@@ -39,6 +39,11 @@ class AgentRpcErrorTest {
         assertEquals(Types.VARCHAR, diagnostic.get("jdbcType").getAsInt());
         assertEquals(2, diagnostic.get("inputLength").getAsInt());
         assertTrue(diagnostic.getAsJsonArray("causeClasses").toString().contains("MalformedInputException"));
+        String visible = AgentRpcError.toJson(error, AgentProtocol.METHOD_EXECUTE_QUERY, "session-1")
+            .get("message").getAsString();
+        assertTrue(visible.startsWith("conversion failed"));
+        assertTrue(visible.contains("column 3 (客户姓名)"));
+        assertTrue(visible.contains("MalformedInputException"));
     }
 
     @Test

@@ -35,6 +35,7 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           shared-key: dbx-custom-windows
+          cache-on-failure: true
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
       - name: Test Java and build fixed DB2 Agent

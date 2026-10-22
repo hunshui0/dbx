@@ -107,6 +107,9 @@ final class AgentRpcError extends RuntimeException {
         JsonObject conversion = conversionDiagnostics(error);
         if (conversion != null) {
             data.add("conversion", conversion);
+            // The desktop intentionally hides internal RPC payloads. Keep the
+            // bounded conversion context visible in the ordinary error detail.
+            rpcError.addProperty("message", message(error) + conversionSummary(conversion));
         }
         if (agentSessionId != null && !agentSessionId.trim().isEmpty()) {
             data.addProperty("agentSessionId", agentSessionId);
@@ -293,5 +296,20 @@ final class AgentRpcError extends RuntimeException {
         // or arbitrary nested exception messages into the public error envelope.
         data.add("causeClasses", classes);
         return data;
+    }
+
+    private static String conversionSummary(JsonObject data) {
+        StringBuilder summary = new StringBuilder(" [character conversion");
+        if (data.has("columnIndex")) summary.append("; column ").append(data.get("columnIndex").getAsInt());
+        if (data.has("columnName")) summary.append(" (").append(data.get("columnName").getAsString()).append(')');
+        if (data.has("jdbcType")) summary.append("; JDBC type ").append(data.get("jdbcType").getAsInt());
+        if (data.has("inputLength")) summary.append("; input length ").append(data.get("inputLength").getAsInt());
+        summary.append("; causes: ");
+        JsonArray classes = data.getAsJsonArray("causeClasses");
+        for (int i = 0; i < classes.size(); i++) {
+            if (i > 0) summary.append(" -> ");
+            summary.append(classes.get(i).getAsString());
+        }
+        return summary.append(']').toString();
     }
 }
