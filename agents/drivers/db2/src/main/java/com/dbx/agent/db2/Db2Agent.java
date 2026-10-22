@@ -8,6 +8,7 @@ import com.dbx.agent.ExecuteQueryOptions;
 import com.dbx.agent.ForeignKeyInfo;
 import com.dbx.agent.IndexInfo;
 import com.dbx.agent.JdbcExecutor;
+import com.dbx.agent.ResultColumnReadException;
 import com.dbx.agent.JdbcIdentifiers;
 import com.dbx.agent.MultiSessionJsonRpcServer;
 import com.dbx.agent.MetadataListConstraints;
@@ -59,9 +60,9 @@ public final class Db2Agent extends AbstractJdbcAgent {
 
     @Override
     protected Properties buildConnectionProperties(ConnectParams params) {
-        Properties properties = super.buildConnectionProperties(params);
-        properties.setProperty("db2.jcc.charsetDecoderEncoder", "3");
-        return properties;
+        // Keep JCC's strict decoder: replacement characters can fabricate matches
+        // and differences. Connection encoding is negotiated by JCC, not guessed.
+        return super.buildConnectionProperties(params);
     }
 
     @Override
@@ -484,18 +485,22 @@ public final class Db2Agent extends AbstractJdbcAgent {
 
     @Override
     protected Object resultValue(ResultSet rs, int index, int sqlType) {
-        return unchecked(() -> {
-            if (sqlType == Types.CLOB || sqlType == Types.NCLOB) {
-                String value = rs.getString(index);
-                return rs.wasNull() ? null : value;
-            }
-            if (sqlType == Types.BLOB || sqlType == Types.BINARY || sqlType == Types.VARBINARY || sqlType == Types.LONGVARBINARY) {
-                byte[] value = rs.getBytes(index);
-                return rs.wasNull() ? null : JdbcExecutor.bytesToHex(value);
-            }
-            Object value = rs.getObject(index);
-            return rs.wasNull() ? null : value == null ? null : value.toString();
-        });
+        try {
+            return unchecked(() -> {
+                if (sqlType == Types.CLOB || sqlType == Types.NCLOB) {
+                    String value = rs.getString(index);
+                    return rs.wasNull() ? null : value;
+                }
+                if (sqlType == Types.BLOB || sqlType == Types.BINARY || sqlType == Types.VARBINARY || sqlType == Types.LONGVARBINARY) {
+                    byte[] value = rs.getBytes(index);
+                    return rs.wasNull() ? null : JdbcExecutor.bytesToHex(value);
+                }
+                Object value = rs.getObject(index);
+                return rs.wasNull() ? null : value == null ? null : value.toString();
+            });
+        } catch (RuntimeException error) {
+            throw new ResultColumnReadException(rs, index, sqlType, error);
+        }
     }
 
     Object deferredResultValue(ResultSet rs, int index, int sqlType, String typeName) {

@@ -142,6 +142,7 @@ mod tests {
                 sql_state: Some("42P01".to_string()),
                 vendor_code: None,
                 exception_class: Some("java.sql.SQLException".to_string()),
+                conversion: None,
             },
         });
 

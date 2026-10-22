@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "dbx"
-version = "0.6.51"
+version = "0.6.51-custom.1"
 dependencies = [
  "anyhow",
  "axum",

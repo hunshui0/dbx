@@ -362,6 +362,19 @@ pub async fn check_for_updates(
     locale: Option<String>,
     source: Option<dbx_core::DownloadSource>,
 ) -> Result<UpdateInfo, String> {
+    if cfg!(feature = "custom-build") {
+        let version = env!("CARGO_PKG_VERSION").to_string();
+        return Ok(UpdateInfo {
+            current_version: version.clone(),
+            latest_version: version,
+            update_available: false,
+            portable_mode: crate::data_dir::is_portable_mode(),
+            manual_update_only: true,
+            release_name: "DBX Custom".into(),
+            release_url: "https://github.com/hunshui0/dbx/actions".into(),
+            release_notes: "DBX Custom uses manually installed custom builds.".into(),
+        });
+    }
     let locale = locale.unwrap_or_else(|| "zh-CN".to_string());
     let release = dbx_core::update::fetch_latest_release(&locale, source.unwrap_or_default()).await?;
     let current_version = env!("CARGO_PKG_VERSION");
@@ -372,7 +385,7 @@ pub async fn check_for_updates(
 }
 
 fn requires_manual_update(is_windows_7_target: bool) -> bool {
-    is_windows_7_target
+    is_windows_7_target || cfg!(feature = "custom-build")
 }
 
 #[tauri::command]
@@ -493,6 +506,9 @@ pub async fn download_update(
     attempt_id: String,
     release_notes: Option<String>,
 ) -> Result<DownloadedUpdate, String> {
+    if cfg!(feature = "custom-build") {
+        return Err("DBX Custom updates must be installed using a custom installer.".into());
+    }
     let portable_mode = crate::data_dir::is_portable_mode();
     if requires_manual_update(IS_WINDOWS_7_TARGET) {
         return Err("Windows 7 builds must be updated with the dedicated Windows 7 offline installer.".to_string());
@@ -890,6 +906,9 @@ pub fn install_downloaded_update(
     cache_id: String,
     expected_version: String,
 ) -> Result<(), String> {
+    if cfg!(feature = "custom-build") {
+        return Err("DBX Custom updates must be installed using a custom installer.".into());
+    }
     let cached = state.take_ready(&cache_id, &expected_version)?;
     // Read and reverify disk bytes immediately before installation; never trust memory alone.
     let refreshed = match restore_cached(&app) {
@@ -1027,7 +1046,7 @@ mod tests {
     #[test]
     fn all_windows_7_builds_require_manual_updates() {
         assert!(requires_manual_update(true));
-        assert!(!requires_manual_update(false));
+        assert_eq!(requires_manual_update(false), cfg!(feature = "custom-build"));
     }
 
     #[test]

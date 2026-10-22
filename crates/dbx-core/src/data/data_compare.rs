@@ -11,9 +11,9 @@ use crate::models::connection::DatabaseType;
 use crate::query::{execute_sql_statement_with_options, QueryExecutionOptions};
 use crate::schema::get_columns_core;
 use crate::sql_dialect::{
-    build_count_table_sql, build_iris_table_select_sql, firebird_rows_clause, pagination_strategy,
-    qualified_table_name, quote_iris_identifier, quote_table_identifier, table_data_qualified_table_name,
-    PaginationContext, TablePaginationStrategy,
+    build_count_table_sql, build_iris_table_select_sql, build_table_data_select_sql, firebird_rows_clause,
+    pagination_strategy, qualified_table_name, quote_iris_identifier, quote_table_identifier,
+    table_data_qualified_table_name, PaginationContext, TableDataSelectSqlOptions, TablePaginationStrategy,
 };
 use crate::transfer::{generate_comment_ddl, generate_create_table_ddl};
 
@@ -413,8 +413,8 @@ pub async fn prepare_data_compare_from_tables(
                         row_budget,
                     )
                 )?;
-                let source_truncated = source_row_count > row_budget as u64;
-                let target_truncated = target_row_count > row_budget as u64;
+                let source_truncated = validate_full_compare_read(source_row_count, src.len(), row_budget)?;
+                let target_truncated = validate_full_compare_read(target_row_count, tgt.len(), row_budget)?;
                 (src, tgt, 1.0, "full_compare".to_string(), source_truncated, target_truncated)
             }
             DegradationLevel::Sample => {
@@ -570,7 +570,7 @@ pub async fn prepare_data_compare_missing_target(
         row_budget,
     )
     .await?;
-    let source_truncated = source_row_count > row_budget as u64;
+    let source_truncated = validate_full_compare_read(source_row_count, source_rows.len(), row_budget)?;
     let sync_eligible = !source_truncated;
     let result = missing_target_diff(&column_names, &options.key_columns, source_rows);
     let mut pre_sync_statements = Vec::new();
@@ -1181,7 +1181,17 @@ fn build_data_compare_select_sql(
     };
 
     match pagination_strategy(Some(database_type), PaginationContext::BoundedRead) {
-        TablePaginationStrategy::Db2FetchFirst | TablePaginationStrategy::FetchFirst => {
+        TablePaginationStrategy::Db2FetchFirst => build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(database_type),
+            schema: Some(schema.to_string()),
+            table_name: table_name.to_string(),
+            columns: columns.to_vec(),
+            order_by: (!key_columns.is_empty()).then_some(order_expression),
+            limit: Some(row_limit),
+            offset: Some(offset),
+            ..Default::default()
+        }),
+        TablePaginationStrategy::FetchFirst => {
             let offset_sql = if offset > 0 { format!(" OFFSET {offset} ROWS") } else { String::new() };
             format!("SELECT {select_columns} FROM {table}{order_by}{offset_sql} FETCH FIRST {row_limit} ROWS ONLY")
         }
@@ -1261,6 +1271,18 @@ fn build_rownum_data_compare_select_sql(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Counts and reads must agree before a bounded full comparison can be trusted.
+/// A short read (or a concurrent table change) must never produce deletion SQL.
+fn validate_full_compare_read(expected: u64, actual: usize, row_budget: usize) -> Result<bool, String> {
+    let required = expected.min(row_budget as u64);
+    if actual as u64 != required {
+        return Err(format!(
+            "Comparison read incomplete or table changed: COUNT(*) returned {expected}, expected to read {required} rows, read {actual}. Retry against unchanged tables; no synchronization plan was generated."
+        ));
+    }
+    Ok(expected > actual as u64)
+}
+
 /// Fetches the rows a comparison needs, stopping after `row_budget` rows.
 ///
 /// A compare reads both sides into memory and ships the diff to the UI, so an unbounded
@@ -1297,6 +1319,11 @@ async fn fetch_compare_rows(
         )
         .await?;
         let fetched = result.rows.len();
+        if result.truncated && fetched < batch_size {
+            return Err(format!(
+                "Comparison page was truncated: requested {batch_size} rows, received {fetched} at offset {offset}."
+            ));
+        }
         if fetched == 0 {
             break;
         }
@@ -1536,6 +1563,13 @@ fn build_limited_sampling_select_sql(
             let order = order_by.map(|order_by| format!(" ORDER BY {order_by}")).unwrap_or_default();
             format!("SELECT FIRST {row_limit} {select_columns} FROM {table}{order}")
         }
+        TablePaginationStrategy::Db2FetchFirst => {
+            if row_limit == 0 {
+                return format!("SELECT {select_columns} FROM {table} WHERE 1 = 0");
+            }
+            let order = order_by.map(|order_by| format!(" ORDER BY {order_by}")).unwrap_or_default();
+            format!("SELECT {select_columns} FROM {table}{order} FETCH FIRST {row_limit} ROWS ONLY")
+        }
         _ => {
             let order = order_by.map(|order_by| format!(" ORDER BY {order_by}")).unwrap_or_default();
             format!("SELECT {select_columns} FROM {table}{order} LIMIT {row_limit}")
@@ -1613,6 +1647,9 @@ fn build_sampling_select_sql(
 
     match strategy {
         SamplingStrategy::Random => match database_type {
+            DatabaseType::Db2 => {
+                build_limited_sampling_select_sql(database_type, &table, &select_columns, Some("RAND()"), sample_size)
+            }
             DatabaseType::Postgres | DatabaseType::Redshift | DatabaseType::DuckDb | DatabaseType::Databricks => {
                 format!("SELECT {select_columns} FROM {table} TABLESAMPLE SYSTEM (1) LIMIT {sample_size}")
             }
@@ -1702,6 +1739,13 @@ fn build_sampling_select_sql(
             let tail_count = sample_size - random_count - head_count;
 
             let random_part = match database_type {
+                DatabaseType::Db2 => build_limited_sampling_select_sql(
+                    database_type,
+                    &table,
+                    &select_columns,
+                    Some("RAND()"),
+                    random_count,
+                ),
                 DatabaseType::Postgres | DatabaseType::Redshift | DatabaseType::DuckDb | DatabaseType::Databricks => {
                     format!("SELECT {select_columns} FROM {table} TABLESAMPLE SYSTEM (1) LIMIT {random_count}")
                 }
@@ -2926,6 +2970,65 @@ mod tests {
             ),
             "SELECT \"id\", \"name\" FROM \"public\".\"users\" ORDER BY \"id\" ASC LIMIT 1000;"
         );
+    }
+
+    #[test]
+    fn db2_compare_pages_reuse_legacy_compatible_table_pagination() {
+        let columns = vec!["ACCT_NO".into(), "客户\"姓名".into(), "SEQ".into()];
+        let keys = vec!["ACCT_NO".into(), "SEQ".into()];
+        let first = build_data_compare_select_sql(DatabaseType::Db2, "ODS", "FCKFH", &columns, &keys, 1000, 0);
+        assert!(first.ends_with("ORDER BY \"ACCT_NO\" ASC, \"SEQ\" ASC FETCH FIRST 1000 ROWS ONLY"), "{first}");
+        for (offset, size) in [(1000, 1000), (2000, 17)] {
+            let sql = build_data_compare_select_sql(DatabaseType::Db2, "ODS", "FCKFH", &columns, &keys, size, offset);
+            assert!(sql.contains("ROW_NUMBER() OVER (ORDER BY \"ACCT_NO\" ASC, \"SEQ\" ASC)"), "{sql}");
+            assert!(sql.contains(&format!("\"__dbx_row_num\" > {offset}")), "{sql}");
+            assert!(sql.contains(&format!("\"__dbx_row_num\" <= {}", offset + size)), "{sql}");
+            assert!(sql.contains("\"客户\"\"姓名\""), "{sql}");
+            assert!(!sql.contains(" OFFSET ") && !sql.contains(" LIMIT "), "{sql}");
+            assert!(sql.starts_with("SELECT \"ACCT_NO\", \"客户\"\"姓名\", \"SEQ\" FROM"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn db2_all_sampling_strategies_use_fetch_first_and_keep_branch_markers() {
+        for strategy in [SamplingStrategy::Random, SamplingStrategy::ExtremeValues, SamplingStrategy::Hybrid] {
+            for size in [1, 2, 10_000] {
+                for keys in [vec![], vec!["ACCT_NO".into(), "SEQ".into()]] {
+                    let sql = build_sampling_select_sql(
+                        DatabaseType::Db2,
+                        "ODS",
+                        "LONSTS",
+                        &["ACCT_NO".into(), "SEQ".into()],
+                        &keys,
+                        &strategy,
+                        size,
+                    );
+                    assert!(!sql.contains(" LIMIT ") && !sql.contains(" OFFSET "), "{sql}");
+                    assert!(sql.contains("FETCH FIRST"), "{sql}");
+                    assert!(!sql.contains("FETCH FIRST 0"), "{sql}");
+                    if matches!(strategy, SamplingStrategy::Random)
+                        || (matches!(strategy, SamplingStrategy::Hybrid) && !keys.is_empty() && size >= 2)
+                    {
+                        assert!(sql.contains("ORDER BY RAND()"), "{sql}");
+                    }
+                    if !matches!(strategy, SamplingStrategy::Random) && !keys.is_empty() {
+                        assert!(sql.contains("dbx_sample_branch"), "{sql}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_compare_requires_exact_bounded_count_before_sync() {
+        for count in [0, 365, 1000, 1017, 100_000] {
+            assert_eq!(validate_full_compare_read(count, count as usize, 100_000), Ok(false));
+        }
+        assert_eq!(validate_full_compare_read(100_001, 100_000, 100_000), Ok(true));
+        for (expected, actual) in [(19_877, 365), (1017, 1000), (1000, 1001), (100_001, 99_999)] {
+            let error = validate_full_compare_read(expected, actual, 100_000).unwrap_err();
+            assert!(error.contains("no synchronization plan was generated"));
+        }
     }
 
     #[test]

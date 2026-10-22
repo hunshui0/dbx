@@ -1,6 +1,6 @@
 [package]
 name = "dbx"
-version = "0.6.51"
+version = "0.6.51-custom.1"
 description = "Open-source database management tool"
 authors = ["skyler"]
 license = "Apache-2.0"
@@ -15,6 +15,7 @@ crate-type = ["rlib"]
 [features]
 default = ["duckdb-sidecar", "dynamodb", "mq-admin", "sqlite-multiple-ciphers", "system-fonts", "os-keyring", "sqlserver-native-attention"]
 custom-protocol = ["tauri/custom-protocol"]
+custom-build = []
 duckdb-sidecar = ["dbx-core/duckdb-sidecar"]
 os-keyring = ["dbx-core/os-keyring"]
 sqlserver-native-attention = ["dbx-core/sqlserver-native-attention"]

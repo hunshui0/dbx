@@ -5,12 +5,61 @@ import org.junit.jupiter.api.Test;
 
 import java.sql.SQLException;
 import java.sql.SQLTimeoutException;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.Types;
+import java.lang.reflect.Proxy;
+import java.nio.charset.MalformedInputException;
 import java.util.concurrent.CancellationException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AgentRpcErrorTest {
+    @Test
+    void conversionFailureKeepsSqlClassificationAndBoundedColumnDiagnostics() {
+        ResultSetMetaData meta = (ResultSetMetaData) Proxy.newProxyInstance(getClass().getClassLoader(),
+            new Class<?>[] {ResultSetMetaData.class}, (proxy, method, args) ->
+                "getColumnLabel".equals(method.getName()) ? "客户姓名" : null);
+        ResultSet rs = (ResultSet) Proxy.newProxyInstance(getClass().getClassLoader(),
+            new Class<?>[] {ResultSet.class}, (proxy, method, args) ->
+                "getMetaData".equals(method.getName()) ? meta : null);
+        SQLException original = new SQLException("conversion failed", null, -4220, new MalformedInputException(2));
+        var error = new ResultColumnReadException(rs, 3, Types.VARCHAR, original);
+        JsonObject data = errorData(error, AgentProtocol.METHOD_EXECUTE_QUERY, "session-1");
+        assertEquals("sql", data.get("category").getAsString());
+        assertEquals(-4220, data.get("vendorCode").getAsInt());
+        assertEquals(SQLException.class.getName(), data.get("exceptionClass").getAsString());
+        assertEquals("keep", data.get("sessionDisposition").getAsString());
+        assertFalse(data.get("retryable").getAsBoolean());
+        var diagnostic = data.getAsJsonObject("conversion");
+        assertEquals(3, diagnostic.get("columnIndex").getAsInt());
+        assertEquals("客户姓名", diagnostic.get("columnName").getAsString());
+        assertEquals(Types.VARCHAR, diagnostic.get("jdbcType").getAsInt());
+        assertEquals(2, diagnostic.get("inputLength").getAsInt());
+        assertTrue(diagnostic.getAsJsonArray("causeClasses").toString().contains("MalformedInputException"));
+    }
+
+    @Test
+    void conversionDiagnosticTraversalIsBoundedAndHandlesSqlNextExceptionCycles() {
+        SQLException head = new SQLException("conversion failed", null, -4220);
+        SQLException tail = head;
+        for (int i = 0; i < 30; i++) {
+            SQLException next = new SQLException("details");
+            tail.initCause(next);
+            tail = next;
+        }
+        var conversion = errorData(head, AgentProtocol.METHOD_EXECUTE_QUERY, null).getAsJsonObject("conversion");
+        assertEquals(16, conversion.getAsJsonArray("causeClasses").size());
+        SQLException cycle = new SQLException("conversion failed", null, -4220);
+        cycle.setNextException(cycle);
+        assertEquals(1, errorData(cycle, AgentProtocol.METHOD_EXECUTE_QUERY, null)
+            .getAsJsonObject("conversion").getAsJsonArray("causeClasses").size());
+        assertFalse(errorData(new SQLException("ordinary failure"), AgentProtocol.METHOD_EXECUTE_QUERY, null)
+            .has("conversion"));
+    }
+
     @Test
     void serializesVersionedSqlDiagnosticsAndUnknownExecuteOutcome() {
         SQLException cause = new SQLException("statement failed", "42000", 1064);

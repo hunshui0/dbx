@@ -505,10 +505,11 @@ pub fn build_agent_list(am: &AgentManager, registry: Option<&AgentRegistry>) -> 
                 size: remote.map(|driver| driver_download_size(key, driver)).unwrap_or(0),
                 installed,
                 installed_version: local.map(|l| l.version.clone()),
-                update_available: match (local, remote) {
-                    (Some(l), Some(r)) => l.version != r.version || jre_update_available,
-                    _ => false,
-                },
+                update_available: !am.is_driver_pinned(key)
+                    && match (local, remote) {
+                        (Some(l), Some(r)) => l.version != r.version || jre_update_available,
+                        _ => false,
+                    },
                 requires_java_runtime,
                 jre: jre_key.clone(),
                 jre_installed: !requires_java_runtime || am.is_jre_installed(&jre_key),
@@ -1398,6 +1399,9 @@ async fn install_agent_driver_with_batch_unlocked(
     total_drivers: Option<u32>,
     cancellations: &[&AgentInstallCancellation],
 ) -> Result<(), String> {
+    if am.is_driver_pinned(db_type) {
+        return Err("This Agent is bundled with DBX Custom. Update it using the custom installer.".into());
+    }
     match fetch_registry_from_claimed(source, cancellations).await {
         Ok(registry) => {
             match install_agent_driver_from_registry(
@@ -1726,6 +1730,9 @@ async fn install_agent_driver_from_registry(
     total_drivers: Option<u32>,
     cancellations: &[&AgentInstallCancellation],
 ) -> Result<(), String> {
+    if am.is_driver_pinned(db_type) {
+        return Err("This Agent is bundled with DBX Custom. Update it using the custom installer.".into());
+    }
     let Some(driver) = agent_registry_driver(registry, db_type) else {
         if let Some(local_jar) = find_local_agent_jar(db_type) {
             install_local_agent_with_registry_jre(

@@ -426,6 +426,31 @@ pub struct AgentErrorContext {
     pub vendor_code: Option<i32>,
     #[serde(default)]
     pub exception_class: Option<String>,
+    #[serde(default)]
+    pub conversion: Option<AgentConversionDiagnostics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentConversionDiagnostics {
+    pub cause_classes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jdbc_type: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_length: Option<u32>,
+}
+
+impl AgentConversionDiagnostics {
+    fn is_valid(&self) -> bool {
+        !self.cause_classes.is_empty()
+            && self.cause_classes.len() <= 16
+            && self.cause_classes.iter().all(|name| valid_ascii_diagnostic(Some(name), 160))
+            && self.column_name.as_ref().is_none_or(|name| name.chars().count() <= 128)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -517,6 +542,7 @@ impl AgentCallError {
                     "sqlState": context.sql_state,
                     "vendorCode": context.vendor_code,
                     "exceptionClass": context.exception_class,
+                    "conversion": context.conversion,
                 });
                 format_agent_rpc_error_parts(rpc_code, &message, Some(&data))
             }
@@ -744,6 +770,7 @@ pub fn valid_agent_error_combination(context: &AgentErrorContext) -> bool {
     }
     valid_ascii_diagnostic(context.sql_state.as_deref(), 16)
         && valid_ascii_diagnostic(context.exception_class.as_deref(), 160)
+        && context.conversion.as_ref().is_none_or(AgentConversionDiagnostics::is_valid)
         && context.agent_session_id.as_deref().is_none_or(valid_ascii_identifier)
 }
 
@@ -3997,6 +4024,27 @@ mod tests {
     }
 
     #[test]
+    fn conversion_diagnostics_survive_rpc_legacy_and_backend_boundaries() {
+        let response = serde_json::json!({"error": {"code": -1, "message": "conversion failed", "data": {
+            "contractVersion": 1, "category": "sql", "retryable": false,
+            "sessionDisposition": "keep", "stage": "execute", "operationOutcome": "unknown",
+            "vendorCode": -4220, "exceptionClass": "java.sql.SQLException",
+            "conversion": {"causeClasses": ["java.sql.SQLException", "java.nio.charset.MalformedInputException"],
+                "columnIndex": 2, "columnName": "客户姓名", "jdbcType": 12, "inputLength": 1}
+        }}});
+        let error = decode_agent_response::<serde_json::Value>(response, true, None).unwrap_err();
+        let legacy = error.into_legacy_string();
+        let decoded = agent_error_from_legacy(&legacy, None);
+        let AgentCallError::Structured { context, .. } = decoded else { panic!("lost strict error context") };
+        assert_eq!(context.conversion.as_ref().unwrap().column_name.as_deref(), Some("客户姓名"));
+        let backend = crate::backend_error::BackendError::from_legacy_string(&legacy);
+        let diagnostic = serde_json::to_value(backend.diagnostics()).unwrap();
+        assert_eq!(diagnostic["vendorCode"], -4220);
+        assert_eq!(diagnostic["conversion"]["inputLength"], 1);
+        assert_eq!(diagnostic["conversion"]["columnName"], "客户姓名");
+    }
+
+    #[test]
     fn strict_structured_error_keeps_identity_across_legacy_api_boundary() {
         let response = serde_json::json!({
             "error": {
@@ -4053,6 +4101,7 @@ mod tests {
                 sql_state: None,
                 vendor_code: None,
                 exception_class: None,
+                conversion: None,
             },
         };
         let suffixed = format!("{}: fallback failed", structured.into_legacy_string());
@@ -4179,6 +4228,7 @@ mod tests {
                 sql_state: Some("08006".to_string()),
                 vendor_code: None,
                 exception_class: None,
+                conversion: None,
             },
         };
 
@@ -4212,6 +4262,7 @@ mod tests {
                 sql_state: None,
                 vendor_code: None,
                 exception_class: None,
+                conversion: None,
             },
         };
         assert_eq!(RecoveryPolicy::decide(&replace, RecoveryScope::Keepalive), RecoveryDecision::ReplaceRuntime);
@@ -4229,6 +4280,7 @@ mod tests {
                 sql_state: None,
                 vendor_code: None,
                 exception_class: None,
+                conversion: None,
             },
         };
         assert_eq!(

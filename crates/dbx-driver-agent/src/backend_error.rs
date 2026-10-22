@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::db::agent_driver::{
-    category_name, stage_name, valid_agent_error_combination, AgentCallError, AgentErrorCategory, AgentErrorContext,
-    AgentErrorStage, AgentOperationOutcome, AgentSessionDisposition,
+    category_name, stage_name, valid_agent_error_combination, AgentCallError, AgentConversionDiagnostics,
+    AgentErrorCategory, AgentErrorContext, AgentErrorStage, AgentOperationOutcome, AgentSessionDisposition,
 };
 
 const MAX_DETAIL_BYTES: usize = 64 * 1024;
@@ -101,6 +101,8 @@ pub struct BackendErrorDiagnostics {
     vendor_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exception_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conversion: Option<AgentConversionDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     adapter_code: Option<String>,
 }
@@ -806,6 +808,7 @@ fn diagnostics_from_context(context: &AgentErrorContext) -> BackendErrorDiagnost
         sql_state: context.sql_state.as_deref().map(|value| bounded_ascii(value, 32)),
         vendor_code: context.vendor_code,
         exception_class: context.exception_class.as_deref().map(|value| bounded_ascii(value, 128)),
+        conversion: context.conversion.clone(),
         ..Default::default()
     }
 }
@@ -1225,6 +1228,7 @@ mod tests {
             sql_state: Some("08006".to_string()),
             vendor_code: Some(-7),
             exception_class: Some("java.sql.SQLException".to_string()),
+            conversion: None,
         }
     }
 

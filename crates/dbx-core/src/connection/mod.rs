@@ -8329,6 +8329,7 @@ mod tests {
                 sql_state: None,
                 vendor_code: None,
                 exception_class: None,
+                conversion: None,
             },
         }
         .into_legacy_string();

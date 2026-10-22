@@ -1,12 +1,22 @@
 package com.dbx.agent;
 
 import com.google.gson.JsonObject;
+import com.google.gson.JsonArray;
 
 import java.sql.SQLException;
 import java.sql.SQLTimeoutException;
 import java.sql.SQLRecoverableException;
 import java.sql.SQLTransientConnectionException;
 import java.util.Locale;
+import java.util.ArrayDeque;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Set;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.MalformedInputException;
+import java.nio.charset.UnmappableCharacterException;
+import java.io.CharConversionException;
+import java.io.UnsupportedEncodingException;
 import java.util.concurrent.CancellationException;
 
 final class AgentRpcError extends RuntimeException {
@@ -94,6 +104,10 @@ final class AgentRpcError extends RuntimeException {
             data.addProperty("vendorCode", classified.vendorCode);
         }
         addDiagnostic(data, "exceptionClass", classified.exceptionClass);
+        JsonObject conversion = conversionDiagnostics(error);
+        if (conversion != null) {
+            data.add("conversion", conversion);
+        }
         if (agentSessionId != null && !agentSessionId.trim().isEmpty()) {
             data.addProperty("agentSessionId", agentSessionId);
         }
@@ -232,12 +246,52 @@ final class AgentRpcError extends RuntimeException {
 
     private static <T extends Throwable> T find(Throwable error, Class<T> type) {
         Throwable current = error;
-        while (current != null) {
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        while (current != null && seen.size() < 32 && seen.add(current)) {
             if (type.isInstance(current)) {
                 return type.cast(current);
             }
             current = current.getCause();
         }
         return null;
+    }
+
+    private static JsonObject conversionDiagnostics(Throwable error) {
+        JsonObject data = new JsonObject();
+        JsonArray classes = new JsonArray();
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        ArrayDeque<Throwable> pending = new ArrayDeque<>();
+        pending.add(error);
+        boolean conversion = false;
+        while (!pending.isEmpty() && seen.size() < 16) {
+            Throwable current = pending.removeFirst();
+            if (!seen.add(current)) continue;
+            classes.add(safeClassName(current));
+            conversion |= current instanceof CharConversionException
+                || current instanceof CharacterCodingException
+                || current instanceof UnsupportedEncodingException
+                || (current instanceof SQLException && ((SQLException) current).getErrorCode() == -4220);
+            if (current instanceof MalformedInputException) {
+                data.addProperty("inputLength", ((MalformedInputException) current).getInputLength());
+            } else if (current instanceof UnmappableCharacterException) {
+                data.addProperty("inputLength", ((UnmappableCharacterException) current).getInputLength());
+            }
+            if (current instanceof ResultColumnReadException column) {
+                data.addProperty("columnIndex", column.columnIndex);
+                data.addProperty("jdbcType", column.jdbcType);
+                if (column.columnName != null && !column.columnName.isBlank()) {
+                    data.addProperty("columnName", column.columnName.substring(0, Math.min(128, column.columnName.length())));
+                }
+            }
+            if (current.getCause() != null) pending.addLast(current.getCause());
+            if (current instanceof SQLException sql && sql.getNextException() != null) {
+                pending.addLast(sql.getNextException());
+            }
+        }
+        if (!conversion) return null;
+        // Class names and numeric context are useful without copying row values
+        // or arbitrary nested exception messages into the public error envelope.
+        data.add("causeClasses", classes);
+        return data;
     }
 }

@@ -10522,6 +10522,7 @@ for line in sys.stdin:
                 sql_state: None,
                 vendor_code: None,
                 exception_class: None,
+                conversion: None,
             },
         });
 

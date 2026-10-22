@@ -19,7 +19,8 @@ const DISABLE_WIN7_CSS_COLOR4_ENV: &str = "DBX_DISABLE_WIN7_CSS_COLOR4";
 const RECOVERY_ATTEMPT_ENV: &str = "DBX_STARTUP_COMPAT_RECOVERY";
 const RECOVERY_PARENT_PID_ENV: &str = "DBX_STARTUP_COMPAT_PARENT_PID";
 const DISABLE_ENTERPRISE_COMPAT_ENV: &str = "DBX_DISABLE_ENTERPRISE_COMPAT";
-const WINDOWS_APP_DATA_DIR_NAME: &str = "com.dbx.app";
+const WINDOWS_APP_DATA_DIR_NAME: &str =
+    if cfg!(feature = "custom-build") { "com.hunshui0.dbx.custom" } else { "com.dbx.app" };
 const COMPATIBILITY_MARKER_FILE: &str = "webview2-enterprise-compat.enabled";
 const COMPATIBILITY_PROFILE_DIR: &str = "webview2-enterprise-compat";
 const STARTUP_LOG_BUFFER_CAPACITY: usize = 256;
@@ -598,7 +599,7 @@ mod tests {
         compatibility_marker_contents, compatibility_marker_path_from_appdata, compatibility_profile_path_from_inputs,
         compatibility_profile_ready_record, configure_recovery_child, resolve_compatibility_mode,
         should_attempt_enterprise_recovery, startup_log_dir_from_inputs, webview2_compatibility_arguments,
-        RECOVERY_ATTEMPT_ENV, RECOVERY_PARENT_PID_ENV,
+        RECOVERY_ATTEMPT_ENV, RECOVERY_PARENT_PID_ENV, WINDOWS_APP_DATA_DIR_NAME,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -607,7 +608,7 @@ mod tests {
     fn startup_log_uses_windows_appdata() {
         assert_eq!(
             startup_log_dir_from_inputs("windows", None, Some(OsString::from(r"C:\Users\test\AppData\Roaming")),),
-            Some(PathBuf::from(r"C:\Users\test\AppData\Roaming").join("com.dbx.app"))
+            Some(PathBuf::from(r"C:\Users\test\AppData\Roaming").join(WINDOWS_APP_DATA_DIR_NAME))
         );
     }
 
@@ -629,7 +630,7 @@ mod tests {
             compatibility_marker_path_from_appdata(Some(OsString::from(r"C:\Users\test\AppData\Roaming"))),
             Some(
                 PathBuf::from(r"C:\Users\test\AppData\Roaming")
-                    .join("com.dbx.app")
+                    .join(WINDOWS_APP_DATA_DIR_NAME)
                     .join("webview2-enterprise-compat.enabled")
             )
         );
@@ -641,7 +642,7 @@ mod tests {
             (
                 Some(
                     PathBuf::from(r"C:\Users\test\AppData\Local")
-                        .join("com.dbx.app")
+                        .join(WINDOWS_APP_DATA_DIR_NAME)
                         .join("webview2-enterprise-compat")
                 ),
                 "local_appdata",

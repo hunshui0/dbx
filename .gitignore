@@ -19,6 +19,7 @@ CLAUDE.md
 dist/
 coverage/
 /target/
+/src-tauri/custom-resources/
 vendor/wry/target/
 vendor/wry/Cargo.lock
 src-tauri/webview2-fixed-runtime/

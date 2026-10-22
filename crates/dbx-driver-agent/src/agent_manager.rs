@@ -169,6 +169,24 @@ mod tests {
         AgentManager::new_with_base_dir(dir)
     }
 
+    #[test]
+    fn pinned_agent_refuses_a_replaced_jar_before_launch() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AgentManager::new_with_base_dir(dir.path().to_path_buf());
+        fs::create_dir_all(manager.driver_dir("db2")).unwrap();
+        fs::write(manager.driver_jar_path("db2"), b"fixed jar").unwrap();
+        fs::write(manager.driver_dir("db2").join("pinned.sha256"), format!("{:x}", Sha256::digest(b"fixed jar")))
+            .unwrap();
+        assert!(manager.validate_driver_pin("db2").is_ok());
+        fs::write(manager.driver_jar_path("db2"), b"old official jar").unwrap();
+        assert!(manager
+            .resolve_agent_launch_spec(&AgentState::default(), "db2", "21")
+            .unwrap_err()
+            .contains("Bundled custom Agent was replaced"));
+        assert!(manager.validate_driver_pin("h2").is_ok());
+    }
+
     fn touch(path: &Path) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
@@ -1146,6 +1164,24 @@ impl AgentManager {
             && !self.driver_launch_config_path(db_type).exists()
     }
 
+    pub fn is_driver_pinned(&self, driver_key: &str) -> bool {
+        self.driver_dir(driver_key).join("pinned.sha256").is_file()
+    }
+
+    fn validate_driver_pin(&self, driver_key: &str) -> Result<(), String> {
+        if !self.is_driver_pinned(driver_key) {
+            return Ok(());
+        }
+        use sha2::{Digest, Sha256};
+        let expected =
+            std::fs::read_to_string(self.driver_dir(driver_key).join("pinned.sha256")).map_err(|e| e.to_string())?;
+        let bytes = std::fs::read(self.driver_jar_path(driver_key)).map_err(|e| e.to_string())?;
+        if format!("{:x}", Sha256::digest(&bytes)) != expected.trim() {
+            return Err("Bundled custom Agent was replaced. Restart DBX Custom to restore the fixed driver.".into());
+        }
+        Ok(())
+    }
+
     /// The JRE key an installed driver actually depends on, or `None` when the
     /// installed artifact runs without a managed JRE (native binary or custom
     /// launch config).
@@ -1195,6 +1231,7 @@ impl AgentManager {
         extra_java_args: &[String],
         env: &[(String, String)],
     ) -> Result<AgentLaunchSpec, String> {
+        self.validate_driver_pin(driver_key)?;
         if driver_key == "dameng" {
             validate_dameng_java_system_properties(extra_java_args)?;
         }

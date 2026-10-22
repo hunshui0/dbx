@@ -1,0 +1,76 @@
+name: DBX Custom Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      NODE_OPTIONS: '--max-old-space-size=8192'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.34.7
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: dbx-custom-windows
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Test Java and build fixed DB2 Agent
+        run: |
+          ./agents/gradlew.bat -p agents :common:test :db2:test :db2:shadowJar --no-daemon
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test comparison and Agent diagnostics
+        run: |
+          cargo test --locked -p dbx-core --no-default-features --features sqlite-bundled data_compare --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p dbx-driver-agent --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Prepare bundled Agent and Java runtime
+        run: ./scripts/prepare-custom-payload.ps1
+      - name: Frontend type check
+        run: pnpm typecheck
+      - name: Build custom Windows installer
+        run: pnpm tauri build --target x86_64-pc-windows-msvc --features custom-build --bundles nsis --config src-tauri/tauri.custom.conf.json
+      - name: Record installer checksums
+        run: |
+          $installers = @(Get-ChildItem target/x86_64-pc-windows-msvc/release/bundle/nsis -Filter '*.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one custom installer.' }
+          foreach ($installer in $installers) {
+            $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($installer.Name)" | Set-Content -LiteralPath "$($installer.FullName).sha256" -Encoding ascii
+          }
+          Copy-Item src-tauri/custom-resources/manifest.json target/x86_64-pc-windows-msvc/release/bundle/nsis/build-manifest.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: DBX-Custom-Windows-x64
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*.sha256
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/build-manifest.json
+            agents/common/build/test-results/test/*.xml
+            agents/drivers/db2/build/test-results/test/*.xml

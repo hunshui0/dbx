@@ -6,6 +6,7 @@ import com.dbx.agent.MetadataListConstraints;
 import com.dbx.agent.ObjectInfo;
 import com.dbx.agent.ObjectSource;
 import com.dbx.agent.QueryResult;
+import com.dbx.agent.ResultColumnReadException;
 import com.dbx.agent.TableInfo;
 import com.dbx.agent.test.JdbcFakeExecutionBehaviorTest;
 import com.dbx.agent.test.JdbcMetadataSqlFake;
@@ -21,6 +22,11 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
 import java.sql.Types;
+import java.sql.SQLException;
+import java.nio.charset.Charset;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.MalformedInputException;
+import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -31,8 +37,55 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertSame;
 
 class Db2AgentTest extends JdbcFakeExecutionBehaviorTest {
+    @Test
+    void keepsStrictDriverDefaultsAndConnectionCredentials() {
+        ConnectParams params = new ConnectParams();
+        params.setUsername("reader");
+        params.setPassword("test-only");
+        var properties = new Db2Agent().buildConnectionProperties(params);
+        assertFalse(properties.containsKey("db2.jcc.charsetDecoderEncoder"));
+        assertEquals("reader", properties.getProperty("user"));
+        assertEquals("test-only", properties.getProperty("password"));
+    }
+
+    @Test
+    void preservesJdbcDecodedGb18030TextNullAndEmptyValues() throws Exception {
+        String text = "中文" + new String(Character.toChars(0x20000));
+        var charset = Charset.forName("GB18030");
+        String decoded = charset.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
+            .decode(ByteBuffer.wrap(text.getBytes(charset))).toString();
+        for (String value : new String[] {decoded, "", null}) {
+            ResultSet rs = proxy(ResultSet.class, (method, args) -> switch (method.getName()) {
+                case "getObject", "getString" -> value;
+                case "wasNull" -> value == null;
+                default -> defaultValue(method.getReturnType());
+            });
+            assertEquals(value, new Db2Agent().resultValue(rs, 1, Types.VARCHAR));
+            assertEquals(value, new Db2Agent().resultValue(rs, 1, Types.CLOB));
+        }
+    }
+
+    @Test
+    void neverReturnsReplacementTextOrPartialRowsAfterConversionFailure() {
+        SQLException original = new SQLException("Caught java.io.CharConversionException", null, -4220,
+            new MalformedInputException(1));
+        RuntimeException wrapped = new RuntimeException(original);
+        ResultSet rs = proxy(ResultSet.class, (method, args) -> {
+            if ("getObject".equals(method.getName()) || "getString".equals(method.getName())) throw wrapped;
+            return defaultValue(method.getReturnType());
+        });
+        for (int type : new int[] {Types.VARCHAR, Types.CLOB}) {
+            ResultColumnReadException error = assertThrows(ResultColumnReadException.class,
+                () -> new Db2Agent().resultValue(rs, 1, type));
+            assertSame(wrapped, error.getCause());
+            assertSame(original, error.getCause().getCause());
+        }
+    }
+
     @Override
     protected DatabaseAgent createAgent() {
         return new Db2Agent();

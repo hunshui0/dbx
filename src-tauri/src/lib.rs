@@ -1,5 +1,7 @@
 mod background_backup;
 mod commands;
+#[cfg(feature = "custom-build")]
+mod custom_build;
 mod data_dir;
 pub use background_backup::run_if_requested as run_backup_worker_if_requested;
 mod db;
@@ -1950,12 +1952,19 @@ pub fn run() {
             });
             eprintln!("[STARTUP] dialect hot-reload watcher started");
 
-            let default_agent_dir = data_dir_resolution.uses_custom_data_dir().then(|| data_dir.join("agents"));
+            let default_agent_dir = (cfg!(feature = "custom-build") || data_dir_resolution.uses_custom_data_dir())
+                .then(|| data_dir.join("agents"));
             let (plugin_dir, agent_dir) = commands::app_settings::resolve_driver_store_dirs_from_settings(
                 &desktop_settings,
                 &data_dir,
                 default_agent_dir,
             );
+
+            #[cfg(feature = "custom-build")]
+            custom_build::prepare_db2(
+                &app.path().resource_dir()?,
+                agent_dir.as_deref().ok_or("DBX Custom requires an isolated Agent directory")?,
+            )?;
 
             let state = if let Some(agent_dir) = agent_dir {
                 AppState::new_with_plugin_and_agent_dir_and_app_version(
