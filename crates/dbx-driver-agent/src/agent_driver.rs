@@ -4609,17 +4609,26 @@ mod tests {
 
     #[test]
     fn startup_error_waits_briefly_for_exit_status_and_stderr_tail() {
+        use std::io::BufRead;
+
         let mut child = test_shell_command(
-            "sleep 0.05; echo 'java.lang.UnsupportedClassVersionError: class file version 65.0' >&2; exit 1",
-            "Start-Sleep -Milliseconds 50; [Console]::Error.WriteLine('java.lang.UnsupportedClassVersionError: class file version 65.0'); exit 1",
+            "echo ready; sleep 0.05; echo 'java.lang.UnsupportedClassVersionError: class file version 65.0' >&2; exit 1",
+            "[Console]::WriteLine('ready'); Start-Sleep -Milliseconds 50; [Console]::Error.WriteLine('java.lang.UnsupportedClassVersionError: class file version 65.0'); exit 1",
         )
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("child should start");
         let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
         start_stderr_collector(child.stderr.take().expect("stderr should be piped"), Arc::clone(&stderr_tail));
 
-        std::thread::sleep(Duration::from_millis(200));
+        // Synchronize with the fixture, rather than counting PowerShell startup
+        // time against the short process-exit grace period on busy CI runners.
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("stdout should be piped"))
+            .read_line(&mut ready)
+            .expect("fixture should signal readiness");
+        assert_eq!(ready.trim(), "ready");
 
         let message = format_agent_startup_error(
             "Failed to read startup line from agent: end of stream",
