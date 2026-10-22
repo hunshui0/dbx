@@ -15,7 +15,10 @@
     "targets": ["nsis"],
     "createUpdaterArtifacts": false,
     "fileAssociations": [],
-    "resources": {"custom-resources/": "custom/"}
+    "resources": {"custom-resources/": "custom/"},
+    "windows": {
+      "webviewInstallMode": {"silent": true, "type": "offlineInstaller"}
+    }
   },
   "plugins": {
     "deep-link": {"desktop": {"schemes": ["dbx-custom"]}},

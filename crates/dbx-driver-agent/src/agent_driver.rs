@@ -4611,19 +4611,28 @@ mod tests {
     fn startup_error_waits_briefly_for_exit_status_and_stderr_tail() {
         use std::io::BufRead;
 
-        let mut child = test_shell_command(
-            "echo ready; sleep 0.05; echo 'java.lang.UnsupportedClassVersionError: class file version 65.0' >&2; exit 1",
-            "[Console]::WriteLine('ready'); Start-Sleep -Milliseconds 50; [Console]::Error.WriteLine('java.lang.UnsupportedClassVersionError: class file version 65.0'); exit 1",
-        )
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("child should start");
+        // PowerShell teardown can exceed the bounded diagnostic wait even after
+        // Environment.Exit. Use a native fixture on Windows, like the Agent.
+        let mut fixture = if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args([
+                "/D",
+                "/C",
+                "echo ready & echo java.lang.UnsupportedClassVersionError: class file version 65.0 1>&2 & exit /b 1",
+            ]);
+            command
+        } else {
+            test_shell_command(
+                "echo ready; sleep 0.05; echo 'java.lang.UnsupportedClassVersionError: class file version 65.0' >&2; exit 1",
+                "",
+            )
+        };
+        let mut child = fixture.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("child should start");
         let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
         start_stderr_collector(child.stderr.take().expect("stderr should be piped"), Arc::clone(&stderr_tail));
 
-        // Synchronize with the fixture, rather than counting PowerShell startup
-        // time against the short process-exit grace period on busy CI runners.
+        // Synchronize with the fixture instead of counting shell startup time
+        // against the short process-exit grace period on busy CI runners.
         let mut ready = String::new();
         std::io::BufReader::new(child.stdout.take().expect("stdout should be piped"))
             .read_line(&mut ready)

@@ -46,7 +46,7 @@ jobs:
         run: |
           cargo test --locked -p dbx-core --no-default-features --features sqlite-bundled data_compare --lib
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p dbx-driver-agent --lib
+          cargo test --locked -p dbx-driver-agent --lib -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Prepare bundled Agent and Java runtime
         run: ./scripts/prepare-custom-payload.ps1
@@ -58,11 +58,11 @@ jobs:
         run: |
           $installers = @(Get-ChildItem target/x86_64-pc-windows-msvc/release/bundle/nsis -Filter '*.exe' -File)
           if ($installers.Count -ne 1) { throw 'Expected exactly one custom installer.' }
-          foreach ($installer in $installers) {
-            $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$hash  $($installer.Name)" | Set-Content -LiteralPath "$($installer.FullName).sha256" -Encoding ascii
-          }
-          Copy-Item src-tauri/custom-resources/manifest.json target/x86_64-pc-windows-msvc/release/bundle/nsis/build-manifest.json
+          $version = (Get-Content src-tauri/tauri.custom.conf.json -Raw | ConvertFrom-Json).version
+          New-Item -ItemType Directory -Force -Path target/custom-installer | Out-Null
+          $output = "target/custom-installer/DBX_${version}_x64-offline-setup.exe"
+          Copy-Item -LiteralPath $installers[0].FullName -Destination $output
+          Get-FileHash -LiteralPath $output -Algorithm SHA256 | Format-List
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -70,8 +70,4 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
           path: |
-            target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
-            target/x86_64-pc-windows-msvc/release/bundle/nsis/*.sha256
-            target/x86_64-pc-windows-msvc/release/bundle/nsis/build-manifest.json
-            agents/common/build/test-results/test/*.xml
-            agents/drivers/db2/build/test-results/test/*.xml
+            target/custom-installer/DBX_*_x64-offline-setup.exe
