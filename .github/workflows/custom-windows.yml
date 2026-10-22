@@ -54,14 +54,25 @@ jobs:
         run: pnpm typecheck
       - name: Build custom Windows installer
         run: pnpm tauri build --target x86_64-pc-windows-msvc --features custom-build --bundles nsis --config src-tauri/tauri.custom.conf.json
-      - name: Record installer checksums
+      - name: Package standard installer
         run: |
           $installers = @(Get-ChildItem target/x86_64-pc-windows-msvc/release/bundle/nsis -Filter '*.exe' -File)
           if ($installers.Count -ne 1) { throw 'Expected exactly one custom installer.' }
           $version = (Get-Content src-tauri/tauri.custom.conf.json -Raw | ConvertFrom-Json).version
           New-Item -ItemType Directory -Force -Path target/custom-installer | Out-Null
+          $output = "target/custom-installer/DBX_${version}_x64-setup.exe"
+          Move-Item -LiteralPath $installers[0].FullName -Destination $output
+          Get-FileHash -LiteralPath $output -Algorithm SHA256 | Format-List
+      - name: Build WebView2 offline setup
+        run: |
+          $bundleDir = 'target/x86_64-pc-windows-msvc/release/bundle/nsis'
+          pnpm tauri bundle --bundles nsis --target x86_64-pc-windows-msvc --config src-tauri/tauri.custom.conf.json --config src-tauri/tauri.webview2-offline.conf.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $installers = @(Get-ChildItem $bundleDir -Filter '*.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one WebView2 offline setup installer.' }
+          $version = (Get-Content src-tauri/tauri.custom.conf.json -Raw | ConvertFrom-Json).version
           $output = "target/custom-installer/DBX_${version}_x64-offline-setup.exe"
-          Copy-Item -LiteralPath $installers[0].FullName -Destination $output
+          Move-Item -LiteralPath $installers[0].FullName -Destination $output
           Get-FileHash -LiteralPath $output -Algorithm SHA256 | Format-List
       - uses: actions/upload-artifact@v4
         if: always()
@@ -70,4 +81,5 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
           path: |
+            target/custom-installer/DBX_*_x64-setup.exe
             target/custom-installer/DBX_*_x64-offline-setup.exe

@@ -7739,7 +7739,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
-                      <PasswordInput v-model="form.password" class="col-span-3" />
+                      <PasswordInput v-model="form.password" class="col-span-3" :show-toggle="!editingId" />
                     </div>
                     <SavePasswordCheckbox v-model="form.save_password" />
                     <div class="grid grid-cols-4 items-start gap-4">
@@ -7878,7 +7878,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div v-if="form.db_type === 'sqlite' && !sqliteUsesSsh" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.sqliteCipherKey") }}</Label>
-                      <PasswordInput v-model="form.password" class="col-span-3" :placeholder="t('connection.sqliteCipherKeyPlaceholder')" />
+                      <PasswordInput v-model="form.password" class="col-span-3" :show-toggle="!editingId" :placeholder="t('connection.sqliteCipherKeyPlaceholder')" />
                     </div>
                     <SavePasswordCheckbox v-if="form.db_type === 'sqlite' && !sqliteUsesSsh" v-model="form.save_password" />
                     <div v-if="form.db_type === 'sqlite' && !sqliteUsesSsh" class="grid grid-cols-4 items-start gap-4">
@@ -7926,7 +7926,7 @@ function openExternalUrl(url: string) {
                       </div>
                       <div class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">{{ t("connection.password") }}{{ form.db_type === "access" ? t("connection.optionalSuffix") : "" }}</Label>
-                        <PasswordInput v-model="form.password" class="col-span-3" />
+                        <PasswordInput v-model="form.password" class="col-span-3" :show-toggle="!editingId" />
                       </div>
                       <SavePasswordCheckbox v-model="form.save_password" />
                     </template>
@@ -8044,7 +8044,7 @@ function openExternalUrl(url: string) {
                     <template v-if="mqAuthKind === 'token'">
                       <div class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">{{ t("connection.mqToken") }}</Label>
-                        <PasswordInput v-model="mqToken" class="col-span-3" />
+                        <PasswordInput v-model="mqToken" class="col-span-3" :show-toggle="!editingId" />
                       </div>
                     </template>
                     <template v-else-if="mqAuthKind === 'basic'">
@@ -8054,7 +8054,7 @@ function openExternalUrl(url: string) {
                       </div>
                       <div class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">{{ mqSystemKind === "rocketmq" ? t("connection.rocketmqSecretKey") : t("connection.password") }}</Label>
-                        <PasswordInput v-model="mqBasicPassword" class="col-span-3" :placeholder="mqSystemKind === 'rabbitmq' ? t('connection.mqRabbitmqPasswordPlaceholder') : ''" />
+                        <PasswordInput v-model="mqBasicPassword" class="col-span-3" :show-toggle="!editingId" :placeholder="mqSystemKind === 'rabbitmq' ? t('connection.mqRabbitmqPasswordPlaceholder') : ''" />
                       </div>
                       <div v-if="mqSystemKind === 'kafka'" class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">{{ t("connection.mqSaslMechanism") }}</Label>
@@ -8122,7 +8122,7 @@ function openExternalUrl(url: string) {
                       </div>
                       <div class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">{{ t("connection.mqApiKeyValue") }}</Label>
-                        <PasswordInput v-model="mqApiKeyValue" class="col-span-3" />
+                        <PasswordInput v-model="mqApiKeyValue" class="col-span-3" :show-toggle="!editingId" />
                       </div>
                     </template>
                     <template v-else-if="mqAuthKind === 'oauth2'">
@@ -8136,7 +8136,7 @@ function openExternalUrl(url: string) {
                       </div>
                       <div class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">{{ t("connection.mqOauthClientSecret") }}</Label>
-                        <PasswordInput v-model="mqOauthClientSecret" class="col-span-3" />
+                        <PasswordInput v-model="mqOauthClientSecret" class="col-span-3" :show-toggle="!editingId" />
                       </div>
                       <div class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">{{ t("connection.mqOauthAudience") }}</Label>
@@ -8271,7 +8271,7 @@ function openExternalUrl(url: string) {
                         </div>
                         <div class="grid gap-1.5">
                           <Label>{{ t("connection.password") }}</Label>
-                          <PasswordInput v-model="nacosPassword" />
+                          <PasswordInput v-model="nacosPassword" :show-toggle="!editingId" />
                         </div>
                       </div>
                       <p v-if="isNacosV3AdminPlane && nacosAuthKind === 'usernamePassword'" class="mt-4 border-t pt-4 text-xs leading-5 text-muted-foreground">
@@ -8333,7 +8333,7 @@ function openExternalUrl(url: string) {
                       </div>
                       <div class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">{{ t("connection.redisSentinelPassword") }}</Label>
-                        <PasswordInput v-model="form.redis_sentinel_password" class="col-span-3" />
+                        <PasswordInput v-model="form.redis_sentinel_password" class="col-span-3" :show-toggle="!editingId" />
                       </div>
                       <div class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelSmallClass">{{ t("connection.redisSentinelTls") }}</Label>
@@ -8360,7 +8360,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
-                      <PasswordInput v-model="form.password" class="col-span-3" :placeholder="t('connection.databasePlaceholder')" />
+                      <PasswordInput v-model="form.password" class="col-span-3" :show-toggle="!editingId" :placeholder="t('connection.databasePlaceholder')" />
                     </div>
                     <SavePasswordCheckbox v-model="form.save_password" />
                     <div class="grid grid-cols-4 items-center gap-4">
@@ -8396,7 +8396,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.consulToken") }}</Label>
-                      <PasswordInput v-model="form.password" class="col-span-3" :placeholder="t('connection.consulTokenPlaceholder')" />
+                      <PasswordInput v-model="form.password" class="col-span-3" :show-toggle="!editingId" :placeholder="t('connection.consulTokenPlaceholder')" />
                     </div>
                     <SavePasswordCheckbox v-model="form.save_password" />
                     <div class="grid grid-cols-4 items-center gap-4">
@@ -8502,7 +8502,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
-                      <PasswordInput v-model="form.password" class="col-span-3" />
+                      <PasswordInput :show-toggle="!editingId" v-model="form.password" class="col-span-3" />
                     </div>
                     <SavePasswordCheckbox v-model="form.save_password" />
                   </template>
@@ -8546,7 +8546,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
-                      <PasswordInput v-model="form.password" class="col-span-3" />
+                      <PasswordInput :show-toggle="!editingId" v-model="form.password" class="col-span-3" />
                     </div>
                     <SavePasswordCheckbox v-model="form.save_password" />
                   </template>
@@ -8575,12 +8575,12 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.dynamodbSecretAccessKey") }}</Label>
-                      <PasswordInput v-model="form.password" class="col-span-3" />
+                      <PasswordInput :show-toggle="!editingId" v-model="form.password" class="col-span-3" />
                     </div>
                     <SavePasswordCheckbox v-model="form.save_password" />
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.dynamodbSessionToken") }}</Label>
-                      <PasswordInput v-model="form.connection_string" class="col-span-3" :placeholder="t('connection.dynamodbSessionTokenPlaceholder')" />
+                      <PasswordInput :show-toggle="!editingId" v-model="form.connection_string" class="col-span-3" :placeholder="t('connection.dynamodbSessionTokenPlaceholder')" />
                     </div>
                   </template>
 
@@ -8680,7 +8680,7 @@ function openExternalUrl(url: string) {
                       </div>
                       <div v-if="mongoAuthMechanism !== 'MONGODB-OIDC'" class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
-                        <PasswordInput v-model="form.password" class="col-span-3" />
+                        <PasswordInput :show-toggle="!editingId" v-model="form.password" class="col-span-3" />
                       </div>
                       <SavePasswordCheckbox v-if="mongoAuthMechanism !== 'MONGODB-OIDC'" v-model="form.save_password" />
                       <div class="grid grid-cols-4 items-center gap-4">
@@ -8832,7 +8832,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
-                      <PasswordInput v-model="form.password" class="col-span-3" />
+                      <PasswordInput :show-toggle="!editingId" v-model="form.password" class="col-span-3" />
                     </div>
                     <SavePasswordCheckbox v-model="form.save_password" />
                     <div class="grid grid-cols-4 items-start gap-4">
@@ -8889,7 +8889,7 @@ function openExternalUrl(url: string) {
                       </div>
                       <div class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">Token</Label>
-                        <PasswordInput v-model="form.password" class="col-span-3" />
+                        <PasswordInput :show-toggle="!editingId" v-model="form.password" class="col-span-3" />
                       </div>
                       <SavePasswordCheckbox v-model="form.save_password" />
                     </template>
@@ -8900,7 +8900,7 @@ function openExternalUrl(url: string) {
                       </div>
                       <div class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">Token</Label>
-                        <PasswordInput v-model="form.password" class="col-span-3" />
+                        <PasswordInput :show-toggle="!editingId" v-model="form.password" class="col-span-3" />
                       </div>
                       <SavePasswordCheckbox v-model="form.save_password" />
                     </template>
@@ -8911,7 +8911,7 @@ function openExternalUrl(url: string) {
                       </div>
                       <div class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
-                        <PasswordInput v-model="form.password" class="col-span-3" />
+                        <PasswordInput :show-toggle="!editingId" v-model="form.password" class="col-span-3" />
                       </div>
                       <SavePasswordCheckbox v-model="form.save_password" />
                       <div class="grid grid-cols-4 items-center gap-4">
@@ -8939,7 +8939,7 @@ function openExternalUrl(url: string) {
 
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">Auth Token</Label>
-                      <PasswordInput v-model="form.password" class="col-span-3" placeholder="eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9..." />
+                      <PasswordInput v-model="form.password" class="col-span-3" :show-toggle="!editingId" placeholder="eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9..." />
                     </div>
 
                     <SavePasswordCheckbox v-model="form.save_password" />
@@ -9030,7 +9030,7 @@ function openExternalUrl(url: string) {
                     <template v-if="salesforceAuthMode === 'token'">
                       <div class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">{{ t("connection.salesforceAccessToken") }}</Label>
-                        <PasswordInput v-model="form.password" class="col-span-3" :placeholder="t('connection.salesforceAccessTokenPlaceholder')" />
+                        <PasswordInput v-model="form.password" class="col-span-3" :show-toggle="!editingId" :placeholder="t('connection.salesforceAccessTokenPlaceholder')" />
                       </div>
                       <SavePasswordCheckbox v-model="form.save_password" />
                       <div class="grid grid-cols-4 items-start gap-4">
@@ -9079,7 +9079,7 @@ function openExternalUrl(url: string) {
                       <div class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">{{ t("connection.salesforceClientSecret") }}</Label>
                         <div class="col-span-3 space-y-1.5">
-                          <PasswordInput v-model="salesforceClientSecret" :placeholder="t('connection.salesforceClientSecretPlaceholder')" :disabled="salesforceOauthRunning" autocomplete="new-password" />
+                          <PasswordInput v-model="salesforceClientSecret" :show-toggle="!editingId" :placeholder="t('connection.salesforceClientSecretPlaceholder')" :disabled="salesforceOauthRunning" autocomplete="new-password" />
                         </div>
                       </div>
 
@@ -9095,7 +9095,7 @@ function openExternalUrl(url: string) {
                         <div class="grid grid-cols-4 items-start gap-4">
                           <Label :class="connectionLabelClass">{{ t("connection.salesforceUserPasswordLabel") }}</Label>
                           <div class="col-span-3 space-y-1.5">
-                            <PasswordInput v-model="salesforceUserPassword" :placeholder="t('connection.salesforceUserPasswordPlaceholder')" :disabled="salesforceOauthRunning" autocomplete="new-password" />
+                            <PasswordInput v-model="salesforceUserPassword" :show-toggle="!editingId" :placeholder="t('connection.salesforceUserPasswordPlaceholder')" :disabled="salesforceOauthRunning" autocomplete="new-password" />
                             <p class="text-xs leading-5 text-muted-foreground">{{ t("connection.salesforceUserPasswordHint") }}</p>
                           </div>
                         </div>
@@ -9400,7 +9400,7 @@ function openExternalUrl(url: string) {
 
                     <div v-if="form.db_type !== 'spanner'" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ form.db_type === "meilisearch" ? t("connection.mqAuthApiKey") : t("connection.password") }}</Label>
-                      <PasswordInput v-model="form.password" class="col-span-3" />
+                      <PasswordInput :show-toggle="!editingId" v-model="form.password" class="col-span-3" />
                     </div>
 
                     <SavePasswordCheckbox v-if="form.db_type !== 'spanner'" v-model="form.save_password" />
@@ -9899,7 +9899,7 @@ function openExternalUrl(url: string) {
 
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelSmallClass">{{ t("connection.damengSslKeystorePassword") }}</Label>
-                    <PasswordInput v-model="damengSslKeystorePassword" class="col-span-3" :disabled="!tlsEnabled" />
+                    <PasswordInput :show-toggle="!editingId" v-model="damengSslKeystorePassword" class="col-span-3" :disabled="!tlsEnabled" />
                   </div>
 
                   <div class="grid grid-cols-4 items-center gap-4">
@@ -9933,7 +9933,7 @@ function openExternalUrl(url: string) {
                           <TooltipContent>{{ t("connection.cassandraTruststoreBrowse") }}</TooltipContent>
                         </Tooltip>
                       </div>
-                      <PasswordInput v-model="cassandraTls.truststore_password" :placeholder="t('connection.cassandraTruststorePassword')" :disabled="!tlsEnabled" />
+                      <PasswordInput :show-toggle="!editingId" v-model="cassandraTls.truststore_password" :placeholder="t('connection.cassandraTruststorePassword')" :disabled="!tlsEnabled" />
                       <p class="text-[11px] leading-4 text-muted-foreground">{{ t("connection.cassandraTruststoreHint") }}</p>
                     </div>
                   </div>
@@ -9957,7 +9957,7 @@ function openExternalUrl(url: string) {
                           <TooltipContent>{{ t("connection.cassandraKeystoreBrowse") }}</TooltipContent>
                         </Tooltip>
                       </div>
-                      <PasswordInput v-model="cassandraTls.keystore_password" :placeholder="t('connection.cassandraKeystorePassword')" :disabled="!tlsEnabled" />
+                      <PasswordInput :show-toggle="!editingId" v-model="cassandraTls.keystore_password" :placeholder="t('connection.cassandraKeystorePassword')" :disabled="!tlsEnabled" />
                       <p class="text-[11px] leading-4 text-muted-foreground">{{ t("connection.cassandraKeystoreHint") }}</p>
                     </div>
                   </div>
@@ -10387,7 +10387,7 @@ function openExternalUrl(url: string) {
                           </div>
                           <div class="grid gap-1.5">
                             <Label>{{ t("connection.nacosConsolePassword") }}</Label>
-                            <PasswordInput v-model="nacosConsolePassword" />
+                            <PasswordInput :show-toggle="!editingId" v-model="nacosConsolePassword" />
                           </div>
                         </div>
                       </template>
@@ -10914,11 +10914,11 @@ function openExternalUrl(url: string) {
                     </div>
                     <div v-if="selectedSshLayer.auth_method === 'key' || selectedSshLayer.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.sshKeyPassphrase") }}</Label>
-                      <PasswordInput v-model="selectedSshLayer.key_passphrase" class="col-span-3" :placeholder="t('connection.sshKeyPassphrasePlaceholder')" :disabled="selectedSshLayer.enabled === false" />
+                      <PasswordInput :show-toggle="!editingId" v-model="selectedSshLayer.key_passphrase" class="col-span-3" :placeholder="t('connection.sshKeyPassphrasePlaceholder')" :disabled="selectedSshLayer.enabled === false" />
                     </div>
                     <div v-if="!selectedSshLayer.auth_method || selectedSshLayer.auth_method === 'password' || selectedSshLayer.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.sshPassword") }}</Label>
-                      <PasswordInput v-model="selectedSshLayer.password" class="col-span-3" :placeholder="t('connection.sshPasswordPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
+                      <PasswordInput :show-toggle="!editingId" v-model="selectedSshLayer.password" class="col-span-3" :placeholder="t('connection.sshPasswordPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
                     </div>
                     <div v-if="selectedSshLayer.auth_method === 'none'" class="grid grid-cols-4 items-center gap-4">
                       <span />
@@ -10980,7 +10980,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.proxyPassword") }}</Label>
-                      <PasswordInput v-model="selectedProxyLayer.password" class="col-span-3" :placeholder="t('connection.proxyPasswordPlaceholder')" :disabled="selectedProxyLayer.enabled === false" />
+                      <PasswordInput :show-toggle="!editingId" v-model="selectedProxyLayer.password" class="col-span-3" :placeholder="t('connection.proxyPasswordPlaceholder')" :disabled="selectedProxyLayer.enabled === false" />
                     </div>
                   </template>
                   <template v-else-if="selectedHttpTunnelLayer && !selectedLayerProfileId">
@@ -11013,7 +11013,7 @@ function openExternalUrl(url: string) {
                     <div v-if="selectedHttpTunnelLayer!.protocol !== 'navicat_mysql'" class="grid min-w-0 grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.httpTunnelToken") }}</Label>
                       <div class="col-span-3 min-w-0">
-                        <PasswordInput v-model="selectedHttpTunnelLayer!.token" class="w-full min-w-0" :placeholder="t('connection.httpTunnelTokenPlaceholder')" :disabled="selectedHttpTunnelLayer!.enabled === false" />
+                        <PasswordInput :show-toggle="!editingId" v-model="selectedHttpTunnelLayer!.token" class="w-full min-w-0" :placeholder="t('connection.httpTunnelTokenPlaceholder')" :disabled="selectedHttpTunnelLayer!.enabled === false" />
                       </div>
                     </div>
                     <div class="grid min-w-0 grid-cols-4 items-center gap-4">

@@ -7,12 +7,12 @@ import PasswordInput from "@/components/ui/PasswordInput.vue";
 
 const mountedContainers: HTMLDivElement[] = [];
 
-async function mountPasswordInput(value: string) {
+async function mountPasswordInput(value: string, showToggle = true) {
   const container = document.createElement("div");
   mountedContainers.push(container);
   document.body.append(container);
 
-  const app = createApp(PasswordInput, { modelValue: value });
+  const app = createApp(PasswordInput, { modelValue: value, showToggle });
   app.use(createI18n({ legacy: false, locale: "en", messages: { en: { common: { showPassword: "Show password", hidePassword: "Hide password" } } } }));
   app.mount(container);
   await nextTick();
@@ -35,5 +35,12 @@ describe("PasswordInput", () => {
     container.querySelector<HTMLButtonElement>("button")?.click();
     await nextTick();
     expect(container.querySelector<HTMLInputElement>("input[data-password-input]")?.getAttribute("type")).toBe("text");
+  });
+
+  it("does not render a reveal control when the parent disables it", async () => {
+    const container = await mountPasswordInput("saved-secret", false);
+
+    expect(container.querySelector("button")).toBeNull();
+    expect(container.querySelector<HTMLInputElement>("input[data-password-input]")?.getAttribute("type")).toBe("password");
   });
 });

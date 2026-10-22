@@ -17,7 +17,7 @@
     "fileAssociations": [],
     "resources": {"custom-resources/": "custom/"},
     "windows": {
-      "webviewInstallMode": {"silent": true, "type": "offlineInstaller"}
+      "webviewInstallMode": {"silent": true, "type": "downloadBootstrapper"}
     }
   },
   "plugins": {

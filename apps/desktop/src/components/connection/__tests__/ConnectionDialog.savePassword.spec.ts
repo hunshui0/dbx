@@ -99,11 +99,11 @@ vi.mock("@/components/ui/PasswordInput.vue", async () => {
   const { defineComponent, h } = await import("vue");
   return {
     default: defineComponent({
-      props: ["modelValue"],
+      props: ["modelValue", "showToggle"],
       setup:
         (props, { attrs }) =>
         () =>
-          h("input", { ...attrs, type: "password", value: props.modelValue }),
+          h("input", { ...attrs, type: "password", value: props.modelValue, "data-show-toggle": String(props.showToggle) }),
     }),
   };
 });
@@ -217,6 +217,7 @@ describe("ConnectionDialog save-password checkbox", () => {
   it("renders on the Redis form and toggles form.save_password", async () => {
     await mountDialog(redisConnection());
 
+    expect(document.querySelector<HTMLInputElement>("input[type=password]")?.getAttribute("data-show-toggle")).toBe("false");
     const checkbox = savePasswordCheckbox();
     expect(checkbox, "Redis form should render the save-password checkbox").toBeTruthy();
     expect(checkbox!.checked).toBe(true);
