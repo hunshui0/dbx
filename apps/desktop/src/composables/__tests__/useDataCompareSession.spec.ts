@@ -128,6 +128,30 @@ test("full compare sends an explicit mode that bypasses default row-count thresh
   assert.equal(options?.degradationThreshold.sampleSize, 10_000);
 });
 
+test("sends exclusions for this table only and retains the filtered scope in results", async () => {
+  const rules = [{ column: "USER_ID", excludeNull: true, excludeEmptyString: true, values: ["0", "NULL"] }];
+  const input = baseConfig({ selectedSourceTables: ["users", "orders"], keyExclusionsByTable: { users: rules } });
+  const session = startDataCompareSession(
+    input,
+    [
+      { sourceTable: "users", targetTable: "users" },
+      { sourceTable: "orders", targetTable: "orders" },
+    ],
+    dependencies,
+  );
+  rules[0]!.values.push("mutated-after-start");
+  for (let attempt = 0; attempt < 50 && session.status === "running"; attempt++) await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(session.status, "completed");
+  const expected = [{ column: "USER_ID", excludeNull: true, excludeEmptyString: true, values: ["0", "NULL"] }];
+  assert.deepEqual(apiMock.prepareDataCompareFromTables.mock.calls[0]?.[0].keyExclusions, expected);
+  assert.deepEqual(apiMock.prepareDataCompareFromTables.mock.calls[1]?.[0].keyExclusions, []);
+  assert.deepEqual(session.batchResults[0]?.keyExclusions, expected);
+  assert.deepEqual(session.batchResults[1]?.keyExclusions, []);
+  apiMock.prepareDataCompareMissingTarget.mockResolvedValue(preparationFor("users"));
+  await runSession({ ...baseConfig(), targetTables: [], selectedSourceTables: ["users"], keyColumnsByTable: { users: ["user_id"] }, keyExclusionsByTable: { users: expected } }, [{ sourceTable: "users", targetTable: "users" }]);
+  assert.deepEqual(apiMock.prepareDataCompareMissingTarget.mock.calls[0]?.[0].keyExclusions, expected);
+});
+
 test("sample compare uses the configured row count for existing and missing target tables", async () => {
   apiMock.prepareDataCompareMissingTarget.mockResolvedValue(preparationFor("users"));
   const input = baseConfig({ selectedSourceTables: ["users"], targetTable: "users", compareMode: "sample", sampleSize: 4321 });

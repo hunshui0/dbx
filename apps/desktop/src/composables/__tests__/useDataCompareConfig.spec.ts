@@ -92,6 +92,24 @@ describe("useDataCompareConfig", () => {
     expect(state.activeConfig.value).toBeNull();
   });
 
+  it("persists per-table key exclusions without sharing rule values", async () => {
+    const { useDataCompareConfig } = await import("../useDataCompareConfig");
+    const state = useDataCompareConfig();
+    const rules = { users: [{ column: "user_id", excludeNull: true, excludeEmptyString: false, values: ["0", "  "] }] };
+    const config = state.createConfig("Filtered", { ...snapshot(), keyExclusionsByTable: rules });
+    rules.users[0]!.values.push("changed");
+    const copy = state.duplicateConfig(config.id)!;
+    copy.keyExclusionsByTable!.users![0]!.values.push("copy");
+    expect(config.keyExclusionsByTable!.users![0]!.values).toEqual(["0", "  "]);
+    state.updateConfig(config.id, { keyExclusionsByTable: { users: [{ column: "user_id", excludeNull: false, excludeEmptyString: false, values: ["-1"] }] } });
+    vi.resetModules();
+    const { useDataCompareConfig: restore } = await import("../useDataCompareConfig");
+    expect(restore().configs.value.find((item) => item.id === config.id)?.keyExclusionsByTable).toEqual({ users: [{ column: "user_id", excludeNull: false, excludeEmptyString: false, values: ["-1"] }] });
+    const restored = restore();
+    restored.updateConfig(config.id, { keyExclusionsByTable: {} });
+    expect(restored.configs.value.find((item) => item.id === config.id)?.keyExclusionsByTable).toEqual({});
+  });
+
   it("duplicates a config under a new id without sharing mutable arrays", async () => {
     const { useDataCompareConfig } = await import("../useDataCompareConfig");
     const state = useDataCompareConfig();

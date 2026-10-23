@@ -5,6 +5,34 @@ export type DataCompareCellValue = QueryResult["rows"][number][number];
 export type SamplingStrategy = "Random" | "ExtremeValues" | "Hybrid";
 export type DataCompareMode = "full" | "sample";
 
+/** Exclude a row when any selected match column meets one of these conditions. */
+export interface DataCompareKeyExclusion {
+  column: string;
+  excludeNull: boolean;
+  excludeEmptyString: boolean;
+  values: string[];
+}
+
+export function normalizeDataCompareKeyExclusions(value: unknown): DataCompareKeyExclusion[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object" || typeof entry.column !== "string" || !entry.column.trim()) return [];
+    const values = Array.isArray(entry.values) ? [...new Set<string>(entry.values.filter((item: unknown): item is string => typeof item === "string" && item.length > 0))] : [];
+    const rule = { column: entry.column.trim(), excludeNull: entry.excludeNull === true, excludeEmptyString: entry.excludeEmptyString === true, values };
+    return rule.excludeNull || rule.excludeEmptyString || values.length ? [rule] : [];
+  });
+}
+
+export function normalizeDataCompareKeyExclusionsByTable(value: unknown): Record<string, DataCompareKeyExclusion[]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([table, rules]) => {
+      const normalized = normalizeDataCompareKeyExclusions(rules);
+      return table && normalized.length ? [[table, normalized]] : [];
+    }),
+  );
+}
+
 export const DEFAULT_DATA_COMPARE_SAMPLE_SIZE = 10_000;
 export const MAX_DATA_COMPARE_SAMPLE_SIZE = 10_000_000;
 
@@ -63,6 +91,7 @@ export interface DataCompareReportTable {
   columns: string[];
   keyColumns: string[];
   ignoredColumns?: string[];
+  keyExclusions?: DataCompareKeyExclusion[];
   sourceRowCount: number;
   targetRowCount: number;
   sourceTruncated: boolean;
@@ -151,6 +180,8 @@ export function buildDataCompareReportMarkdown(options: DataCompareReportOptions
       columns: table.columns,
       keyColumns: table.keyColumns,
       ignoredColumns: table.ignoredColumns ?? [],
+      keyExclusions: table.keyExclusions ?? [],
+      rowScope: table.keyExclusions?.length ? "filtered" : "unfiltered",
       addedCount: table.diff.added.length,
       removedCount: table.diff.removed.length,
       modifiedCount: table.diff.modified.length,
@@ -209,6 +240,7 @@ export interface DataCompareFromTablesOptions {
   columns: string[];
   keyColumns: string[];
   ignoredColumns?: string[];
+  keyExclusions?: DataCompareKeyExclusion[];
   /** Source-side column names aligned positionally with `columns`; needed when the two databases store identifier case differently (e.g. SQL Server vs Oracle). */
   sourceColumns?: string[];
   fetchBatchSize?: number;
@@ -229,6 +261,7 @@ export interface DataCompareMissingTargetOptions {
   targetTable: string;
   keyColumns: string[];
   ignoredColumns?: string[];
+  keyExclusions?: DataCompareKeyExclusion[];
   fetchBatchSize?: number;
   degradationThreshold?: DegradationThreshold;
   compareMode?: DataCompareMode;
@@ -273,7 +306,7 @@ export interface DataCompareSyncPlan {
 }
 
 /** Minimal column shape a match-column picker needs, so it can be fed straight from `getColumns`. */
-export type CompareKeyColumnOption = Pick<ColumnInfo, "name" | "is_primary_key">;
+export type CompareKeyColumnOption = Pick<ColumnInfo, "name" | "is_primary_key"> & Partial<Pick<ColumnInfo, "data_type">>;
 
 /**
  * Safely infers the columns to use as comparison keys for a table.

@@ -24,6 +24,18 @@ const DATA_SYNC_CONDITION_BATCH_SIZE: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DataCompareKeyExclusion {
+    pub column: String,
+    #[serde(default)]
+    pub exclude_null: bool,
+    #[serde(default)]
+    pub exclude_empty_string: bool,
+    #[serde(default)]
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CompareDataRowsOptions {
     pub columns: Vec<String>,
     pub key_columns: Vec<String>,
@@ -66,6 +78,8 @@ pub struct DataCompareFromTablesOptions {
     pub key_columns: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignored_columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_exclusions: Vec<DataCompareKeyExclusion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_columns: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +109,8 @@ pub struct DataCompareMissingTargetOptions {
     pub key_columns: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignored_columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_exclusions: Vec<DataCompareKeyExclusion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_batch_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -375,10 +391,37 @@ pub async fn prepare_data_compare_from_tables(
     )
     .await?;
 
-    let source_count_sql =
-        build_count_table_sql(Some(source_database_type), Some(&options.source_schema), &options.source_table);
-    let target_count_sql =
-        build_count_table_sql(Some(target_database_type), Some(&options.target_schema), &options.target_table);
+    let source_filter_keys = aligned_source_key_columns(
+        &options.columns,
+        &aligned_source_column_names(&options.columns, options.source_columns.as_ref()),
+        &options.key_columns,
+    );
+    let source_filter = build_key_exclusion_filter(
+        source_database_type,
+        &options.key_columns,
+        &source_filter_keys,
+        &source_column_info.iter().cloned().map(data_grid_column_info).collect::<Vec<_>>(),
+        &options.key_exclusions,
+    )?;
+    let target_filter = build_key_exclusion_filter(
+        target_database_type,
+        &options.key_columns,
+        &options.key_columns,
+        &target_column_info.iter().cloned().map(data_grid_column_info).collect::<Vec<_>>(),
+        &options.key_exclusions,
+    )?;
+    let source_count_sql = build_filtered_compare_count_sql(
+        source_database_type,
+        &options.source_schema,
+        &options.source_table,
+        &source_filter,
+    );
+    let target_count_sql = build_filtered_compare_count_sql(
+        target_database_type,
+        &options.target_schema,
+        &options.target_table,
+        &target_filter,
+    );
 
     let (source_count_result, target_count_result) = tokio::try_join!(
         execute_sql_statement_with_options(
@@ -479,6 +522,7 @@ pub async fn prepare_data_compare_from_tables(
                         source_database_type,
                         fetch_batch_size,
                         row_budget,
+                        &source_filter,
                     ),
                     fetch_compare_rows(
                         state,
@@ -491,6 +535,7 @@ pub async fn prepare_data_compare_from_tables(
                         target_database_type,
                         fetch_batch_size,
                         row_budget,
+                        &target_filter,
                     )
                 )?;
                 let source_truncated = validate_full_compare_read(source_row_count, src.len(), row_budget)?;
@@ -510,6 +555,7 @@ pub async fn prepare_data_compare_from_tables(
                         source_database_type,
                         &sampling_strategy,
                         threshold.sample_size.max(1),
+                        &source_filter,
                     ),
                     fetch_sampled_compare_rows(
                         state,
@@ -522,6 +568,7 @@ pub async fn prepare_data_compare_from_tables(
                         target_database_type,
                         &sampling_strategy,
                         threshold.sample_size.max(1),
+                        &target_filter,
                     )
                 )?;
                 let src = normalize_numeric_compare_rows(&columns, src, &numeric_columns);
@@ -640,8 +687,19 @@ pub async fn prepare_data_compare_missing_target(
         return Err("Binary columns cannot be used as data comparison keys".to_string());
     }
 
-    let source_count_sql =
-        build_count_table_sql(Some(source_database_type), Some(&options.source_schema), &options.source_table);
+    let source_filter = build_key_exclusion_filter(
+        source_database_type,
+        &options.key_columns,
+        &options.key_columns,
+        &source_columns.iter().cloned().map(data_grid_column_info).collect::<Vec<_>>(),
+        &options.key_exclusions,
+    )?;
+    let source_count_sql = build_filtered_compare_count_sql(
+        source_database_type,
+        &options.source_schema,
+        &options.source_table,
+        &source_filter,
+    );
     let source_count_result = execute_sql_statement_with_options(
         state,
         &options.source_connection_id,
@@ -673,6 +731,7 @@ pub async fn prepare_data_compare_missing_target(
             source_database_type,
             fetch_batch_size,
             row_budget,
+            &source_filter,
         )
         .await?;
         let truncated = validate_full_compare_read(source_row_count, rows.len(), row_budget)?;
@@ -693,6 +752,7 @@ pub async fn prepare_data_compare_missing_target(
                     source_database_type,
                     fetch_batch_size,
                     row_budget,
+                    &source_filter,
                 )
                 .await?;
                 let truncated = validate_full_compare_read(source_row_count, rows.len(), row_budget)?;
@@ -710,6 +770,7 @@ pub async fn prepare_data_compare_missing_target(
                     source_database_type,
                     &sampling_strategy,
                     threshold.sample_size.max(1),
+                    &source_filter,
                 )
                 .await?;
                 let truncated = source_row_count > rows.len() as u64;
@@ -1313,6 +1374,83 @@ fn aligned_source_key_columns(columns: &[String], source_columns: &[String], key
         .collect()
 }
 
+fn build_key_exclusion_filter(
+    database_type: DatabaseType,
+    keys: &[String],
+    physical_keys: &[String],
+    column_info: &[DataGridColumnInfo],
+    exclusions: &[DataCompareKeyExclusion],
+) -> Result<String, String> {
+    let mut predicates = Vec::new();
+    for rule in exclusions {
+        let index = keys
+            .iter()
+            .position(|key| key.eq_ignore_ascii_case(rule.column.trim()))
+            .ok_or_else(|| format!("Row exclusions must reference a selected match column: {}", rule.column))?;
+        let name = physical_keys.get(index).ok_or("Match column mapping is incomplete")?;
+        let info = column_info
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| format!("Excluded match column does not exist: {name}"))?;
+        if is_binary_compare_type(Some(&info.data_type)) {
+            return Err(format!("Binary columns cannot be used as data comparison keys: {name}"));
+        }
+        let column = quote_table_identifier(Some(database_type), &info.name);
+        let data_type = info.data_type.to_ascii_lowercase();
+        let character_column = ["char", "text", "clob", "string", "graphic"].iter().any(|ty| data_type.contains(ty))
+            || data_type.starts_with("enum")
+            || data_type.starts_with("set");
+        if rule.exclude_empty_string && !character_column {
+            return Err(format!("Empty-string exclusions require a character match column: {name}"));
+        }
+        let empty_is_null =
+            matches!(database_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng);
+        let exclude_null = rule.exclude_null || (rule.exclude_empty_string && empty_is_null);
+        let mut conditions = Vec::new();
+        if exclude_null {
+            conditions.push(format!("{column} IS NOT NULL"));
+        }
+        let mut values = rule.values.clone();
+        if rule.exclude_empty_string && !empty_is_null {
+            values.push(String::new());
+        }
+        let mut literals = Vec::new();
+        for value in values {
+            let literal = format_data_grid_sql_literal(&Value::String(value.clone()), Some(database_type), Some(info));
+            if is_numeric_compare_type(Some(&info.data_type))
+                && !literal
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_digit() || matches!(*byte, b'-' | b'+' | b'.'))
+            {
+                return Err(format!("Invalid numeric exclusion value for {name}: {value}"));
+            }
+            if !literals.contains(&literal) {
+                literals.push(literal);
+            }
+        }
+        // Keep NULL unless explicitly excluded: NOT IN alone would discard it via SQL's UNKNOWN.
+        if !literals.is_empty() {
+            let not_in = format!("{column} NOT IN ({})", literals.join(", "));
+            conditions.push(if exclude_null { not_in } else { format!("({column} IS NULL OR {not_in})") });
+        }
+        if !conditions.is_empty() {
+            predicates.push(format!("({})", conditions.join(" AND ")));
+        }
+    }
+    Ok(predicates.join(" AND "))
+}
+
+fn build_filtered_compare_count_sql(database_type: DatabaseType, schema: &str, table: &str, filter: &str) -> String {
+    let sql = build_count_table_sql(Some(database_type), Some(schema), table);
+    if filter.is_empty() {
+        sql
+    } else {
+        format!("{} WHERE {filter}", sql.trim_end_matches(';'))
+    }
+}
+
+#[cfg(test)]
 fn build_data_compare_select_sql(
     database_type: DatabaseType,
     schema: &str,
@@ -1321,6 +1459,29 @@ fn build_data_compare_select_sql(
     key_columns: &[String],
     row_limit: usize,
     offset: usize,
+) -> String {
+    build_filtered_data_compare_select_sql(
+        database_type,
+        schema,
+        table_name,
+        columns,
+        key_columns,
+        row_limit,
+        offset,
+        "",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_filtered_data_compare_select_sql(
+    database_type: DatabaseType,
+    schema: &str,
+    table_name: &str,
+    columns: &[String],
+    key_columns: &[String],
+    row_limit: usize,
+    offset: usize,
+    filter: &str,
 ) -> String {
     let table = if database_type == DatabaseType::Iris {
         table_data_qualified_table_name(Some(database_type), Some(schema), table_name, None)
@@ -1352,6 +1513,7 @@ fn build_data_compare_select_sql(
     } else {
         key_columns.iter().map(|column| format!("{} ASC", quote_column(column))).collect::<Vec<_>>().join(", ")
     };
+    let where_sql = if filter.is_empty() { String::new() } else { format!(" WHERE {filter}") };
 
     match pagination_strategy(Some(database_type), PaginationContext::BoundedRead) {
         TablePaginationStrategy::Db2FetchFirst => build_table_data_select_sql(TableDataSelectSqlOptions {
@@ -1362,15 +1524,16 @@ fn build_data_compare_select_sql(
             order_by: (!key_columns.is_empty()).then_some(order_expression),
             limit: Some(row_limit),
             offset: Some(offset),
+            where_input: (!filter.is_empty()).then(|| filter.to_string()),
             ..Default::default()
         }),
         TablePaginationStrategy::FetchFirst => {
             let offset_sql = if offset > 0 { format!(" OFFSET {offset} ROWS") } else { String::new() };
-            format!("SELECT {select_columns} FROM {table}{order_by}{offset_sql} FETCH FIRST {row_limit} ROWS ONLY")
+            format!("SELECT {select_columns} FROM {table}{where_sql}{order_by}{offset_sql} FETCH FIRST {row_limit} ROWS ONLY")
         }
         TablePaginationStrategy::Rownum => build_rownum_data_compare_select_sql(
             database_type,
-            &table,
+            &format!("{table}{where_sql}"),
             &select_columns,
             &order_by,
             columns,
@@ -1379,40 +1542,40 @@ fn build_data_compare_select_sql(
         ),
         TablePaginationStrategy::SqlServerTop => {
             if offset == 0 {
-                return format!("SELECT TOP ({row_limit}) {select_columns} FROM {table}{order_by}");
+                return format!("SELECT TOP ({row_limit}) {select_columns} FROM {table}{where_sql}{order_by}");
             }
             let page_alias = quote_table_identifier(Some(DatabaseType::SqlServer), "dbx_page");
             let row_number_alias = quote_table_identifier(Some(DatabaseType::SqlServer), "__dbx_row_num");
             let end = offset + row_limit;
             format!(
-                "WITH {page_alias} AS (SELECT {select_columns}, ROW_NUMBER() OVER (ORDER BY {order_expression}) AS {row_number_alias} FROM {table}) SELECT {select_columns} FROM {page_alias} WHERE {row_number_alias} > {offset} AND {row_number_alias} <= {end} ORDER BY {row_number_alias}"
+                "WITH {page_alias} AS (SELECT {select_columns}, ROW_NUMBER() OVER (ORDER BY {order_expression}) AS {row_number_alias} FROM {table}{where_sql}) SELECT {select_columns} FROM {page_alias} WHERE {row_number_alias} > {offset} AND {row_number_alias} <= {end} ORDER BY {row_number_alias}"
             )
         }
         TablePaginationStrategy::IrisTop => {
-            build_iris_table_select_sql(&select_columns, &table, "", &order_by, row_limit, offset as u64)
+            build_iris_table_select_sql(&select_columns, &table, &where_sql, &order_by, row_limit, offset as u64)
         }
         TablePaginationStrategy::InformixFirst => {
             let row_limit_clause =
                 if offset > 0 { format!("SKIP {offset} FIRST {row_limit}") } else { format!("FIRST {row_limit}") };
-            format!("SELECT {row_limit_clause} {select_columns} FROM {table}{order_by}")
+            format!("SELECT {row_limit_clause} {select_columns} FROM {table}{where_sql}{order_by}")
         }
         TablePaginationStrategy::FirebirdRows => {
             let rows = firebird_rows_clause(row_limit, offset);
-            format!("SELECT {select_columns} FROM {table}{order_by} {rows}")
+            format!("SELECT {select_columns} FROM {table}{where_sql}{order_by} {rows}")
         }
-        TablePaginationStrategy::AgentMaxRows => format!("SELECT {select_columns} FROM {table}{order_by};"),
-        TablePaginationStrategy::Unbounded => format!("SELECT {select_columns} FROM {table}{order_by}"),
+        TablePaginationStrategy::AgentMaxRows => format!("SELECT {select_columns} FROM {table}{where_sql}{order_by};"),
+        TablePaginationStrategy::Unbounded => format!("SELECT {select_columns} FROM {table}{where_sql}{order_by}"),
         TablePaginationStrategy::QuestDbLimit => {
             if offset > 0 {
                 let upper_bound = offset + row_limit;
-                format!("SELECT {select_columns} FROM {table}{order_by} LIMIT {offset}, {upper_bound}")
+                format!("SELECT {select_columns} FROM {table}{where_sql}{order_by} LIMIT {offset}, {upper_bound}")
             } else {
-                format!("SELECT {select_columns} FROM {table}{order_by} LIMIT {row_limit}")
+                format!("SELECT {select_columns} FROM {table}{where_sql}{order_by} LIMIT {row_limit}")
             }
         }
         TablePaginationStrategy::LimitOffset => {
             let offset_sql = if offset > 0 { format!(" OFFSET {offset}") } else { String::new() };
-            format!("SELECT {select_columns} FROM {table}{order_by} LIMIT {row_limit}{offset_sql};")
+            format!("SELECT {select_columns} FROM {table}{where_sql}{order_by} LIMIT {row_limit}{offset_sql};")
         }
     }
 }
@@ -1473,14 +1636,23 @@ async fn fetch_compare_rows(
     database_type: DatabaseType,
     fetch_batch_size: usize,
     row_budget: usize,
+    filter: &str,
 ) -> Result<Vec<Vec<Value>>, String> {
     let mut rows = Vec::new();
     let mut offset = 0usize;
 
     while rows.len() < row_budget {
         let batch_size = fetch_batch_size.min(row_budget - rows.len());
-        let sql =
-            build_data_compare_select_sql(database_type, schema, table_name, columns, key_columns, batch_size, offset);
+        let sql = build_filtered_data_compare_select_sql(
+            database_type,
+            schema,
+            table_name,
+            columns,
+            key_columns,
+            batch_size,
+            offset,
+            filter,
+        );
         let result = execute_sql_statement_with_options(
             state,
             connection_id,
@@ -1939,6 +2111,7 @@ fn dedupe_sampled_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
     sampled_rows
 }
 
+#[cfg(test)]
 fn build_sampling_select_sql(
     database_type: DatabaseType,
     schema: &str,
@@ -1948,11 +2121,40 @@ fn build_sampling_select_sql(
     strategy: &SamplingStrategy,
     sample_size: usize,
 ) -> String {
+    build_filtered_sampling_select_sql(
+        database_type,
+        schema,
+        table_name,
+        columns,
+        key_columns,
+        strategy,
+        sample_size,
+        "",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_filtered_sampling_select_sql(
+    database_type: DatabaseType,
+    schema: &str,
+    table_name: &str,
+    columns: &[String],
+    key_columns: &[String],
+    strategy: &SamplingStrategy,
+    sample_size: usize,
+    filter: &str,
+) -> String {
     let table = qualified_table_name(Some(database_type), Some(schema), table_name);
     let select_columns = if columns.is_empty() {
         "*".to_string()
     } else {
         columns.iter().map(|column| quote_table_identifier(Some(database_type), column)).collect::<Vec<_>>().join(", ")
+    };
+    // Every sampling branch reads the same filtered relation before applying its limit.
+    let table = if filter.is_empty() {
+        table
+    } else {
+        format!("(SELECT {select_columns} FROM {table} WHERE {filter}) dbx_filtered")
     };
 
     match strategy {
@@ -1961,10 +2163,18 @@ fn build_sampling_select_sql(
                 build_limited_sampling_select_sql(database_type, &table, &select_columns, Some("RAND()"), sample_size)
             }
             DatabaseType::Postgres | DatabaseType::Redshift | DatabaseType::DuckDb | DatabaseType::Databricks => {
-                format!("SELECT {select_columns} FROM {table} TABLESAMPLE SYSTEM (1) LIMIT {sample_size}")
+                if filter.is_empty() {
+                    format!("SELECT {select_columns} FROM {table} TABLESAMPLE SYSTEM (1) LIMIT {sample_size}")
+                } else {
+                    format!("SELECT {select_columns} FROM {table} ORDER BY RANDOM() LIMIT {sample_size}")
+                }
             }
             DatabaseType::SqlServer => {
-                format!("SELECT TOP ({sample_size}) {select_columns} FROM {table} TABLESAMPLE ({sample_size} ROWS)")
+                if filter.is_empty() {
+                    format!("SELECT TOP ({sample_size}) {select_columns} FROM {table} TABLESAMPLE ({sample_size} ROWS)")
+                } else {
+                    format!("SELECT TOP ({sample_size}) {select_columns} FROM {table} ORDER BY NEWID()")
+                }
             }
             DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::Goldendb => {
                 format!("SELECT {select_columns} FROM {table} ORDER BY RAND() LIMIT {sample_size}")
@@ -2057,12 +2267,20 @@ fn build_sampling_select_sql(
                     random_count,
                 ),
                 DatabaseType::Postgres | DatabaseType::Redshift | DatabaseType::DuckDb | DatabaseType::Databricks => {
-                    format!("SELECT {select_columns} FROM {table} TABLESAMPLE SYSTEM (1) LIMIT {random_count}")
+                    if filter.is_empty() {
+                        format!("SELECT {select_columns} FROM {table} TABLESAMPLE SYSTEM (1) LIMIT {random_count}")
+                    } else {
+                        format!("SELECT {select_columns} FROM {table} ORDER BY RANDOM() LIMIT {random_count}")
+                    }
                 }
                 DatabaseType::SqlServer => {
-                    format!(
+                    if filter.is_empty() {
+                        format!(
                         "SELECT TOP ({random_count}) {select_columns} FROM {table} TABLESAMPLE ({random_count} ROWS)"
                     )
+                    } else {
+                        format!("SELECT TOP ({random_count}) {select_columns} FROM {table} ORDER BY NEWID()")
+                    }
                 }
                 DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::Goldendb => {
                     format!("SELECT {select_columns} FROM {table} ORDER BY RAND() LIMIT {random_count}")
@@ -2122,12 +2340,22 @@ async fn fetch_sampled_compare_rows(
     database_type: DatabaseType,
     strategy: &SamplingStrategy,
     sample_size: usize,
+    filter: &str,
 ) -> Result<Vec<Vec<Value>>, String> {
     if sample_size == 0 {
         return Ok(Vec::new());
     }
 
-    let sql = build_sampling_select_sql(database_type, schema, table_name, columns, key_columns, strategy, sample_size);
+    let sql = build_filtered_sampling_select_sql(
+        database_type,
+        schema,
+        table_name,
+        columns,
+        key_columns,
+        strategy,
+        sample_size,
+        filter,
+    );
 
     let result = execute_sql_statement_with_options(
         state,
@@ -2214,6 +2442,7 @@ pub async fn verify_data(state: &AppState, options: VerifyDataOptions) -> Result
         columns: options.columns,
         key_columns: options.key_columns,
         ignored_columns: Vec::new(),
+        key_exclusions: Vec::new(),
         source_columns: None,
         fetch_batch_size: options.fetch_batch_size,
         degradation_threshold: Some(degradation_threshold),
@@ -2275,6 +2504,259 @@ mod tests {
     fn nullable_sync_keys_use_is_null_predicate() {
         let keys = HashMap::from([("nullable_id".to_string(), Value::Null)]);
         assert_eq!(where_by_key(&keys, &["nullable_id".to_string()], None, &[]), "\"nullable_id\" IS NULL");
+    }
+
+    fn key_exclusion(
+        column: &str,
+        exclude_null: bool,
+        exclude_empty_string: bool,
+        values: &[&str],
+    ) -> DataCompareKeyExclusion {
+        DataCompareKeyExclusion {
+            column: column.to_string(),
+            exclude_null,
+            exclude_empty_string,
+            values: values.iter().map(|value| value.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn key_exclusions_keep_null_distinct_from_empty_and_literal_null() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE t (id TEXT); INSERT INTO t VALUES (NULL), (''), ('0'), ('NULL'), ('  '), ('O''Brien'), ('safe');").unwrap();
+        let keys = vec!["id".to_string()];
+        let info = vec![data_compare_column("id", "VARCHAR(100)")];
+        let read = |rule| {
+            let filter = build_key_exclusion_filter(DatabaseType::Sqlite, &keys, &keys, &info, &[rule]).unwrap();
+            db.prepare(&format!("SELECT id FROM t WHERE {filter} ORDER BY rowid"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, Option<String>>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            read(key_exclusion("ID", false, false, &["0", "O'Brien"])),
+            vec![None, Some("".into()), Some("NULL".into()), Some("  ".into()), Some("safe".into())]
+        );
+        assert_eq!(
+            read(key_exclusion("id", true, true, &["0", "NULL", "O'Brien"])),
+            vec![Some("  ".into()), Some("safe".into())]
+        );
+        assert_eq!(read(key_exclusion("id", false, true, &[])).first(), Some(&None));
+    }
+
+    #[test]
+    fn key_exclusions_filter_before_paging_sampling_duplicates_and_sync() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE src (id TEXT, value TEXT); CREATE TABLE tgt (id TEXT, value TEXT);
+            INSERT INTO src VALUES (NULL,'a'), (NULL,'b'), ('','a'), ('','b'), ('0','a'), ('0','b'), ('1','same'), ('2','new'), ('3','source-only');
+            INSERT INTO tgt VALUES (NULL,'c'), (NULL,'d'), ('','c'), ('','d'), ('0','c'), ('0','d'), ('1','same'), ('2','old'), ('4','target-only');").unwrap();
+        let columns = vec!["id".to_string(), "value".to_string()];
+        let keys = vec!["id".to_string()];
+        let info = vec![data_compare_column("id", "TEXT")];
+        let filter = build_key_exclusion_filter(
+            DatabaseType::Sqlite,
+            &keys,
+            &keys,
+            &info,
+            &[key_exclusion("id", true, true, &["0"])],
+        )
+        .unwrap();
+        let read = |sql: &str| {
+            db.prepare(sql)
+                .unwrap()
+                .query_map([], |row| {
+                    Ok(vec![
+                        row.get::<_, Option<String>>(0)?.map_or(Value::Null, Value::String),
+                        json!(row.get::<_, String>(1)?),
+                    ])
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let read_table = |table| {
+            let sql = build_filtered_compare_count_sql(DatabaseType::Sqlite, "main", table, &filter);
+            assert_eq!(db.query_row(&sql, [], |row| row.get::<_, i64>(0)).unwrap(), 3);
+            (0..3)
+                .flat_map(|offset| {
+                    read(&build_filtered_data_compare_select_sql(
+                        DatabaseType::Sqlite,
+                        "main",
+                        table,
+                        &columns,
+                        &keys,
+                        1,
+                        offset,
+                        &filter,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        let source_rows = read_table("src");
+        let target_rows = read_table("tgt");
+        for strategy in [SamplingStrategy::Random, SamplingStrategy::ExtremeValues, SamplingStrategy::Hybrid] {
+            let sql = build_filtered_sampling_select_sql(
+                DatabaseType::Sqlite,
+                "main",
+                "src",
+                &columns,
+                &keys,
+                &strategy,
+                3,
+                &filter,
+            );
+            for row in read(&sql) {
+                assert!([json!("1"), json!("2"), json!("3")].contains(&row[0]));
+            }
+        }
+        let preparation = prepare_data_compare(DataComparePreparationOptions {
+            table_name: "tgt".to_string(),
+            schema: Some("main".to_string()),
+            columns: columns.clone(),
+            key_columns: keys.clone(),
+            column_info: Vec::new(),
+            source_rows,
+            target_rows,
+            database_type: Some(DatabaseType::Sqlite),
+        })
+        .unwrap();
+        assert_eq!(preparation.result.added.len(), 1);
+        assert_eq!(preparation.result.removed.len(), 1);
+        assert_eq!(preparation.result.modified.len(), 1);
+        assert!(!preparation.sync_sql.contains("'0'"));
+        assert!(preparation.sync_sql.contains("'2'"));
+        let unfiltered = read("SELECT id, value FROM src");
+        assert!(compare_data_rows(CompareDataRowsOptions {
+            columns,
+            key_columns: keys,
+            source_rows: unfiltered,
+            target_rows: Vec::new()
+        })
+        .is_err());
+        db.execute("INSERT INTO src VALUES ('2', 'still-duplicate')", []).unwrap();
+        let remaining = read(&format!("SELECT id, value FROM src WHERE {filter}"));
+        assert!(compare_data_rows(CompareDataRowsOptions {
+            columns: vec!["id".into(), "value".into()],
+            key_columns: vec!["id".into()],
+            source_rows: remaining,
+            target_rows: Vec::new(),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn key_exclusions_validate_types_keys_and_composite_any_match_semantics() {
+        let keys = vec!["tenant".to_string(), "id".to_string()];
+        let info = vec![data_compare_column("TENANT", "VARCHAR(100)"), data_compare_column("ID", "DECIMAL(31,0)")];
+        let physical = vec!["TENANT".to_string(), "ID".to_string()];
+        let rules = vec![
+            key_exclusion("tenant", true, true, &["O'Brien"]),
+            key_exclusion("ID", false, false, &["0", "9007199254740993123456789"]),
+        ];
+        let filter = build_key_exclusion_filter(DatabaseType::Db2, &keys, &physical, &info, &rules).unwrap();
+        assert!(filter.contains("\"TENANT\" IS NOT NULL"));
+        assert!(filter.contains("'O''Brien'"));
+        assert!(filter.contains("\"ID\" IS NULL OR \"ID\" NOT IN (0, 9007199254740993123456789)"));
+        assert!(filter.contains(") AND ("));
+        assert!(build_key_exclusion_filter(
+            DatabaseType::Db2,
+            &keys,
+            &physical,
+            &info,
+            &[key_exclusion("value", true, false, &[])]
+        )
+        .unwrap_err()
+        .contains("selected match column"));
+        assert!(build_key_exclusion_filter(
+            DatabaseType::Mysql,
+            &keys,
+            &physical,
+            &info,
+            &[key_exclusion("id", false, false, &["bad-number"])]
+        )
+        .unwrap_err()
+        .contains("Invalid numeric"));
+        assert!(build_key_exclusion_filter(
+            DatabaseType::Mysql,
+            &keys,
+            &physical,
+            &info,
+            &[key_exclusion("id", false, true, &[])]
+        )
+        .is_err());
+        assert!(build_key_exclusion_filter(
+            DatabaseType::Mysql,
+            &keys,
+            &physical,
+            &info,
+            &[key_exclusion("id", false, false, &[".5", "+1", "-1"])]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn key_exclusions_reach_db2_tidb_count_all_pages_and_sample_branches() {
+        for (db, column) in [(DatabaseType::Db2, "ID"), (DatabaseType::Mysql, "id")] {
+            let keys = vec![column.to_string()];
+            let filter = build_key_exclusion_filter(
+                db,
+                &["id".to_string()],
+                &keys,
+                &[data_compare_column(column, "VARCHAR(50)")],
+                &[key_exclusion("id", true, true, &["0"])],
+            )
+            .unwrap();
+            assert!(build_filtered_compare_count_sql(db, "APP", "USERS", &filter).contains(&format!("WHERE {filter}")));
+            for offset in [0, 1000, 2000] {
+                let sql =
+                    build_filtered_data_compare_select_sql(db, "APP", "USERS", &keys, &keys, 1000, offset, &filter);
+                assert!(sql.contains(&filter), "{sql}");
+            }
+            for strategy in [SamplingStrategy::Random, SamplingStrategy::ExtremeValues, SamplingStrategy::Hybrid] {
+                let sql = build_filtered_sampling_select_sql(db, "APP", "USERS", &keys, &keys, &strategy, 100, &filter);
+                let branches = if matches!(strategy, SamplingStrategy::Hybrid) {
+                    3
+                } else if matches!(strategy, SamplingStrategy::ExtremeValues) {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(sql.matches(&filter).count(), branches, "{sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn filtered_samples_do_not_apply_tablesample_to_a_derived_relation() {
+        for db in [DatabaseType::Postgres, DatabaseType::SqlServer] {
+            let columns = vec!["id".to_string()];
+            for strategy in [SamplingStrategy::Random, SamplingStrategy::Hybrid] {
+                let sql = build_filtered_sampling_select_sql(
+                    db,
+                    "app",
+                    "users",
+                    &columns,
+                    &columns,
+                    &strategy,
+                    100,
+                    "id IS NOT NULL",
+                );
+                assert!(!sql.contains("TABLESAMPLE"));
+                assert!(sql.contains("WHERE id IS NOT NULL"));
+            }
+        }
+        let keys = vec!["id".to_string()];
+        let filter = build_key_exclusion_filter(
+            DatabaseType::Oracle,
+            &keys,
+            &keys,
+            &[data_compare_column("id", "VARCHAR2(100)")],
+            &[key_exclusion("id", false, true, &[])],
+        )
+        .unwrap();
+        assert_eq!(filter, "(\"id\" IS NOT NULL)");
     }
 
     #[test]

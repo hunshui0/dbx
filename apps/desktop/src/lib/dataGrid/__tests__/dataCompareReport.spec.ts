@@ -21,6 +21,7 @@ const table: DataCompareReportTable = {
   status: "different",
   columns: ["id", "note", "amount"],
   keyColumns: ["id"],
+  keyExclusions: [{ column: "id", excludeNull: true, excludeEmptyString: false, values: ["0"] }],
   sourceRowCount: 20,
   targetRowCount: 18,
   sourceTruncated: true,
@@ -61,6 +62,8 @@ describe("buildDataCompareReportMarkdown", () => {
     expect(report).toContain('"compareModeLabel": "Sample compare"');
     expect(report).toContain('"sampleSizePerSide": 10');
     expect(report).toContain('"sourceTable": "orders"');
+    expect(report).toContain('"keyExclusions": [');
+    expect(report).toContain('"excludeNull": true');
     expect(report).toContain('"rowBudget": 10');
     expect(report).toContain("Only inspected rows are represented.");
     expect(report).toContain('"note": "new|row"');

@@ -256,6 +256,41 @@ function setupMocks() {
 }
 
 describe("DataCompareDialog match columns", () => {
+  it("configures excluded values for a match column before comparing", async () => {
+    setupMocks();
+    await openWithPrefilledSource("USERS");
+    const rule = document.querySelector('[data-key-exclusion-column="USER_ID"]')!;
+    const nullCheckbox = rule.querySelector<HTMLInputElement>("[data-exclude-null]")!;
+    nullCheckbox.checked = true;
+    nullCheckbox.dispatchEvent(new Event("change", { bubbles: true }));
+    await flushAsyncSetup();
+    const values = rule.querySelector<HTMLTextAreaElement>("[data-excluded-values]")!;
+    values.value = "0\n-1";
+    values.dispatchEvent(new Event("change", { bubbles: true }));
+    await flushAsyncSetup();
+    expect(rule.querySelector<HTMLInputElement>("[data-exclude-empty]")?.disabled).toBe(true);
+    compareButton()?.click();
+    await flushAsyncSetup();
+    expect(mocks.prepareDataCompareFromTables.mock.calls[0]?.[0].keyExclusions).toEqual([{ column: "USER_ID", excludeNull: true, excludeEmptyString: false, values: ["0", "-1"] }]);
+  });
+
+  it("removes exclusions when their match column is deselected", async () => {
+    setupMocks();
+    await openWithPrefilledSource("USERS");
+    const input = document.querySelector<HTMLTextAreaElement>('[data-key-exclusion-column="USER_ID"] textarea')!;
+    input.value = "0";
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    await flushAsyncSetup();
+    await togglePickerColumn("EMAIL");
+    await togglePickerColumn("USER_ID");
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await flushAsyncSetup();
+    expect(document.querySelector('[data-key-exclusion-column="USER_ID"]')).toBeNull();
+    compareButton()?.click();
+    await flushAsyncSetup();
+    expect(mocks.prepareDataCompareFromTables.mock.calls[0]?.[0]).toMatchObject({ keyColumns: ["EMAIL"], keyExclusions: [] });
+  });
+
   it("selects ignored fields from this table and hides match keys from the choices", async () => {
     setupMocks();
     await openWithPrefilledSource("USERS");
