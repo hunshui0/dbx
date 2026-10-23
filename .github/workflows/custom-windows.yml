@@ -74,12 +74,20 @@ jobs:
           $output = "target/custom-installer/DBX_${version}_x64-offline-setup.exe"
           Move-Item -LiteralPath $installers[0].FullName -Destination $output
           Get-FileHash -LiteralPath $output -Algorithm SHA256 | Format-List
-      - uses: actions/upload-artifact@v4
+      - name: Upload standard installer separately
+        uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: DBX-Custom-Windows-x64
+          name: DBX-Custom-Windows-x64-setup
           if-no-files-found: warn
           retention-days: 30
-          path: |
-            target/custom-installer/DBX_*_x64-setup.exe
-            target/custom-installer/DBX_*_x64-offline-setup.exe
+          path: target/custom-installer/DBX_*_x64-setup.exe
+
+      - name: Upload offline installer separately
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: DBX-Custom-Windows-x64-offline-setup
+          if-no-files-found: warn
+          retention-days: 30
+          path: target/custom-installer/DBX_*_x64-offline-setup.exe
