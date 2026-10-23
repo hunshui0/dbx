@@ -292,6 +292,51 @@ describe("sqlCompletion keyword snippets", () => {
 
     expect(items.some((item) => item.label === "QUALIFY")).toBe(false);
   });
+
+  describe("clause keywords after a FROM table reference (#13120)", () => {
+    const routineNames = ["wms_handle_order", "WriteHistoryEntry", "WhereUsed", "web_hook", "w_h_e_r", "wh_sync", "group_hist", "order_sync"];
+    const objects = routineNames.flatMap((name) => [
+      { name, schema: "app", type: "procedure" as const, signature: "" },
+      { name: `${name}_fn`, schema: "app", type: "function" as const, signature: "" },
+    ]);
+
+    function rankedItems(sql: string, databaseType: "mysql" | "postgres" | "sqlserver") {
+      const legacy = getSqlCompletionContext(sql, sql.length, { databaseType });
+      const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, sql.length, { databaseType }), legacy);
+      return buildSqlCompletionItemsFromContext(context, {
+        databaseType,
+        tables: [{ name: "users" }],
+        columnsByTable: new Map([["users", [{ name: "id", table: "users" }]]]),
+        objects,
+        keywordCase: "upper",
+      });
+    }
+
+    it.each([
+      ["SELECT * FROM users w", "WHERE"],
+      ["SELECT * FROM users wh", "WHERE"],
+      ["SELECT * FROM users whe", "WHERE"],
+      ["SELECT * FROM users wher", "WHERE"],
+      ["SELECT * FROM users u wh", "WHERE"],
+      ["SELECT * FROM users AS u gr", "GROUP"],
+      ["SELECT * FROM users ord", "ORDER"],
+    ])("ranks the clause keyword above routines for %s", (sql, keyword) => {
+      for (const databaseType of ["mysql", "postgres", "sqlserver"] as const) {
+        const items = rankedItems(sql, databaseType);
+        const keywordIndex = items.findIndex((item) => item.type === "keyword" && item.label === keyword);
+        const firstRoutineIndex = items.findIndex((item) => item.type === "function");
+        expect(keywordIndex, `${databaseType} ${sql}`).toBeGreaterThanOrEqual(0);
+        expect(items[0]?.type, `${databaseType} ${sql}`).toBe("keyword");
+        if (firstRoutineIndex >= 0) expect(keywordIndex, `${databaseType} ${sql}`).toBeLessThan(firstRoutineIndex);
+      }
+    });
+
+    it("keeps routines ahead of keywords where an expression is expected", () => {
+      const items = rankedItems("SELECT * FROM users WHERE id = wh", "mysql");
+
+      expect(items[0]?.type).toBe("function");
+    });
+  });
 });
 
 describe("SQL Server datepart completion", () => {
@@ -2797,5 +2842,60 @@ describe("quoted identifier completion filtering (issue #12008)", () => {
     ["", "test_"],
   ])("leaves %s (prefix %s) to CodeMirror's own matcher", (query, prefix) => {
     expect(quotedCompletionFilterPrefix(query, prefix)).toBeUndefined();
+  });
+});
+
+describe("Spanner keyword completion (issue #13129)", () => {
+  it.each([
+    "CREATE CHANGE STREAM",
+    "CREATE SEARCH INDEX",
+    "CREATE VECTOR INDEX",
+    "CREATE PROPERTY GRAPH",
+    "INTERLEAVE IN PARENT",
+    "STORING",
+    "PENDING_COMMIT_TIMESTAMP",
+    "GENERATE_UUID",
+    // Ported from the overlapping #13138 (row-deletion policies, DML exits,
+    // scalar types, sequence options) so one list carries the full dialect.
+    "ROW DELETION POLICY",
+    "THEN RETURN",
+    "INSERT OR UPDATE",
+    "SQL SECURITY INVOKER",
+    "BIT_REVERSED_POSITIVE",
+    "INT64",
+  ])("offers %s", (label) => {
+    const sql = "CREATE ";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "spanner",
+      tables: [],
+      columnsByTable: new Map(),
+    });
+
+    expect(items.some((item) => item.label === label)).toBe(true);
+  });
+
+  it("keeps BigQuery-only syntax out of the Spanner keyword list", () => {
+    const sql = "SELECT * ";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "spanner",
+      tables: [],
+      columnsByTable: new Map(),
+    });
+
+    // TABLESAMPLE and FOR SYSTEM_TIME AS OF are BigQuery syntax; Spanner reads
+    // staleness through the API, not SQL.
+    expect(items.some((item) => item.label === "TABLESAMPLE")).toBe(false);
+    expect(items.some((item) => item.label === "FOR SYSTEM_TIME AS OF")).toBe(false);
+  });
+
+  it("keeps Spanner-only DDL out of the PostgreSQL keyword list", () => {
+    const sql = "CREATE ";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "postgres",
+      tables: [],
+      columnsByTable: new Map(),
+    });
+
+    expect(items.some((item) => item.label === "CREATE CHANGE STREAM")).toBe(false);
   });
 });
