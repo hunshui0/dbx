@@ -62,6 +62,7 @@ export interface DataCompareReportTable {
   status: "different" | "same" | "error";
   columns: string[];
   keyColumns: string[];
+  ignoredColumns?: string[];
   sourceRowCount: number;
   targetRowCount: number;
   sourceTruncated: boolean;
@@ -149,6 +150,7 @@ export function buildDataCompareReportMarkdown(options: DataCompareReportOptions
       syncEligible: table.syncEligible,
       columns: table.columns,
       keyColumns: table.keyColumns,
+      ignoredColumns: table.ignoredColumns ?? [],
       addedCount: table.diff.added.length,
       removedCount: table.diff.removed.length,
       modifiedCount: table.diff.modified.length,
@@ -206,6 +208,7 @@ export interface DataCompareFromTablesOptions {
   targetTable: string;
   columns: string[];
   keyColumns: string[];
+  ignoredColumns?: string[];
   /** Source-side column names aligned positionally with `columns`; needed when the two databases store identifier case differently (e.g. SQL Server vs Oracle). */
   sourceColumns?: string[];
   fetchBatchSize?: number;
@@ -225,6 +228,7 @@ export interface DataCompareMissingTargetOptions {
   targetSchema: string;
   targetTable: string;
   keyColumns: string[];
+  ignoredColumns?: string[];
   fetchBatchSize?: number;
   degradationThreshold?: DegradationThreshold;
   compareMode?: DataCompareMode;
@@ -342,7 +346,8 @@ export interface CompareColumnIntersection {
  * migrated table's columns only match across engines when compared without
  * case. Target names are canonical because sync SQL runs against the target.
  */
-export function intersectCompareColumns(sourceColumns: (Pick<ColumnInfo, "name"> & Partial<Pick<ColumnInfo, "data_type">>)[], targetColumns: (Pick<ColumnInfo, "name"> & Partial<Pick<ColumnInfo, "data_type">>)[]): CompareColumnIntersection {
+export function intersectCompareColumns(sourceColumns: (Pick<ColumnInfo, "name"> & Partial<Pick<ColumnInfo, "data_type">>)[], targetColumns: (Pick<ColumnInfo, "name"> & Partial<Pick<ColumnInfo, "data_type">>)[], ignoredColumns: string[] = []): CompareColumnIntersection {
+  const ignored = new Set(normalizeKeyColumns(ignoredColumns).map((column) => column.toLowerCase()));
   const targetNamesByLowerName = new Map<string, string>();
   for (const column of targetColumns) {
     const lowerName = column.name.toLowerCase();
@@ -355,7 +360,7 @@ export function intersectCompareColumns(sourceColumns: (Pick<ColumnInfo, "name">
   for (const column of sourceColumns) {
     const lowerName = column.name.toLowerCase();
     const targetName = targetNamesByLowerName.get(lowerName);
-    if (targetName === undefined || matched.has(lowerName)) continue;
+    if (targetName === undefined || matched.has(lowerName) || ignored.has(lowerName)) continue;
     const targetColumn = targetColumns.find((candidate) => candidate.name === targetName);
     if (isBinaryCompareType(column.data_type) || isBinaryCompareType(targetColumn?.data_type)) continue;
     matched.add(lowerName);

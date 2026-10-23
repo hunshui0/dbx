@@ -30,6 +30,7 @@ export interface DataCompareConfig {
   sampleSize: number;
   /** Explicit match columns per source table; absent entry means "use the primary key". */
   keyColumnsByTable: Record<string, string[]>;
+  ignoredColumnsByTable?: Record<string, string[]>;
 }
 
 export interface DataCompareConfigSnapshot {
@@ -45,6 +46,7 @@ export interface DataCompareConfigSnapshot {
   compareMode: DataCompareMode;
   sampleSize: number;
   keyColumnsByTable: Record<string, string[]>;
+  ignoredColumnsByTable?: Record<string, string[]>;
 }
 
 const STORAGE_KEY = "dbx-data-compare-configs";
@@ -94,6 +96,7 @@ function sanitizeConfig(raw: unknown): DataCompareConfig | undefined {
     compareMode: item.compareMode === "sample" ? "sample" : "full",
     sampleSize: normalizeDataCompareSampleSize(item.sampleSize ?? DEFAULT_DATA_COMPARE_SAMPLE_SIZE),
     keyColumnsByTable: sanitizeKeyColumns(item.keyColumnsByTable),
+    ignoredColumnsByTable: sanitizeKeyColumns(item.ignoredColumnsByTable),
   };
 }
 
@@ -140,6 +143,7 @@ export function useDataCompareConfig() {
       selectedSourceTables: [...snapshot.selectedSourceTables],
       sampleSize: normalizeDataCompareSampleSize(snapshot.sampleSize),
       keyColumnsByTable: sanitizeKeyColumns(snapshot.keyColumnsByTable),
+      ignoredColumnsByTable: sanitizeKeyColumns(snapshot.ignoredColumnsByTable),
       id: uuid(),
       name: uniqueName(name),
       createdAt: now,
@@ -160,6 +164,7 @@ export function useDataCompareConfig() {
       ...(patch.selectedSourceTables ? { selectedSourceTables: [...patch.selectedSourceTables] } : {}),
       ...(patch.sampleSize !== undefined ? { sampleSize: normalizeDataCompareSampleSize(patch.sampleSize) } : {}),
       ...(patch.keyColumnsByTable ? { keyColumnsByTable: sanitizeKeyColumns(patch.keyColumnsByTable) } : {}),
+      ...(patch.ignoredColumnsByTable ? { ignoredColumnsByTable: sanitizeKeyColumns(patch.ignoredColumnsByTable) } : {}),
       updatedAt: Date.now(),
     };
     configs.value = configs.value.map((config, position) => (position === index ? next : config));
@@ -193,6 +198,7 @@ export function useDataCompareConfig() {
       updatedAt: now,
       selectedSourceTables: [...source.selectedSourceTables],
       keyColumnsByTable: sanitizeKeyColumns(source.keyColumnsByTable),
+      ignoredColumnsByTable: sanitizeKeyColumns(source.ignoredColumnsByTable),
     };
     configs.value = [copy, ...configs.value].slice(0, MAX_CONFIGS);
     activeConfigId.value = copy.id;

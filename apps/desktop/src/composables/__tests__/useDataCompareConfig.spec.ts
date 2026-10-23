@@ -67,6 +67,19 @@ describe("useDataCompareConfig", () => {
     expect(state.configs.value.map((config) => config.name)).toEqual(["Same (1)", "Same (1) (1)"]);
   });
 
+  it("persists per-table ignored fields and clones them independently", async () => {
+    const { useDataCompareConfig } = await import("../useDataCompareConfig");
+    const state = useDataCompareConfig();
+    const created = state.createConfig("Per table", { ...snapshot(), ignoredColumnsByTable: { users: ["email"], orders: [] } });
+    const copy = state.duplicateConfig(created.id)!;
+    copy.ignoredColumnsByTable!.users!.push("name");
+    expect(created.ignoredColumnsByTable).toEqual({ users: ["email"], orders: [] });
+    state.updateConfig(created.id, { ignoredColumnsByTable: { users: ["name"] } });
+    vi.resetModules();
+    const { useDataCompareConfig: restore } = await import("../useDataCompareConfig");
+    expect(restore().configs.value.find((config) => config.id === created.id)?.ignoredColumnsByTable).toEqual({ users: ["name"] });
+  });
+
   it("drops the active selection when the active config is deleted", async () => {
     const { useDataCompareConfig } = await import("../useDataCompareConfig");
     const state = useDataCompareConfig();

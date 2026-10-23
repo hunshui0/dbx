@@ -256,6 +256,27 @@ function setupMocks() {
 }
 
 describe("DataCompareDialog match columns", () => {
+  it("selects ignored fields from this table and hides match keys from the choices", async () => {
+    setupMocks();
+    await openWithPrefilledSource("USERS");
+    const ignored = document.querySelector('[data-ignored-columns-table="USERS"]');
+    ignored?.querySelector<HTMLButtonElement>("button.dbx-compare-key-columns-trigger")?.click();
+    await flushAsyncSetup();
+    expect(document.querySelector('[data-column-name="USER_ID"]')).toBeNull();
+    document.querySelector<HTMLButtonElement>('[data-column-name="EMAIL"]')?.click();
+    await flushAsyncSetup();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await flushAsyncSetup();
+    expect(ignored?.textContent).toContain("EMAIL");
+    compareButton()?.click();
+    await flushAsyncSetup();
+    expect(mocks.prepareDataCompareFromTables.mock.calls[0]?.[0]).toMatchObject({
+      columns: ["USER_ID", "NAME"],
+      sourceColumns: ["USER_ID", "NAME"],
+      ignoredColumns: ["EMAIL"],
+    });
+  });
+
   it("auto-selects the single primary key of a single-table compare and labels it", async () => {
     setupMocks();
     await openWithPrefilledSource("USERS");

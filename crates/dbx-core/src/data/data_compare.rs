@@ -64,6 +64,8 @@ pub struct DataCompareFromTablesOptions {
     pub target_table: String,
     pub columns: Vec<String>,
     pub key_columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_columns: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_columns: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,6 +93,8 @@ pub struct DataCompareMissingTargetOptions {
     pub target_table: String,
     #[serde(default)]
     pub key_columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_columns: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_batch_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -407,22 +411,29 @@ pub async fn prepare_data_compare_from_tables(
 
     // Cross-database comparison matches columns case-insensitively, so `columns` holds
     // target-side names while the source side needs its own names in the same order.
-    let requested_source_names = aligned_source_column_names(&options.columns, options.source_columns.as_ref());
+    let selected_columns = select_compare_columns(
+        &options.columns,
+        options.source_columns.as_ref(),
+        &options.key_columns,
+        &options.ignored_columns,
+    )?;
     let mut columns = Vec::new();
     let mut source_column_names = Vec::new();
-    for (target_name, source_name) in options.columns.iter().zip(requested_source_names) {
+    let mut skipped_binary_columns = false;
+    for (target_name, source_name) in selected_columns {
         let source_type = source_column_info
             .iter()
             .find(|column| column.name.eq_ignore_ascii_case(&source_name))
             .map(|column| column.data_type.as_str());
         let target_type = target_column_info
             .iter()
-            .find(|column| column.name.eq_ignore_ascii_case(target_name))
+            .find(|column| column.name.eq_ignore_ascii_case(&target_name))
             .map(|column| column.data_type.as_str());
         if is_binary_compare_type(source_type) || is_binary_compare_type(target_type) {
+            skipped_binary_columns = true;
             continue;
         }
-        columns.push(target_name.clone());
+        columns.push(target_name);
         source_column_names.push(source_name);
     }
     if columns.is_empty() {
@@ -535,7 +546,6 @@ pub async fn prepare_data_compare_from_tables(
     let source_rows = normalize_numeric_compare_rows(&columns, source_rows, &numeric_columns);
     let target_rows = normalize_numeric_compare_rows(&columns, target_rows, &numeric_columns);
 
-    let skipped_binary_columns = columns.len() != options.columns.len();
     let sync_eligible = matches!(degradation_level, DegradationLevel::Full)
         && !source_truncated
         && !target_truncated
@@ -611,8 +621,15 @@ pub async fn prepare_data_compare_missing_target(
         &options.source_table,
     )
     .await?;
+    let selected_columns = select_compare_columns(
+        &source_columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>(),
+        None,
+        &options.key_columns,
+        &options.ignored_columns,
+    )?;
     let column_names = source_columns
         .iter()
+        .filter(|column| selected_columns.iter().any(|(name, _)| name == &column.name))
         .filter(|column| !is_binary_compare_type(Some(&column.data_type)))
         .map(|column| column.name.clone())
         .collect::<Vec<_>>();
@@ -975,6 +992,27 @@ fn row_object(columns: &[String], row: &[Value]) -> HashMap<String, Value> {
         .enumerate()
         .map(|(index, column)| (column.clone(), row.get(index).cloned().unwrap_or(Value::Null)))
         .collect()
+}
+
+fn select_compare_columns(
+    columns: &[String],
+    source_columns: Option<&Vec<String>>,
+    key_columns: &[String],
+    ignored_columns: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    let ignored: HashSet<String> = ignored_columns.iter().map(|column| column.trim().to_lowercase()).collect();
+    let source_names = aligned_source_column_names(columns, source_columns);
+    let mut selected = Vec::new();
+    for (target, source) in columns.iter().zip(source_names) {
+        if ignored.contains(&target.to_lowercase()) || ignored.contains(&source.to_lowercase()) {
+            if key_columns.iter().any(|key| key.eq_ignore_ascii_case(target) || key.eq_ignore_ascii_case(&source)) {
+                return Err(format!("Key column {target} cannot be ignored"));
+            }
+        } else {
+            selected.push((target.clone(), source));
+        }
+    }
+    Ok(selected)
 }
 
 fn row_object_owned(columns: &[String], row: Vec<Value>) -> HashMap<String, Value> {
@@ -2175,6 +2213,7 @@ pub async fn verify_data(state: &AppState, options: VerifyDataOptions) -> Result
         target_table: options.target_table,
         columns: options.columns,
         key_columns: options.key_columns,
+        ignored_columns: Vec::new(),
         source_columns: None,
         fetch_batch_size: options.fetch_batch_size,
         degradation_threshold: Some(degradation_threshold),
@@ -2236,6 +2275,54 @@ mod tests {
     fn nullable_sync_keys_use_is_null_predicate() {
         let keys = HashMap::from([("nullable_id".to_string(), Value::Null)]);
         assert_eq!(where_by_key(&keys, &["nullable_id".to_string()], None, &[]), "\"nullable_id\" IS NULL");
+    }
+
+    #[test]
+    fn ignored_columns_are_excluded_before_db2_or_tidb_selects_and_sync_sql() {
+        let columns = vec!["id".to_string(), "id_iss_org".to_string(), "name".to_string()];
+        let source_columns = vec!["ID".to_string(), "ID_ISS_ORG".to_string(), "NAME".to_string()];
+        let keys = vec!["id".to_string()];
+        let selected =
+            select_compare_columns(&columns, Some(&source_columns), &keys, &[" ID_ISS_ORG ".to_string()]).unwrap();
+        let (target, source): (Vec<_>, Vec<_>) = selected.into_iter().unzip();
+        assert_eq!(target, vec!["id", "name"]);
+        assert_eq!(source, vec!["ID", "NAME"]);
+        let db2_sql =
+            build_data_compare_select_sql(DatabaseType::Db2, "APP", "USERS", &source, &["ID".to_string()], 1000, 0);
+        let tidb_sql = build_data_compare_select_sql(DatabaseType::Mysql, "app", "users", &target, &keys, 1000, 0);
+        assert!(!db2_sql.contains("ID_ISS_ORG"));
+        assert!(!tidb_sql.contains("id_iss_org"));
+
+        let preparation = prepare_data_compare(DataComparePreparationOptions {
+            table_name: "users".to_string(),
+            schema: None,
+            columns: target,
+            key_columns: keys,
+            column_info: Vec::new(),
+            source_rows: vec![vec![json!(1), json!("source")]],
+            target_rows: vec![vec![json!(1), json!("target")]],
+            database_type: Some(DatabaseType::Mysql),
+        })
+        .unwrap();
+        assert_eq!(preparation.result.modified.len(), 1);
+        assert_eq!(preparation.result.modified[0].changes[0].column, "name");
+        assert!(!preparation.sync_sql.to_lowercase().contains("id_iss_org"));
+        assert!(preparation.sync_sql.contains("UPDATE"));
+
+        let unfiltered = select_compare_columns(&columns, Some(&source_columns), &["id".to_string()], &[]).unwrap();
+        assert_eq!(unfiltered.len(), 3);
+    }
+
+    #[test]
+    fn ignored_columns_cannot_remove_match_keys_from_either_side() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        assert!(select_compare_columns(&columns, None, &["id".to_string()], &["ID".to_string()])
+            .unwrap_err()
+            .contains("cannot be ignored"));
+        let sources = vec!["SOURCE_ID".to_string(), "NAME".to_string()];
+        assert!(
+            select_compare_columns(&columns, Some(&sources), &["id".to_string()], &["source_id".to_string()]).is_err()
+        );
     }
 
     #[test]

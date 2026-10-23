@@ -109,7 +109,10 @@ final class AgentRpcError extends RuntimeException {
             data.add("conversion", conversion);
             // The desktop intentionally hides internal RPC payloads. Keep the
             // bounded conversion context visible in the ordinary error detail.
-            rpcError.addProperty("message", message(error) + conversionSummary(conversion));
+            String recoveryHint = classified.vendorCode != null && classified.vendorCode == -4220
+                ? " DB2 text decoding failed. In Data Compare, exclude the affected column for this table, or repair the source data/encoding before comparing it. Invalid bytes were not replaced or treated as NULL."
+                : "";
+            rpcError.addProperty("message", message(error) + conversionSummary(conversion) + recoveryHint);
         }
         if (agentSessionId != null && !agentSessionId.trim().isEmpty()) {
             data.addProperty("agentSessionId", agentSessionId);

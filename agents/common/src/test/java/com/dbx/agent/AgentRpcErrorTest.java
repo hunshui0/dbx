@@ -44,6 +44,8 @@ class AgentRpcErrorTest {
         assertTrue(visible.startsWith("conversion failed"));
         assertTrue(visible.contains("column 3 (客户姓名)"));
         assertTrue(visible.contains("MalformedInputException"));
+        assertTrue(visible.contains("exclude the affected column for this table"));
+        assertTrue(visible.contains("not replaced or treated as NULL"));
     }
 
     @Test

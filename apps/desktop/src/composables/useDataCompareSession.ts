@@ -61,6 +61,7 @@ export interface DataCompareTableResult {
   sourceTable: string;
   targetTable: string;
   keyColumns: string[];
+  ignoredColumns?: string[];
   columns: string[];
   columnInfo: CompareColumn[];
   status: DataCompareTableStatus;
@@ -106,6 +107,7 @@ export interface DataCompareSessionConfig {
    * again — it must not silently fall back to the primary key.
    */
   keyColumnsByTable: Record<string, string[]>;
+  ignoredColumnsByTable?: Record<string, string[]>;
   compareMode: DataCompareMode;
   sampleSize: number;
   label: string;
@@ -118,7 +120,7 @@ export interface DataCompareSessionProgress {
 }
 
 export type DataCompareSessionStatus = "running" | "completed" | "failed";
-export type DataCompareSessionErrorKind = "noKeyColumns" | "missingKeyColumns" | "noCommonColumns";
+export type DataCompareSessionErrorKind = "noKeyColumns" | "missingKeyColumns" | "noCommonColumns" | "ignoredKeyColumns";
 
 export interface DataCompareSession {
   id: string;
@@ -163,6 +165,7 @@ function cloneConfig(config: DataCompareSessionConfig): DataCompareSessionConfig
     targetSchemas: [...config.targetSchemas],
     targetTables: [...config.targetTables],
     keyColumnsByTable: normalizeKeyColumnOverrides(config.keyColumnsByTable),
+    ignoredColumnsByTable: normalizeKeyColumnOverrides(config.ignoredColumnsByTable),
   };
 }
 
@@ -185,6 +188,7 @@ function sessionError(error: unknown): string {
 }
 
 function fallbackCompareErrorMessage(kind: DataCompareSessionErrorKind, columns?: string): string {
+  if (kind === "ignoredKeyColumns") return `Key columns cannot be ignored: ${columns ?? ""}`;
   if (kind === "missingKeyColumns") return `Missing key columns: ${columns ?? ""}`;
   if (kind === "noCommonColumns") return "No common columns";
   return "No key columns available";
@@ -263,7 +267,7 @@ async function inferKeyColumnsForTable(input: DataCompareSessionConfig, table: s
   return inferCompareKeyColumns(columns);
 }
 
-function buildTableResult(task: DataCompareTableTask, preparation: DataCompareFromTablesPreparation, keyColumns: string[], columns: string[], columnInfo: CompareColumn[], databaseType: DatabaseType | undefined): DataCompareTableResult {
+function buildTableResult(task: DataCompareTableTask, preparation: DataCompareFromTablesPreparation, keyColumns: string[], columns: string[], columnInfo: CompareColumn[], databaseType: DatabaseType | undefined, ignoredColumns: string[]): DataCompareTableResult {
   const added = preparation.result.added.length;
   const removed = preparation.result.removed.length;
   const modified = preparation.result.modified.length;
@@ -272,6 +276,7 @@ function buildTableResult(task: DataCompareTableTask, preparation: DataCompareFr
     sourceTable: task.sourceTable,
     targetTable: task.targetTable,
     keyColumns,
+    ignoredColumns,
     columns,
     columnInfo,
     status,
@@ -292,11 +297,12 @@ function buildTableResult(task: DataCompareTableTask, preparation: DataCompareFr
   };
 }
 
-function buildMissingTargetResult(task: DataCompareTableTask, preparation: DataCompareFromTablesPreparation, sourceColumns: CompareColumn[], keyColumns: string[], databaseType: DatabaseType | undefined): DataCompareTableResult {
+function buildMissingTargetResult(task: DataCompareTableTask, preparation: DataCompareFromTablesPreparation, sourceColumns: CompareColumn[], keyColumns: string[], databaseType: DatabaseType | undefined, ignoredColumns: string[]): DataCompareTableResult {
   return {
     sourceTable: task.sourceTable,
     targetTable: task.targetTable,
     keyColumns,
+    ignoredColumns,
     columns: sourceColumns.map((column) => column.name),
     columnInfo: sourceColumns,
     status: "different",
@@ -355,6 +361,10 @@ function configuredTaskKeyColumns(input: DataCompareSessionConfig, task: DataCom
   return override === undefined ? undefined : normalizeKeyColumns(override);
 }
 
+function configuredTaskIgnoredColumns(input: DataCompareSessionConfig, task: DataCompareTableTask): string[] {
+  return normalizeKeyColumns(input.ignoredColumnsByTable?.[task.sourceTable] ?? []);
+}
+
 async function runDataCompareSession(session: DataCompareSession, tasks: DataCompareTableTask[], dependencies: DataCompareSessionDependencies): Promise<void> {
   const input = session.config;
   const sourceColumnCache = new Map<string, CompareColumn[]>();
@@ -369,6 +379,7 @@ async function runDataCompareSession(session: DataCompareSession, tasks: DataCom
     for (const [index, task] of tasks.entries()) {
       publishProgress(session, { current: index + 1, total: tasks.length, table: task.sourceTable });
       const configuredKeys = configuredTaskKeyColumns(input, task);
+      const ignoredColumns = configuredTaskIgnoredColumns(input, task);
       let keyColumns = configuredKeys ?? [];
       try {
         if (input.targetTables.includes(task.targetTable)) {
@@ -377,7 +388,9 @@ async function runDataCompareSession(session: DataCompareSession, tasks: DataCom
 
           const sourceColumns = await loadColumnsWithCache(sourceColumnCache, input.sourceConnectionId, input.sourceDatabase, input.sourceSchema, task.sourceTable);
           const targetColumns = await loadColumnsWithCache(targetColumnCache, input.targetConnectionId, input.targetDatabase, input.targetSchema, task.targetTable);
-          const matched = intersectCompareColumns(sourceColumns, targetColumns);
+          const ignoredKeys = resolvedKeys.filter((key) => ignoredColumns.some((ignored) => ignored.toLowerCase() === key.toLowerCase()));
+          if (ignoredKeys.length) throw new Error(compareErrorMessage(dependencies, "ignoredKeyColumns", ignoredKeys.join(", ")));
+          const matched = intersectCompareColumns(sourceColumns, targetColumns, ignoredColumns);
           const columns = matched.columns;
           const columnInfo = columns.map((column) => targetColumns.find((target) => target.name === column)).filter((column): column is CompareColumn => !!column);
           const canonicalKeyColumns: string[] = [];
@@ -401,17 +414,20 @@ async function runDataCompareSession(session: DataCompareSession, tasks: DataCom
             targetTable: task.targetTable,
             columns,
             keyColumns: canonicalKeyColumns,
+            ignoredColumns,
             sourceColumns: matched.sourceColumns,
             degradationThreshold: dataCompareThreshold(input.sampleSize),
             compareMode: input.compareMode,
           });
           keyColumns = canonicalKeyColumns;
-          results.push(buildTableResult(task, preparation, canonicalKeyColumns, columns, columnInfo, databaseType));
+          results.push(buildTableResult(task, preparation, canonicalKeyColumns, columns, columnInfo, databaseType, ignoredColumns));
         } else {
           const sourceColumns = await loadColumnsWithCache(sourceColumnCache, input.sourceConnectionId, input.sourceDatabase, input.sourceSchema, task.sourceTable);
           const resolvedKeys = configuredTaskKeyColumns(input, task) ?? [];
           const sourceColumnNames = sourceColumns.map((column) => column.name);
           keyColumns = resolvedKeys.map((key) => matchColumnNameIgnoreCase(key, sourceColumnNames) ?? key);
+          const ignoredKeys = keyColumns.filter((key) => ignoredColumns.some((ignored) => ignored.toLowerCase() === key.toLowerCase()));
+          if (ignoredKeys.length) throw new Error(compareErrorMessage(dependencies, "ignoredKeyColumns", ignoredKeys.join(", ")));
           const preparation = await api.prepareDataCompareMissingTarget({
             sourceConnectionId: input.sourceConnectionId,
             sourceDatabase: input.sourceDatabase,
@@ -422,10 +438,12 @@ async function runDataCompareSession(session: DataCompareSession, tasks: DataCom
             targetSchema: input.targetSchema,
             targetTable: task.targetTable,
             keyColumns,
+            ignoredColumns,
             degradationThreshold: dataCompareThreshold(input.sampleSize),
             compareMode: input.compareMode,
           });
-          results.push(buildMissingTargetResult(task, preparation, sourceColumns, keyColumns, databaseType));
+          const comparedSourceColumns = sourceColumns.filter((column) => !ignoredColumns.some((ignored) => ignored.toLowerCase() === column.name.toLowerCase()));
+          results.push(buildMissingTargetResult(task, preparation, comparedSourceColumns, keyColumns, databaseType, ignoredColumns));
         }
       } catch (error: unknown) {
         results.push(buildErrorResult(task, keyColumns, databaseType, error));

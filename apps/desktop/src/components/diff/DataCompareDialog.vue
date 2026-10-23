@@ -127,6 +127,7 @@ const showModified = ref(true);
  * global key column list across different tables.
  */
 const keyColumnOverrides = ref<Record<string, string[]>>({});
+const ignoredColumnOverrides = ref<Record<string, string[]>>({});
 /** Column metadata per source table, keyed by table name; cleared with the source endpoint. */
 const tableColumns = ref<Record<string, CompareKeyColumnOption[]>>({});
 const tableColumnErrors = ref<Record<string, string>>({});
@@ -419,6 +420,7 @@ function clearTableKeyColumnsOverride(table: string) {
 /** Drops overrides and metadata of tables that are no longer selected. */
 function pruneKeyColumnState(tables: string[]) {
   const keep = new Set(tables);
+  ignoredColumnOverrides.value = Object.fromEntries(Object.entries(ignoredColumnOverrides.value).filter(([table]) => keep.has(table)));
   const nextOverrides: Record<string, string[]> = {};
   let overridesChanged = false;
   for (const [table, columns] of Object.entries(keyColumnOverrides.value)) {
@@ -523,6 +525,7 @@ async function restoreDataCompareSession(session: DataCompareSession): Promise<v
     // Restore the per-table match columns so a reopened session keeps every
     // table's own selection instead of collapsing back to one global list.
     keyColumnOverrides.value = normalizeKeyColumnOverrides(config.keyColumnsByTable);
+    ignoredColumnOverrides.value = normalizeKeyColumnOverrides(config.ignoredColumnsByTable);
     resetTableColumnMetadata();
     batchResults.value = session.batchResults;
     syncPlan.value = session.syncPlan;
@@ -553,6 +556,7 @@ function dataCompareConfigSnapshot(): DataCompareConfigSnapshot {
     compareMode: compareMode.value,
     sampleSize: normalizedSampleSize(),
     keyColumnsByTable: buildSessionKeyColumnsByTable(),
+    ignoredColumnsByTable: { ...ignoredColumnOverrides.value },
   };
 }
 
@@ -609,6 +613,7 @@ async function applyDataCompareConfig(config: DataCompareConfig): Promise<void> 
     compareMode.value = config.compareMode;
     sampleSize.value = String(normalizeDataCompareSampleSize(config.sampleSize));
     keyColumnOverrides.value = normalizeKeyColumnOverrides(config.keyColumnsByTable);
+    ignoredColumnOverrides.value = normalizeKeyColumnOverrides(config.ignoredColumnsByTable);
     resetTableColumnMetadata();
     if (config.detailPreviewLimit) detailPreviewLimit.value = config.detailPreviewLimit;
     void prefetchSelectedTableColumns(selectedSourceTableNames.value);
@@ -702,6 +707,7 @@ function swapSourceTarget() {
 
   sourceTable.value = selectedSourceTableNames.value.length === 1 ? selectedSourceTableNames.value[0] : "";
   keyColumnOverrides.value = {};
+  ignoredColumnOverrides.value = {};
   resetTableColumnMetadata();
   clearResult();
   void nextTick(() => {
@@ -905,6 +911,24 @@ function buildSyncPlanTables() {
   return buildDataCompareSyncPlanTables(batchResults.value, targetSchema.value);
 }
 
+function ignoredColumnsForTable(table: string): string[] {
+  return ignoredColumnOverrides.value[table] ?? [];
+}
+
+function ignorableColumnsForTable(table: string): CompareKeyColumnOption[] {
+  const keys = new Set(effectiveKeyColumns(table).map((column) => column.toLowerCase()));
+  return columnsForTable(table).filter((column) => !keys.has(column.name.toLowerCase()));
+}
+
+function setIgnoredColumns(table: string, value: string[]): void {
+  const columns = normalizeKeyColumns(value);
+  const next = { ...ignoredColumnOverrides.value };
+  if (columns.length) next[table] = columns;
+  else delete next[table];
+  ignoredColumnOverrides.value = next;
+  clearResult();
+}
+
 function updateSyncPlan(nextPlan: DataCompareSyncPlan, sessionId = activeSessionId.value): void {
   if (!componentUnmounted) syncPlan.value = nextPlan;
   const session = getDataCompareSession(sessionId);
@@ -965,6 +989,7 @@ function startCompare(): void {
       targetTables: [...targetTables.value],
       targetTable: targetTable.value,
       keyColumnsByTable: buildSessionKeyColumnsByTable(),
+      ignoredColumnsByTable: { ...ignoredColumnOverrides.value },
       compareMode: compareMode.value,
       sampleSize: normalizedSampleSize(),
       label: `${comparisonEndpointLabel(sourceConnectionId.value, sourceDatabase.value, sourceSchema.value)} → ${comparisonEndpointLabel(targetConnectionId.value, targetDatabase.value, targetSchema.value)}`,
@@ -974,6 +999,7 @@ function startCompare(): void {
       ensureConnected: (connectionId) => store.ensureConnected(connectionId),
       getConfig: (connectionId) => store.getConfig(connectionId),
       formatError: (kind, columns) => {
+        if (kind === "ignoredKeyColumns") return t("dataCompare.ignoredKeyColumns", { columns: columns ?? "" });
         if (kind === "missingKeyColumns") return t("dataCompare.missingKeyColumns", { columns: columns ?? "" });
         return kind === "noCommonColumns" ? t("dataCompare.noCommonColumns") : t("dataCompare.noKeyColumns");
       },
@@ -1284,6 +1310,7 @@ watch(
     compareMode.value,
     sampleSize.value,
     JSON.stringify(keyColumnOverrides.value),
+    JSON.stringify(ignoredColumnOverrides.value),
   ],
   () => {
     if (suppressConfigSave || initializingPrefill || !dataCompareConfigId.value) return;
@@ -1561,6 +1588,18 @@ onBeforeUnmount(() => {
                     </button>
                     <div v-if="expandedKeyColumnTable === row.table" class="space-y-1 border-t bg-muted/10 px-2 py-2">
                       <CompareKeyColumnsSelect :model-value="row.columns" :columns="columnsForTable(row.table)" :loading="row.loading" :disabled="comparing || executionLocked" @update:model-value="(columns) => setTableKeyColumns(row.table, columns)" />
+                      <div class="space-y-1" :data-ignored-columns-table="row.table">
+                        <Label class="text-xs font-medium">{{ t("dataCompare.ignoredColumns") }}</Label>
+                        <CompareKeyColumnsSelect
+                          :model-value="ignoredColumnsForTable(row.table)"
+                          :columns="ignorableColumnsForTable(row.table)"
+                          :placeholder="t('dataCompare.ignoredColumnsPlaceholder')"
+                          :loading="row.loading"
+                          :disabled="comparing || executionLocked"
+                          @update:model-value="(columns) => setIgnoredColumns(row.table, columns)"
+                        />
+                        <p class="text-[11px] text-muted-foreground">{{ t("dataCompare.ignoredColumnsHint") }}</p>
+                      </div>
                       <div class="flex flex-wrap items-center gap-2 text-[11px]">
                         <span data-key-column-hint :class="row.error || (row.status === 'missing' && row.matched) ? 'text-destructive' : 'text-muted-foreground'">{{ row.hint }}</span>
                         <Button v-if="row.manual" size="sm" variant="ghost" class="h-6 px-1.5 text-[11px]" :disabled="comparing || executionLocked" @click="clearTableKeyColumnsOverride(row.table)">
@@ -1575,6 +1614,18 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="space-y-2 border-t pt-3">
+            <div v-if="singleKeyColumnRow" class="space-y-1" :data-ignored-columns-table="singleKeyColumnRow.table">
+              <Label class="text-xs font-medium">{{ t("dataCompare.ignoredColumns") }}</Label>
+              <CompareKeyColumnsSelect
+                :model-value="ignoredColumnsForTable(singleKeyColumnRow.table)"
+                :columns="ignorableColumnsForTable(singleKeyColumnRow.table)"
+                :placeholder="t('dataCompare.ignoredColumnsPlaceholder')"
+                :loading="singleKeyColumnRow.loading"
+                :disabled="comparing || executionLocked"
+                @update:model-value="(columns) => setIgnoredColumns(singleKeyColumnRow!.table, columns)"
+              />
+              <p class="text-[11px] text-muted-foreground">{{ t("dataCompare.ignoredColumnsHint") }}</p>
+            </div>
             <div class="flex flex-wrap items-end gap-3">
               <div class="space-y-1">
                 <Label class="text-xs font-medium">{{ t("dataCompare.compareMode") }}</Label>
@@ -1726,6 +1777,7 @@ onBeforeUnmount(() => {
                           <div class="mt-1">
                             {{ t("dataCompare.keyColumnsInline", { columns: item.keyColumns.join(", ") }) }}
                           </div>
+                          <div v-if="item.ignoredColumns?.length" class="mt-1">{{ t("dataCompare.ignoredColumns") }}: {{ item.ignoredColumns.join(", ") }}</div>
                           <div v-if="item.status === 'different'" class="mt-1">
                             {{
                               t("dataCompare.selectedInline", {

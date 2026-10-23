@@ -142,6 +142,47 @@ test("sample compare uses the configured row count for existing and missing targ
   }
 });
 
+test("keeps ignored fields separate for each table and filters sync plan columns", async () => {
+  apiMock.getColumns.mockResolvedValue([column("user_id", true), column("email"), column("name")]);
+  const session = await runSession(baseConfig({ selectedSourceTables: ["users", "orders"], ignoredColumnsByTable: { users: [" EMAIL ", "email"] } }), [
+    { sourceTable: "users", targetTable: "users" },
+    { sourceTable: "orders", targetTable: "orders" },
+  ]);
+  const [users, orders] = apiMock.prepareDataCompareFromTables.mock.calls.map((call) => call[0]);
+  assert.deepEqual(users.columns, ["user_id", "name"]);
+  assert.deepEqual(users.sourceColumns, ["user_id", "name"]);
+  assert.deepEqual(users.ignoredColumns, ["EMAIL"]);
+  assert.deepEqual(orders.columns, ["user_id", "email", "name"]);
+  assert.deepEqual(orders.ignoredColumns, []);
+  assert.deepEqual(session.batchResults[0]?.ignoredColumns, ["EMAIL"]);
+  assert.deepEqual(apiMock.buildDataCompareSyncPlan.mock.calls[0]?.[0].tables[0].columns, ["user_id", "name"]);
+});
+
+test("preserves source column alignment when ignoring a middle column across identifier case", async () => {
+  apiMock.getColumns.mockImplementation((connectionId: string) => Promise.resolve((connectionId === "source" ? ["ID", "ID_ISS_ORG", "NAME"] : ["id", "id_iss_org", "name"]).map((name, index) => column(name, index === 0))));
+  await runSession(baseConfig({ ignoredColumnsByTable: { users: ["id_iss_org"] } }), [{ sourceTable: "users", targetTable: "users" }]);
+  const options = apiMock.prepareDataCompareFromTables.mock.calls[0]?.[0];
+  assert.deepEqual(options.columns, ["id", "name"]);
+  assert.deepEqual(options.sourceColumns, ["ID", "NAME"]);
+  assert.deepEqual(options.keyColumns, ["id"]);
+});
+
+test("rejects ignored key columns before querying table data", async () => {
+  const session = await runSession(baseConfig({ ignoredColumnsByTable: { users: ["USER_ID"] } }), [{ sourceTable: "users", targetTable: "users" }]);
+  assert.equal(apiMock.prepareDataCompareFromTables.mock.calls.length, 0);
+  assert.equal(session.batchResults[0]?.status, "error");
+  assert.match(session.batchResults[0]?.error ?? "", /Key columns cannot be ignored/);
+});
+
+test("passes ignored columns for missing targets and keeps the partial result ineligible for sync", async () => {
+  apiMock.prepareDataCompareMissingTarget.mockResolvedValue({ ...preparationFor("users"), syncEligible: false, syncSql: "", syncStatements: [] });
+  const session = await runSession(baseConfig({ targetTables: [], ignoredColumnsByTable: { users: ["email"] } }), [{ sourceTable: "users", targetTable: "users" }]);
+  assert.deepEqual(apiMock.prepareDataCompareMissingTarget.mock.calls[0]?.[0].ignoredColumns, ["email"]);
+  assert.deepEqual(session.batchResults[0]?.columns, ["user_id", "name"]);
+  assert.equal(session.batchResults[0]?.syncEligible, false);
+  assert.deepEqual(apiMock.buildDataCompareSyncPlan.mock.calls[0]?.[0].tables, []);
+});
+
 test("infers the primary key of every table when no match columns are configured", async () => {
   const session = await runSession(baseConfig({ selectedSourceTables: ["users", "orders", "payments"] }), [
     { sourceTable: "users", targetTable: "users" },
