@@ -105,6 +105,8 @@ async fn run_live_mysql_data_compare_missing_target_is_bounded() {
             key_columns: vec!["id".to_string()],
             fetch_batch_size: None,
             degradation_threshold: None,
+            compare_mode: None,
+            sampling_strategy: None,
         },
     )
     .await
@@ -191,6 +193,7 @@ async fn run_live_mysql_data_compare_two_databases_with_differences() {
             source_columns: None,
             fetch_batch_size: None,
             degradation_threshold: None,
+            compare_mode: None,
             sampling_strategy: None,
             enable_checksum: None,
         },

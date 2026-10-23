@@ -15,6 +15,8 @@ function snapshot(overrides: Record<string, unknown> = {}) {
     targetSchema: "public",
     targetTable: "users",
     detailPreviewLimit: "100",
+    compareMode: "full" as const,
+    sampleSize: 10_000,
     keyColumnsByTable: { users: ["user_id"] },
     ...overrides,
   };
@@ -37,7 +39,20 @@ describe("useDataCompareConfig", () => {
     const stored = JSON.parse(localStorage.getItem(CONFIG_KEY) ?? "[]") as Array<Record<string, unknown>>;
     expect(stored).toHaveLength(1);
     expect(stored[0]!.selectedSourceTables).toEqual(["users", "orders"]);
+    expect(stored[0]!.compareMode).toBe("full");
+    expect(stored[0]!.sampleSize).toBe(10_000);
     expect(stored[0]!.keyColumnsByTable).toEqual({ users: ["user_id"] });
+  });
+
+  it("persists and restores a custom sample mode and row count", async () => {
+    const { useDataCompareConfig } = await import("../useDataCompareConfig");
+    const state = useDataCompareConfig();
+    state.createConfig("Sample", snapshot({ compareMode: "sample", sampleSize: 4321 }));
+
+    vi.resetModules();
+    const { useDataCompareConfig: createRestoredState } = await import("../useDataCompareConfig");
+    const restored = createRestoredState();
+    expect(restored.configs.value[0]).toMatchObject({ compareMode: "sample", sampleSize: 4321 });
   });
 
   it("keeps config names unique instead of silently overwriting", async () => {
@@ -102,6 +117,8 @@ describe("useDataCompareConfig", () => {
     expect(state.configs.value[0]!.selectedSourceTables).toEqual(["t"]);
     expect(state.configs.value[0]!.keyColumnsByTable).toEqual({ t: [] });
     expect(state.configs.value[0]!.detailPreviewLimit).toBe("");
+    expect(state.configs.value[0]!.compareMode).toBe("full");
+    expect(state.configs.value[0]!.sampleSize).toBe(10_000);
   });
 
   it("recovers from unreadable stored JSON", async () => {

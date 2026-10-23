@@ -1,5 +1,26 @@
 import { describe, expect, it } from "vitest";
-import { inferCompareKeyColumns, intersectCompareColumns, matchColumnNameIgnoreCase, normalizeKeyColumns, sameKeyColumns } from "../dataCompare";
+import { DEFAULT_DATA_COMPARE_SAMPLE_SIZE, MAX_DATA_COMPARE_SAMPLE_SIZE, dataCompareThreshold, inferCompareKeyColumns, intersectCompareColumns, matchColumnNameIgnoreCase, normalizeDataCompareSampleSize, normalizeKeyColumns, sameKeyColumns } from "../dataCompare";
+
+describe("dataCompareThreshold", () => {
+  it("keeps a sample count while leaving mode selection to the compare request", () => {
+    expect(dataCompareThreshold(DEFAULT_DATA_COMPARE_SAMPLE_SIZE)).toEqual({
+      fullCompareMaxRows: 100_000,
+      sampleMaxRows: 10_000_000,
+      sampleSize: DEFAULT_DATA_COMPARE_SAMPLE_SIZE,
+      extremeSampleCount: 500,
+    });
+  });
+
+  it("uses the requested sample size", () => {
+    expect(dataCompareThreshold(4321).sampleSize).toBe(4321);
+  });
+
+  it("clamps sample sizes to a positive supported integer", () => {
+    expect(normalizeDataCompareSampleSize(0)).toBe(1);
+    expect(normalizeDataCompareSampleSize(4321.9)).toBe(4321);
+    expect(normalizeDataCompareSampleSize(MAX_DATA_COMPARE_SAMPLE_SIZE + 1)).toBe(MAX_DATA_COMPARE_SAMPLE_SIZE);
+  });
+});
 
 describe("inferCompareKeyColumns", () => {
   it("returns all primary-key columns when a primary key exists", () => {
@@ -58,6 +79,23 @@ describe("intersectCompareColumns", () => {
     const intersection = intersectCompareColumns([{ name: "snid" }, { name: "SNID" }], [{ name: "SNID" }]);
     expect(intersection.columns).toEqual(["SNID"]);
     expect(intersection.sourceColumns).toEqual(["snid"]);
+  });
+
+  it("excludes binary columns on either side", () => {
+    const intersection = intersectCompareColumns(
+      [
+        { name: "id", data_type: "INTEGER" },
+        { name: "payload", data_type: "BLOB" },
+        { name: "flags", data_type: "CHAR FOR BIT DATA" },
+      ],
+      [
+        { name: "ID", data_type: "int" },
+        { name: "PAYLOAD", data_type: "longblob" },
+        { name: "FLAGS", data_type: "varbinary(8)" },
+      ],
+    );
+    expect(intersection.columns).toEqual(["ID"]);
+    expect(intersection.sourceColumns).toEqual(["id"]);
   });
 });
 

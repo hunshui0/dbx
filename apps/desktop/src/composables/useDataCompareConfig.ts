@@ -1,5 +1,6 @@
 import { computed, ref, watch } from "vue";
 import { uuid } from "@/lib/common/utils";
+import { DEFAULT_DATA_COMPARE_SAMPLE_SIZE, normalizeDataCompareSampleSize, type DataCompareMode } from "@/lib/dataGrid/dataCompare";
 
 /**
  * Persisted "Compare Data" task configuration.
@@ -25,6 +26,8 @@ export interface DataCompareConfig {
   targetTable: string;
   /** Preview row limit, stored alongside the selection so re-running reproduces the same view. */
   detailPreviewLimit: string;
+  compareMode: DataCompareMode;
+  sampleSize: number;
   /** Explicit match columns per source table; absent entry means "use the primary key". */
   keyColumnsByTable: Record<string, string[]>;
 }
@@ -39,6 +42,8 @@ export interface DataCompareConfigSnapshot {
   targetSchema: string;
   targetTable: string;
   detailPreviewLimit: string;
+  compareMode: DataCompareMode;
+  sampleSize: number;
   keyColumnsByTable: Record<string, string[]>;
 }
 
@@ -86,6 +91,8 @@ function sanitizeConfig(raw: unknown): DataCompareConfig | undefined {
     targetSchema: typeof item.targetSchema === "string" ? item.targetSchema : "",
     targetTable: typeof item.targetTable === "string" ? item.targetTable : "",
     detailPreviewLimit: typeof item.detailPreviewLimit === "string" ? item.detailPreviewLimit : "",
+    compareMode: item.compareMode === "sample" ? "sample" : "full",
+    sampleSize: normalizeDataCompareSampleSize(item.sampleSize ?? DEFAULT_DATA_COMPARE_SAMPLE_SIZE),
     keyColumnsByTable: sanitizeKeyColumns(item.keyColumnsByTable),
   };
 }
@@ -131,6 +138,7 @@ export function useDataCompareConfig() {
     const config: DataCompareConfig = {
       ...snapshot,
       selectedSourceTables: [...snapshot.selectedSourceTables],
+      sampleSize: normalizeDataCompareSampleSize(snapshot.sampleSize),
       keyColumnsByTable: sanitizeKeyColumns(snapshot.keyColumnsByTable),
       id: uuid(),
       name: uniqueName(name),
@@ -150,6 +158,7 @@ export function useDataCompareConfig() {
       ...configs.value[index]!,
       ...patch,
       ...(patch.selectedSourceTables ? { selectedSourceTables: [...patch.selectedSourceTables] } : {}),
+      ...(patch.sampleSize !== undefined ? { sampleSize: normalizeDataCompareSampleSize(patch.sampleSize) } : {}),
       ...(patch.keyColumnsByTable ? { keyColumnsByTable: sanitizeKeyColumns(patch.keyColumnsByTable) } : {}),
       updatedAt: Date.now(),
     };

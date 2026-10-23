@@ -3,6 +3,25 @@ import type { ColumnInfo, DatabaseType, QueryResult } from "@/types/database";
 export type DataCompareCellValue = QueryResult["rows"][number][number];
 
 export type SamplingStrategy = "Random" | "ExtremeValues" | "Hybrid";
+export type DataCompareMode = "full" | "sample";
+
+export const DEFAULT_DATA_COMPARE_SAMPLE_SIZE = 10_000;
+export const MAX_DATA_COMPARE_SAMPLE_SIZE = 10_000_000;
+
+export function normalizeDataCompareSampleSize(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) return DEFAULT_DATA_COMPARE_SAMPLE_SIZE;
+  return Math.max(1, Math.min(MAX_DATA_COMPARE_SAMPLE_SIZE, Math.floor(parsed)));
+}
+
+export function dataCompareThreshold(sampleSize: unknown): DegradationThreshold {
+  return {
+    fullCompareMaxRows: 100_000,
+    sampleMaxRows: 10_000_000,
+    sampleSize: normalizeDataCompareSampleSize(sampleSize),
+    extremeSampleCount: 500,
+  };
+}
 
 export interface DegradationThreshold {
   fullCompareMaxRows: number;
@@ -37,6 +56,128 @@ export interface DataCompareResult {
   modified: DataCompareModifiedRow[];
 }
 
+export interface DataCompareReportTable {
+  sourceTable: string;
+  targetTable: string;
+  status: "different" | "same" | "error";
+  columns: string[];
+  keyColumns: string[];
+  sourceRowCount: number;
+  targetRowCount: number;
+  sourceTruncated: boolean;
+  targetTruncated: boolean;
+  rowBudget: number;
+  syncEligible: boolean;
+  diff: {
+    added: Array<DataCompareRow & { selected: boolean }>;
+    removed: Array<DataCompareRow & { selected: boolean }>;
+    modified: Array<DataCompareModifiedRow & { selected: boolean }>;
+  };
+  error?: string;
+}
+
+export interface DataCompareReportLabels {
+  title: string;
+  overview: string;
+  details: string;
+  table: string;
+  sourceOnlyRows: string;
+  targetOnlyRows: string;
+  modifiedRows: string;
+  syncSql: string;
+  syncSqlSelectionNote: string;
+  noSyncSql: string;
+  partialResult: string;
+}
+
+export interface DataCompareReportOptions {
+  source: string;
+  target: string;
+  compareMode: DataCompareMode;
+  compareModeLabel: string;
+  sampleSize: number;
+  generatedAt: Date;
+  tables: DataCompareReportTable[];
+  syncSql: string;
+  labels: DataCompareReportLabels;
+}
+
+function fencedBlock(language: string, content: string): string {
+  const longestBacktickRun = Math.max(0, ...(content.match(/`+/g) ?? []).map((run) => run.length));
+  const fence = "`".repeat(Math.max(3, longestBacktickRun + 1));
+  return `${fence}${language}\n${content}\n${fence}`;
+}
+
+function jsonBlock(value: unknown): string {
+  return fencedBlock("json", JSON.stringify(value, null, 2));
+}
+
+export function buildDataCompareReportMarkdown(options: DataCompareReportOptions): string {
+  const { labels, tables } = options;
+  const totals = tables.reduce(
+    (summary, table) => ({
+      added: summary.added + table.diff.added.length,
+      removed: summary.removed + table.diff.removed.length,
+      modified: summary.modified + table.diff.modified.length,
+      sameTables: summary.sameTables + Number(table.status === "same"),
+      differentTables: summary.differentTables + Number(table.status === "different"),
+      failedTables: summary.failedTables + Number(table.status === "error"),
+    }),
+    { added: 0, removed: 0, modified: 0, sameTables: 0, differentTables: 0, failedTables: 0 },
+  );
+  const mode = options.compareMode === "sample" ? "sample" : "full";
+  const overview = {
+    generatedAt: options.generatedAt.toISOString(),
+    source: options.source,
+    target: options.target,
+    compareMode: mode,
+    compareModeLabel: options.compareModeLabel,
+    sampleSizePerSide: mode === "sample" ? options.sampleSize : null,
+    tableCount: tables.length,
+    totals,
+  };
+  const tableSections = tables.map((table, index) => {
+    const summary = {
+      sourceTable: table.sourceTable,
+      targetTable: table.targetTable,
+      status: table.status,
+      sourceRowCount: table.sourceRowCount,
+      targetRowCount: table.targetRowCount,
+      rowBudget: table.rowBudget,
+      sourceTruncated: table.sourceTruncated,
+      targetTruncated: table.targetTruncated,
+      syncEligible: table.syncEligible,
+      columns: table.columns,
+      keyColumns: table.keyColumns,
+      addedCount: table.diff.added.length,
+      removedCount: table.diff.removed.length,
+      modifiedCount: table.diff.modified.length,
+      ...(table.error ? { error: table.error } : {}),
+    };
+    return [
+      `### ${labels.table} ${index + 1}`,
+      "",
+      jsonBlock(summary),
+      table.sourceTruncated || table.targetTruncated ? `\n\n${labels.partialResult}` : "",
+      "",
+      `#### ${labels.sourceOnlyRows} (${table.diff.added.length})`,
+      "",
+      jsonBlock(table.diff.added),
+      "",
+      `#### ${labels.targetOnlyRows} (${table.diff.removed.length})`,
+      "",
+      jsonBlock(table.diff.removed),
+      "",
+      `#### ${labels.modifiedRows} (${table.diff.modified.length})`,
+      "",
+      jsonBlock(table.diff.modified),
+    ].join("\n");
+  });
+  const sqlSection = options.syncSql.trim() ? `${labels.syncSqlSelectionNote}\n\n${fencedBlock("sql", options.syncSql.trim())}` : labels.noSyncSql;
+
+  return [`# ${labels.title}`, "", `## ${labels.overview}`, "", jsonBlock(overview), "", `## ${labels.details}`, "", ...(tableSections.length ? tableSections : ["_"]), "", `## ${labels.syncSql}`, "", sqlSection, ""].join("\n");
+}
+
 export interface DataComparePreparationOptions {
   tableName: string;
   schema?: string;
@@ -69,6 +210,7 @@ export interface DataCompareFromTablesOptions {
   sourceColumns?: string[];
   fetchBatchSize?: number;
   degradationThreshold?: DegradationThreshold;
+  compareMode?: DataCompareMode;
   samplingStrategy?: SamplingStrategy;
   enableChecksum?: boolean;
 }
@@ -85,6 +227,7 @@ export interface DataCompareMissingTargetOptions {
   keyColumns: string[];
   fetchBatchSize?: number;
   degradationThreshold?: DegradationThreshold;
+  compareMode?: DataCompareMode;
   samplingStrategy?: SamplingStrategy;
   enableChecksum?: boolean;
 }
@@ -199,7 +342,7 @@ export interface CompareColumnIntersection {
  * migrated table's columns only match across engines when compared without
  * case. Target names are canonical because sync SQL runs against the target.
  */
-export function intersectCompareColumns(sourceColumns: Pick<ColumnInfo, "name">[], targetColumns: Pick<ColumnInfo, "name">[]): CompareColumnIntersection {
+export function intersectCompareColumns(sourceColumns: (Pick<ColumnInfo, "name"> & Partial<Pick<ColumnInfo, "data_type">>)[], targetColumns: (Pick<ColumnInfo, "name"> & Partial<Pick<ColumnInfo, "data_type">>)[]): CompareColumnIntersection {
   const targetNamesByLowerName = new Map<string, string>();
   for (const column of targetColumns) {
     const lowerName = column.name.toLowerCase();
@@ -213,11 +356,18 @@ export function intersectCompareColumns(sourceColumns: Pick<ColumnInfo, "name">[
     const lowerName = column.name.toLowerCase();
     const targetName = targetNamesByLowerName.get(lowerName);
     if (targetName === undefined || matched.has(lowerName)) continue;
+    const targetColumn = targetColumns.find((candidate) => candidate.name === targetName);
+    if (isBinaryCompareType(column.data_type) || isBinaryCompareType(targetColumn?.data_type)) continue;
     matched.add(lowerName);
     columns.push(targetName);
     sourceNames.push(column.name);
   }
   return { columns, sourceColumns: sourceNames };
+}
+
+export function isBinaryCompareType(dataType: string | undefined): boolean {
+  const type = dataType?.trim().toLowerCase() ?? "";
+  return type.includes("blob") || type.includes("binary") || type.includes("for bit data") || type === "bit" || type.startsWith("bit(") || type === "image" || type === "bytea";
 }
 
 /**

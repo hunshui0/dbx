@@ -71,6 +71,8 @@ pub struct DataCompareFromTablesOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degradation_threshold: Option<DegradationThreshold>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compare_mode: Option<DataCompareMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling_strategy: Option<SamplingStrategy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_checksum: Option<bool>,
@@ -93,6 +95,10 @@ pub struct DataCompareMissingTargetOptions {
     pub fetch_batch_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degradation_threshold: Option<DegradationThreshold>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compare_mode: Option<DataCompareMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_strategy: Option<SamplingStrategy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +252,13 @@ pub enum SamplingStrategy {
     Hybrid,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum DataCompareMode {
+    Full,
+    Sample,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DegradationThreshold {
@@ -341,6 +354,22 @@ pub async fn prepare_data_compare_from_tables(
     ensure_data_compare_supported(source_database_type, "source")?;
     ensure_data_compare_supported(target_database_type, "target")?;
     let fetch_batch_size = options.fetch_batch_size.unwrap_or(1000).max(1);
+    let source_column_info = get_columns_core(
+        state,
+        &options.source_connection_id,
+        &options.source_database,
+        &options.source_schema,
+        &options.source_table,
+    )
+    .await?;
+    let target_column_info = get_columns_core(
+        state,
+        &options.target_connection_id,
+        &options.target_database,
+        &options.target_schema,
+        &options.target_table,
+    )
+    .await?;
 
     let source_count_sql =
         build_count_table_sql(Some(source_database_type), Some(&options.source_schema), &options.source_table);
@@ -371,18 +400,58 @@ pub async fn prepare_data_compare_from_tables(
     let target_row_count = first_count(&target_count_result.rows)?;
 
     let threshold = options.degradation_threshold.clone().unwrap_or_default();
-    let degradation_level = should_degrade(source_row_count, target_row_count, &threshold);
+    let degradation_level =
+        selected_degradation_level(options.compare_mode.as_ref(), source_row_count, target_row_count, &threshold);
     let sampling_strategy = options.sampling_strategy.clone().unwrap_or(SamplingStrategy::Hybrid);
     let enable_checksum = options.enable_checksum.unwrap_or(true);
 
     // Cross-database comparison matches columns case-insensitively, so `columns` holds
     // target-side names while the source side needs its own names in the same order.
-    let source_column_names = aligned_source_column_names(&options.columns, options.source_columns.as_ref());
-    let source_key_columns = aligned_source_key_columns(&options.columns, &source_column_names, &options.key_columns);
+    let requested_source_names = aligned_source_column_names(&options.columns, options.source_columns.as_ref());
+    let mut columns = Vec::new();
+    let mut source_column_names = Vec::new();
+    for (target_name, source_name) in options.columns.iter().zip(requested_source_names) {
+        let source_type = source_column_info
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(&source_name))
+            .map(|column| column.data_type.as_str());
+        let target_type = target_column_info
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(target_name))
+            .map(|column| column.data_type.as_str());
+        if is_binary_compare_type(source_type) || is_binary_compare_type(target_type) {
+            continue;
+        }
+        columns.push(target_name.clone());
+        source_column_names.push(source_name);
+    }
+    if columns.is_empty() {
+        return Err("No comparable non-binary columns were found".to_string());
+    }
+    let source_key_columns = aligned_source_key_columns(&columns, &source_column_names, &options.key_columns);
+    if source_key_columns.len() != options.key_columns.len() {
+        return Err("Binary columns cannot be used as data comparison keys".to_string());
+    }
 
-    // Every row is read into memory and then shipped to the UI, so even the "full" level
-    // is capped: the degradation thresholds decide the level, the budget bounds the fetch.
-    let row_budget = rows_read_budget(&degradation_level, &threshold);
+    // Explicit full mode reads the entire table; calls without a selected mode retain the
+    // configured budget so older API clients keep their bounded behavior.
+    let row_budget = selected_rows_read_budget(options.compare_mode.as_ref(), &degradation_level, &threshold);
+    let numeric_columns = columns
+        .iter()
+        .zip(&source_column_names)
+        .filter_map(|(target_name, source_name)| {
+            let source_type = source_column_info
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(source_name))
+                .map(|column| column.data_type.as_str());
+            let target_type = target_column_info
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(target_name))
+                .map(|column| column.data_type.as_str());
+            (is_numeric_compare_type(source_type) && is_numeric_compare_type(target_type))
+                .then_some(target_name.as_str())
+        })
+        .collect::<HashSet<_>>();
 
     let (source_rows, target_rows, sampling_rate, verification_method, source_truncated, target_truncated) =
         match &degradation_level {
@@ -406,7 +475,7 @@ pub async fn prepare_data_compare_from_tables(
                         &options.target_database,
                         &options.target_schema,
                         &options.target_table,
-                        &options.columns,
+                        &columns,
                         &options.key_columns,
                         target_database_type,
                         fetch_batch_size,
@@ -429,7 +498,7 @@ pub async fn prepare_data_compare_from_tables(
                         &source_key_columns,
                         source_database_type,
                         &sampling_strategy,
-                        threshold.sample_size,
+                        threshold.sample_size.max(1),
                     ),
                     fetch_sampled_compare_rows(
                         state,
@@ -437,19 +506,22 @@ pub async fn prepare_data_compare_from_tables(
                         &options.target_database,
                         &options.target_schema,
                         &options.target_table,
-                        &options.columns,
+                        &columns,
                         &options.key_columns,
                         target_database_type,
                         &sampling_strategy,
-                        threshold.sample_size,
+                        threshold.sample_size.max(1),
                     )
                 )?;
-                let column_indexes = column_index_map(&options.columns);
+                let src = normalize_numeric_compare_rows(&columns, src, &numeric_columns);
+                let tgt = normalize_numeric_compare_rows(&columns, tgt, &numeric_columns);
+                let column_indexes = column_index_map(&columns);
                 let (src, tgt) = retain_shared_sample_rows_by_key(src, tgt, |row| {
                     key_for_row(row, &options.key_columns, &column_indexes)
                 });
                 let max_count = source_row_count.max(target_row_count);
-                let sample_rate = if max_count > 0 { threshold.sample_size as f64 / max_count as f64 } else { 1.0 };
+                let sample_rate =
+                    if max_count > 0 { threshold.sample_size.max(1) as f64 / max_count as f64 } else { 1.0 };
                 let method = "paired_key_sample".to_string();
                 let source_truncated = source_row_count > src.len() as u64;
                 let target_truncated = target_row_count > tgt.len() as u64;
@@ -460,24 +532,22 @@ pub async fn prepare_data_compare_from_tables(
             }
         };
 
-    let sync_eligible = matches!(degradation_level, DegradationLevel::Full) && !source_truncated && !target_truncated;
+    let source_rows = normalize_numeric_compare_rows(&columns, source_rows, &numeric_columns);
+    let target_rows = normalize_numeric_compare_rows(&columns, target_rows, &numeric_columns);
 
-    let target_columns = get_columns_core(
-        state,
-        &options.target_connection_id,
-        &options.target_database,
-        &options.target_schema,
-        &options.target_table,
-    )
-    .await?;
+    let skipped_binary_columns = columns.len() != options.columns.len();
+    let sync_eligible = matches!(degradation_level, DegradationLevel::Full)
+        && !source_truncated
+        && !target_truncated
+        && !skipped_binary_columns;
 
     let source_checksums = if enable_checksum && !source_rows.is_empty() {
-        Some(compute_column_checksums(&options.columns, &source_rows))
+        Some(compute_column_checksums(&columns, &source_rows))
     } else {
         None
     };
     let target_checksums = if enable_checksum && !target_rows.is_empty() {
-        Some(compute_column_checksums(&options.columns, &target_rows))
+        Some(compute_column_checksums(&columns, &target_rows))
     } else {
         None
     };
@@ -489,9 +559,13 @@ pub async fn prepare_data_compare_from_tables(
     let preparation = prepare_data_compare(DataComparePreparationOptions {
         table_name: options.target_table,
         schema: Some(options.target_schema),
-        columns: options.columns,
+        columns: columns.clone(),
         key_columns: options.key_columns,
-        column_info: target_columns.into_iter().map(data_grid_column_info).collect(),
+        column_info: target_column_info
+            .into_iter()
+            .filter(|column| columns.iter().any(|name| name.eq_ignore_ascii_case(&column.name)))
+            .map(data_grid_column_info)
+            .collect(),
         source_rows,
         target_rows,
         database_type: Some(target_database_type),
@@ -537,7 +611,17 @@ pub async fn prepare_data_compare_missing_target(
         &options.source_table,
     )
     .await?;
-    let column_names = source_columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
+    let column_names = source_columns
+        .iter()
+        .filter(|column| !is_binary_compare_type(Some(&column.data_type)))
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    if column_names.is_empty() {
+        return Err("No comparable non-binary columns were found".to_string());
+    }
+    if options.key_columns.iter().any(|key| !column_names.iter().any(|column| column.eq_ignore_ascii_case(key))) {
+        return Err("Binary columns cannot be used as data comparison keys".to_string());
+    }
 
     let source_count_sql =
         build_count_table_sql(Some(source_database_type), Some(&options.source_schema), &options.source_table);
@@ -552,26 +636,75 @@ pub async fn prepare_data_compare_missing_target(
     )
     .await?;
     let source_row_count = first_count(&source_count_result.rows)?;
-    // A table that only exists on the source side has no count to compare against, but the
-    // sync plan still embeds one statement per row: reading the whole table freezes the
-    // client on large tables, so the plan covers at most one full-compare budget of rows.
     let threshold = options.degradation_threshold.clone().unwrap_or_default();
-    let row_budget = threshold.full_compare_max_rows.max(1) as usize;
-    let source_rows = fetch_compare_rows(
-        state,
-        &options.source_connection_id,
-        &options.source_database,
-        &options.source_schema,
-        &options.source_table,
-        &column_names,
-        &options.key_columns,
-        source_database_type,
-        fetch_batch_size,
-        row_budget,
-    )
-    .await?;
-    let source_truncated = validate_full_compare_read(source_row_count, source_rows.len(), row_budget)?;
-    let sync_eligible = !source_truncated;
+    let degradation_level = selected_degradation_level(options.compare_mode.as_ref(), source_row_count, 0, &threshold);
+    let sampling_strategy = options.sampling_strategy.clone().unwrap_or(SamplingStrategy::Hybrid);
+    let row_budget = if options.compare_mode.is_none() {
+        usize::try_from(threshold.full_compare_max_rows).unwrap_or(usize::MAX).max(1)
+    } else {
+        selected_rows_read_budget(options.compare_mode.as_ref(), &degradation_level, &threshold)
+    };
+    let (source_rows, source_truncated, sampling_rate, verification_method) = if options.compare_mode.is_none() {
+        let rows = fetch_compare_rows(
+            state,
+            &options.source_connection_id,
+            &options.source_database,
+            &options.source_schema,
+            &options.source_table,
+            &column_names,
+            &options.key_columns,
+            source_database_type,
+            fetch_batch_size,
+            row_budget,
+        )
+        .await?;
+        let truncated = validate_full_compare_read(source_row_count, rows.len(), row_budget)?;
+        let rate = if truncated { row_budget as f64 / source_row_count.max(1) as f64 } else { 1.0 };
+        let method = if truncated { "missing_target_prefix" } else { "missing_target_full" };
+        (rows, truncated, rate, method.to_string())
+    } else {
+        match &degradation_level {
+            DegradationLevel::Full => {
+                let rows = fetch_compare_rows(
+                    state,
+                    &options.source_connection_id,
+                    &options.source_database,
+                    &options.source_schema,
+                    &options.source_table,
+                    &column_names,
+                    &options.key_columns,
+                    source_database_type,
+                    fetch_batch_size,
+                    row_budget,
+                )
+                .await?;
+                let truncated = validate_full_compare_read(source_row_count, rows.len(), row_budget)?;
+                (rows, truncated, 1.0, "missing_target_full".to_string())
+            }
+            DegradationLevel::Sample => {
+                let rows = fetch_sampled_compare_rows(
+                    state,
+                    &options.source_connection_id,
+                    &options.source_database,
+                    &options.source_schema,
+                    &options.source_table,
+                    &column_names,
+                    &options.key_columns,
+                    source_database_type,
+                    &sampling_strategy,
+                    threshold.sample_size.max(1),
+                )
+                .await?;
+                let truncated = source_row_count > rows.len() as u64;
+                let rate = (threshold.sample_size.max(1) as f64 / source_row_count.max(1) as f64).min(1.0);
+                (rows, truncated, rate, "missing_target_sample".to_string())
+            }
+            DegradationLevel::SkipWithRisk => (Vec::new(), true, 0.0, "skipped".to_string()),
+        }
+    };
+    let skipped_binary_columns = column_names.len() != source_columns.len();
+    let sync_eligible =
+        !skipped_binary_columns && !source_truncated && !matches!(&options.compare_mode, Some(DataCompareMode::Sample));
     let result = missing_target_diff(&column_names, &options.key_columns, source_rows);
     let mut pre_sync_statements = Vec::new();
     pre_sync_statements.push(format!(
@@ -622,12 +755,14 @@ pub async fn prepare_data_compare_missing_target(
         target_truncated: false,
         row_budget,
         sync_eligible,
-        degradation_level: Some(should_degrade(source_row_count, 0, &threshold).to_string()),
-        sampling_rate: Some(if source_truncated { row_budget as f64 / source_row_count.max(1) as f64 } else { 1.0 }),
-        confidence_score: Some(if source_truncated { 0.5 } else { 1.0 }),
-        verification_method: Some(
-            if source_truncated { "missing_target_prefix" } else { "missing_target_full" }.to_string(),
-        ),
+        degradation_level: Some(degradation_level.to_string()),
+        sampling_rate: Some(sampling_rate),
+        confidence_score: Some(if source_truncated || matches!(&degradation_level, DegradationLevel::Sample) {
+            0.5
+        } else {
+            1.0
+        }),
+        verification_method: Some(verification_method),
         source_checksums: None,
         target_checksums: None,
     })
@@ -1346,18 +1481,130 @@ fn where_by_key(
     key_columns
         .iter()
         .map(|column| {
-            format!(
-                "{} = {}",
-                quote_table_identifier(database_type, column),
-                format_grid_sql_literal(
-                    key_values.get(column).unwrap_or(&Value::Null),
-                    database_type,
-                    column_info_for(column_info, column),
+            let identifier = quote_table_identifier(database_type, column);
+            let value = key_values.get(column).unwrap_or(&Value::Null);
+            if value.is_null() {
+                format!("{identifier} IS NULL")
+            } else {
+                format!(
+                    "{identifier} = {}",
+                    format_grid_sql_literal(value, database_type, column_info_for(column_info, column))
                 )
-            )
+            }
         })
         .collect::<Vec<_>>()
         .join(" AND ")
+}
+
+fn is_binary_compare_type(data_type: Option<&str>) -> bool {
+    let Some(data_type) = data_type else { return false };
+    let data_type = data_type.trim().to_ascii_lowercase();
+    data_type.contains("blob")
+        || data_type.contains("binary")
+        || data_type.contains("for bit data")
+        || data_type == "bit"
+        || data_type.starts_with("bit(")
+        || data_type == "image"
+        || data_type == "bytea"
+}
+
+fn is_numeric_compare_type(data_type: Option<&str>) -> bool {
+    let Some(data_type) = data_type else { return false };
+    let ty = data_type.trim().to_ascii_lowercase();
+    [
+        "tinyint",
+        "smallint",
+        "mediumint",
+        "int",
+        "integer",
+        "bigint",
+        "decimal",
+        "numeric",
+        "number",
+        "real",
+        "float",
+        "double",
+        "decfloat",
+        "serial",
+    ]
+    .iter()
+    .any(|name| ty == *name || ty.starts_with(&format!("{name}(")) || ty.starts_with(&format!("{name} ")))
+}
+
+fn normalize_numeric_compare_rows(
+    columns: &[String],
+    rows: Vec<Vec<Value>>,
+    numeric_columns: &HashSet<&str>,
+) -> Vec<Vec<Value>> {
+    let indexes = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, name)| numeric_columns.contains(name.as_str()).then_some(index))
+        .collect::<Vec<_>>();
+    rows.into_iter()
+        .map(|mut row| {
+            for index in &indexes {
+                if let Some(value) = row.get_mut(*index) {
+                    if let Some(normalized) = normalize_numeric_compare_value(value) {
+                        *value = Value::String(normalized);
+                    }
+                }
+            }
+            row
+        })
+        .collect()
+}
+
+fn normalize_numeric_compare_value(value: &Value) -> Option<String> {
+    if value.is_null() || value.is_boolean() {
+        return None;
+    }
+    let raw = match value {
+        Value::String(value) => value.clone(),
+        Value::Number(value) => value.to_string(),
+        _ => return None,
+    };
+    let (negative, unsigned) = raw.strip_prefix('-').map_or((false, raw.as_str()), |value| (true, value));
+    let (mantissa, exponent) = unsigned
+        .find(['e', 'E'])
+        .map(|index| {
+            let (mantissa, exponent) = unsigned.split_at(index);
+            (mantissa, exponent[1..].parse::<i32>().ok())
+        })
+        .unwrap_or((unsigned, Some(0)));
+    let Some(exponent) = exponent.filter(|value| value.unsigned_abs() <= 100_000) else {
+        return Some(raw);
+    };
+    let mut parts = mantissa.split('.');
+    let integer = parts.next()?;
+    let fraction = parts.next().unwrap_or("");
+    if parts.next().is_some()
+        || integer.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Some(raw);
+    }
+    let digits = format!("{integer}{fraction}");
+    let decimal_position = integer.len() as i64 + i64::from(exponent);
+    let (integer, fraction) = if decimal_position <= 0 {
+        ("0".to_string(), format!("{}{digits}", "0".repeat((-decimal_position) as usize)))
+    } else if decimal_position as usize >= digits.len() {
+        (format!("{digits}{}", "0".repeat(decimal_position as usize - digits.len())), String::new())
+    } else {
+        let position = decimal_position as usize;
+        (digits[..position].to_string(), digits[position..].to_string())
+    };
+    let integer = integer.trim_start_matches('0');
+    let integer = if integer.is_empty() { "0" } else { integer };
+    let fraction = fraction.trim_end_matches('0');
+    let is_zero = integer == "0" && fraction.is_empty();
+    Some(format!(
+        "{}{integer}{}{}",
+        if negative && !is_zero { "-" } else { "" },
+        if fraction.is_empty() { "" } else { "." },
+        fraction
+    ))
 }
 
 fn format_grid_sql_literal(
@@ -1397,9 +1644,34 @@ fn data_grid_column_info(column: crate::types::ColumnInfo) -> DataGridColumnInfo
 /// Rows per side a compare may read for a given degradation level.
 fn rows_read_budget(level: &DegradationLevel, threshold: &DegradationThreshold) -> usize {
     match level {
-        DegradationLevel::Full => threshold.full_compare_max_rows.max(1) as usize,
-        DegradationLevel::Sample => threshold.sample_size,
+        DegradationLevel::Full => usize::try_from(threshold.full_compare_max_rows).unwrap_or(usize::MAX).max(1),
+        DegradationLevel::Sample => threshold.sample_size.max(1),
         DegradationLevel::SkipWithRisk => 0,
+    }
+}
+
+fn selected_degradation_level(
+    mode: Option<&DataCompareMode>,
+    source_row_count: u64,
+    target_row_count: u64,
+    threshold: &DegradationThreshold,
+) -> DegradationLevel {
+    match mode {
+        Some(DataCompareMode::Full) => DegradationLevel::Full,
+        Some(DataCompareMode::Sample) => DegradationLevel::Sample,
+        None => should_degrade(source_row_count, target_row_count, threshold),
+    }
+}
+
+fn selected_rows_read_budget(
+    mode: Option<&DataCompareMode>,
+    level: &DegradationLevel,
+    threshold: &DegradationThreshold,
+) -> usize {
+    match mode {
+        Some(DataCompareMode::Full) => usize::MAX,
+        Some(DataCompareMode::Sample) => threshold.sample_size.max(1),
+        None => rows_read_budget(level, threshold),
     }
 }
 
@@ -1906,6 +2178,7 @@ pub async fn verify_data(state: &AppState, options: VerifyDataOptions) -> Result
         source_columns: None,
         fetch_batch_size: options.fetch_batch_size,
         degradation_threshold: Some(degradation_threshold),
+        compare_mode: None,
         sampling_strategy: Some(sampling_strategy),
         enable_checksum: Some(enable_checksum),
     };
@@ -1957,6 +2230,58 @@ mod tests {
 
     fn data_compare_column_with_extra(name: &str, data_type: &str, extra: &str) -> DataGridColumnInfo {
         DataGridColumnInfo { extra: Some(extra.to_string()), ..data_compare_column(name, data_type) }
+    }
+
+    #[test]
+    fn nullable_sync_keys_use_is_null_predicate() {
+        let keys = HashMap::from([("nullable_id".to_string(), Value::Null)]);
+        assert_eq!(where_by_key(&keys, &["nullable_id".to_string()], None, &[]), "\"nullable_id\" IS NULL");
+    }
+
+    #[test]
+    fn numeric_values_normalize_across_string_and_number_encodings() {
+        assert_eq!(normalize_numeric_compare_value(&json!(1)), Some("1".to_string()));
+        assert_eq!(normalize_numeric_compare_value(&json!("001.000")), Some("1".to_string()));
+        assert_eq!(normalize_numeric_compare_value(&json!("1.23e2")), Some("123".to_string()));
+        assert_eq!(normalize_numeric_compare_value(&json!("12.30E-1")), Some("1.23".to_string()));
+        assert_eq!(normalize_numeric_compare_value(&json!("-0.00")), Some("0".to_string()));
+        assert_eq!(normalize_numeric_compare_value(&Value::Null), None);
+
+        let columns = vec!["id".to_string(), "amount".to_string()];
+        let numeric_columns = HashSet::from(["id"]);
+        let source_rows =
+            normalize_numeric_compare_rows(&columns, vec![vec![json!("001"), json!("5.00")]], &numeric_columns);
+        let target_rows = normalize_numeric_compare_rows(&columns, vec![vec![json!(1), json!(5.0)]], &numeric_columns);
+        let indexes = column_index_map(&columns);
+        let (source_rows, target_rows) = retain_shared_sample_rows_by_key(source_rows, target_rows, |row| {
+            key_for_row(row, &["id".to_string()], &indexes)
+        });
+        assert_eq!(source_rows.len(), 1);
+        assert_eq!(target_rows.len(), 1);
+    }
+
+    #[test]
+    fn null_values_compare_equal_only_when_both_sides_are_null() {
+        let diff = compare_data_rows(CompareDataRowsOptions {
+            columns: vec!["id".to_string(), "value".to_string()],
+            key_columns: vec!["id".to_string()],
+            source_rows: vec![vec![json!(1), Value::Null], vec![json!(2), json!("source")]],
+            target_rows: vec![vec![json!(1), Value::Null], vec![json!(2), Value::Null]],
+        })
+        .expect("NULL values are valid compare cells");
+
+        assert_eq!(diff.modified.len(), 1);
+        assert_eq!(diff.modified[0].key_values.get("id"), Some(&json!(2)));
+        assert_eq!(diff.modified[0].changes[0].source, json!("source"));
+        assert_eq!(diff.modified[0].changes[0].target, Value::Null);
+    }
+
+    #[test]
+    fn binary_compare_types_cover_db2_and_tidb_families() {
+        for data_type in ["BLOB(1M)", "VARBINARY(20)", "CHARACTER FOR BIT DATA", "BIT(4)", "LONGBLOB"] {
+            assert!(is_binary_compare_type(Some(data_type)), "{data_type}");
+        }
+        assert!(!is_binary_compare_type(Some("VARCHAR(20)")));
     }
 
     #[test]
@@ -3029,6 +3354,42 @@ mod tests {
             let error = validate_full_compare_read(expected, actual, 100_000).unwrap_err();
             assert!(error.contains("no synchronization plan was generated"));
         }
+    }
+
+    #[test]
+    fn explicit_full_or_sample_mode_bypasses_default_row_count_thresholds() {
+        let threshold = DegradationThreshold { sample_size: 4321, ..DegradationThreshold::default() };
+        let sample_mode = DataCompareMode::Sample;
+        for row_count in [10_000_001, 100_000_000, u64::MAX] {
+            let level = selected_degradation_level(Some(&sample_mode), row_count, row_count, &threshold);
+            assert_eq!(level, DegradationLevel::Sample);
+            assert_eq!(selected_rows_read_budget(Some(&sample_mode), &level, &threshold), 4321);
+        }
+
+        let full_mode = DataCompareMode::Full;
+        for row_count in [10_000_001, u64::MAX] {
+            let level = selected_degradation_level(Some(&full_mode), row_count, row_count, &threshold);
+            assert_eq!(level, DegradationLevel::Full);
+            assert_eq!(selected_rows_read_budget(Some(&full_mode), &level, &threshold), usize::MAX);
+        }
+    }
+
+    #[test]
+    fn db2_10_1_and_tidb_mysql_pagination_keep_native_limit_syntax() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let keys = vec!["id".to_string()];
+        let db2_first = build_data_compare_select_sql(DatabaseType::Db2, "APP", "USERS", &columns, &keys, 1000, 0);
+        let db2_second = build_data_compare_select_sql(DatabaseType::Db2, "APP", "USERS", &columns, &keys, 1000, 1000);
+        assert!(db2_first.contains("FETCH FIRST 1000 ROWS ONLY"), "{db2_first}");
+        assert!(db2_second.contains("ROW_NUMBER() OVER (ORDER BY \"id\" ASC)"), "{db2_second}");
+        assert!(!db2_second.contains(" LIMIT ") && !db2_second.contains(" OFFSET "), "{db2_second}");
+
+        // TiDB uses the MySQL wire profile in DBX.
+        let tidb_first = build_data_compare_select_sql(DatabaseType::Mysql, "app", "users", &columns, &keys, 1000, 0);
+        let tidb_second =
+            build_data_compare_select_sql(DatabaseType::Mysql, "app", "users", &columns, &keys, 1000, 1000);
+        assert!(tidb_first.ends_with("LIMIT 1000;"), "{tidb_first}");
+        assert!(tidb_second.ends_with("LIMIT 1000 OFFSET 1000;"), "{tidb_second}");
     }
 
     #[test]

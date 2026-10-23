@@ -93,6 +93,8 @@ describe("DataCompareConfigSelector", () => {
     targetSchema: "public",
     targetTable: "users",
     detailPreviewLimit: "100",
+    compareMode: "full",
+    sampleSize: 10_000,
     keyColumnsByTable: {},
   };
 

@@ -3,7 +3,19 @@ import { uuid } from "@/lib/common/utils";
 import * as api from "@/lib/backend/api";
 import { openDataCompareSession } from "@/composables/useDialogSources";
 import { useExportTracker } from "@/composables/useExportTracker";
-import { inferCompareKeyColumns, intersectCompareColumns, matchColumnNameIgnoreCase, normalizeKeyColumns, type DataCompareCellValue, type DataCompareFromTablesPreparation, type DataCompareResult, type DataCompareSyncPlan, type DataCompareSyncPlanTableOptions } from "@/lib/dataGrid/dataCompare";
+import {
+  dataCompareThreshold,
+  inferCompareKeyColumns,
+  intersectCompareColumns,
+  matchColumnNameIgnoreCase,
+  normalizeKeyColumns,
+  type DataCompareCellValue,
+  type DataCompareFromTablesPreparation,
+  type DataCompareMode,
+  type DataCompareResult,
+  type DataCompareSyncPlan,
+  type DataCompareSyncPlanTableOptions,
+} from "@/lib/dataGrid/dataCompare";
 import type { ColumnInfo, DatabaseType } from "@/types/database";
 
 export type CompareColumn = ColumnInfo;
@@ -94,6 +106,8 @@ export interface DataCompareSessionConfig {
    * again — it must not silently fall back to the primary key.
    */
   keyColumnsByTable: Record<string, string[]>;
+  compareMode: DataCompareMode;
+  sampleSize: number;
   label: string;
 }
 
@@ -388,6 +402,8 @@ async function runDataCompareSession(session: DataCompareSession, tasks: DataCom
             columns,
             keyColumns: canonicalKeyColumns,
             sourceColumns: matched.sourceColumns,
+            degradationThreshold: dataCompareThreshold(input.sampleSize),
+            compareMode: input.compareMode,
           });
           keyColumns = canonicalKeyColumns;
           results.push(buildTableResult(task, preparation, canonicalKeyColumns, columns, columnInfo, databaseType));
@@ -406,6 +422,8 @@ async function runDataCompareSession(session: DataCompareSession, tasks: DataCom
             targetSchema: input.targetSchema,
             targetTable: task.targetTable,
             keyColumns,
+            degradationThreshold: dataCompareThreshold(input.sampleSize),
+            compareMode: input.compareMode,
           });
           results.push(buildMissingTargetResult(task, preparation, sourceColumns, keyColumns, databaseType));
         }

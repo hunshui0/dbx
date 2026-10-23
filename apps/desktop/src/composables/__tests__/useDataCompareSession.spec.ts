@@ -66,6 +66,8 @@ function baseConfig(overrides: Partial<DataCompareSessionConfig> = {}): DataComp
     targetTables: Object.keys(TABLES),
     targetTable: "",
     keyColumnsByTable: {},
+    compareMode: "full",
+    sampleSize: 10_000,
     label: "app → warehouse",
     ...overrides,
   };
@@ -116,6 +118,28 @@ test("runs a data compare session independently of the dialog and retains its re
   const onOpen = trackerMock.addDataCompareTask.mock.calls[0]?.[2] as (() => void) | undefined;
   onOpen?.();
   assert.equal(openMock.mock.calls.at(-1)?.[0], session.id);
+});
+
+test("full compare sends an explicit mode that bypasses default row-count thresholds", async () => {
+  await runSession(baseConfig({ selectedSourceTables: ["users"], targetTable: "users" }), [{ sourceTable: "users", targetTable: "users" }]);
+
+  const options = apiMock.prepareDataCompareFromTables.mock.calls[0]?.[0];
+  assert.equal(options?.compareMode, "full");
+  assert.equal(options?.degradationThreshold.sampleSize, 10_000);
+});
+
+test("sample compare uses the configured row count for existing and missing target tables", async () => {
+  apiMock.prepareDataCompareMissingTarget.mockResolvedValue(preparationFor("users"));
+  const input = baseConfig({ selectedSourceTables: ["users"], targetTable: "users", compareMode: "sample", sampleSize: 4321 });
+  await runSession(input, [{ sourceTable: "users", targetTable: "users" }]);
+  await runSession({ ...input, targetTables: ["orders"] }, [{ sourceTable: "users", targetTable: "users" }]);
+
+  const matchedOptions = apiMock.prepareDataCompareFromTables.mock.calls[0]?.[0];
+  const missingOptions = apiMock.prepareDataCompareMissingTarget.mock.calls[0]?.[0];
+  for (const options of [matchedOptions, missingOptions]) {
+    assert.equal(options?.compareMode, "sample");
+    assert.equal(options?.degradationThreshold.sampleSize, 4321);
+  }
 });
 
 test("infers the primary key of every table when no match columns are configured", async () => {

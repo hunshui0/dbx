@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import SearchableSelect from "@/components/ui/searchable-select/SearchableSelect.vue";
 import CompareConnectionSelect from "@/components/diff/CompareConnectionSelect.vue";
@@ -13,7 +14,19 @@ import { useToast } from "@/composables/useToast";
 import { databaseOptionsForConnection, fetchNamespaceOptionsForConnection } from "@/composables/useDatabaseOptions";
 import { isSchemaAware } from "@/lib/database/databaseCapabilities";
 import { copyToClipboard } from "@/lib/common/clipboard";
-import { inferCompareKeyColumns, normalizeKeyColumns, sameKeyColumns, type CompareKeyColumnOption, type DataCompareCellValue, type DataCompareSyncPlan } from "@/lib/dataGrid/dataCompare";
+import {
+  DEFAULT_DATA_COMPARE_SAMPLE_SIZE,
+  MAX_DATA_COMPARE_SAMPLE_SIZE,
+  buildDataCompareReportMarkdown,
+  inferCompareKeyColumns,
+  normalizeDataCompareSampleSize,
+  normalizeKeyColumns,
+  sameKeyColumns,
+  type CompareKeyColumnOption,
+  type DataCompareCellValue,
+  type DataCompareMode,
+  type DataCompareSyncPlan,
+} from "@/lib/dataGrid/dataCompare";
 import {
   buildDataCompareSyncPlanTables,
   emptyDataCompareSyncPlan,
@@ -36,7 +49,8 @@ import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutio
 import { supportsTransaction } from "@/lib/database/databaseFeatureSupport";
 import { formatError, isManualTransactionSessionExpired } from "@/lib/backend/errorUtils";
 import TableMultiSelect from "@/components/diff/TableMultiSelect.vue";
-import { ArrowLeftRight, CheckSquare, ChevronDown, ChevronRight, Copy, GitCompareArrows, Loader2, Play, RotateCcw, Square } from "@lucide/vue";
+import { compactLocalTimestamp, saveTextFile } from "@/lib/export/saveTextFile";
+import { ArrowLeftRight, CheckSquare, ChevronDown, ChevronRight, Copy, Download, GitCompareArrows, Loader2, Play, RotateCcw, Square } from "@lucide/vue";
 
 const PREVIEW_LIMIT_OPTIONS = [50, 100, 200, 500];
 const SYNC_EXECUTE_BATCH_SIZE = 500;
@@ -82,6 +96,8 @@ const targetSchemas = ref<string[]>([]);
 const targetTables = ref<string[]>([]);
 
 const detailPreviewLimit = ref(String(PREVIEW_LIMIT_OPTIONS[1]));
+const compareMode = ref<DataCompareMode>("full");
+const sampleSize = ref(String(DEFAULT_DATA_COMPARE_SAMPLE_SIZE));
 const batchResults = ref<DataCompareTableResult[]>([]);
 const syncPlan = ref<DataCompareSyncPlan>(emptyDataCompareSyncPlan());
 const comparing = ref(false);
@@ -237,6 +253,14 @@ const canCompare = computed(
     !singleTableNeedsKeyColumns.value,
 );
 const detailPreviewLimitNumber = computed(() => Number(detailPreviewLimit.value) || PREVIEW_LIMIT_OPTIONS[1]);
+
+function normalizedSampleSize(): number {
+  return normalizeDataCompareSampleSize(sampleSize.value);
+}
+
+function normalizeSampleSizeInput(): void {
+  sampleSize.value = String(normalizedSampleSize());
+}
 
 const sameTableCount = computed(() => batchResults.value.filter((item) => item.status === "same").length);
 const differentTableCount = computed(() => batchResults.value.filter((item) => item.status === "different").length);
@@ -494,6 +518,8 @@ async function restoreDataCompareSession(session: DataCompareSession): Promise<v
     targetSchemas.value = [...config.targetSchemas];
     targetTables.value = [...config.targetTables];
     targetTable.value = config.targetTable;
+    compareMode.value = config.compareMode;
+    sampleSize.value = String(normalizeDataCompareSampleSize(config.sampleSize));
     // Restore the per-table match columns so a reopened session keeps every
     // table's own selection instead of collapsing back to one global list.
     keyColumnOverrides.value = normalizeKeyColumnOverrides(config.keyColumnsByTable);
@@ -524,6 +550,8 @@ function dataCompareConfigSnapshot(): DataCompareConfigSnapshot {
     targetSchema: targetSchema.value,
     targetTable: targetTable.value,
     detailPreviewLimit: detailPreviewLimit.value,
+    compareMode: compareMode.value,
+    sampleSize: normalizedSampleSize(),
     keyColumnsByTable: buildSessionKeyColumnsByTable(),
   };
 }
@@ -578,6 +606,8 @@ async function applyDataCompareConfig(config: DataCompareConfig): Promise<void> 
     resetSelectedSourceTables(availableTables);
     sourceTable.value = availableTables.length === 1 ? (availableTables[0] ?? "") : "";
     if (config.targetTable && targetTables.value.includes(config.targetTable)) targetTable.value = config.targetTable;
+    compareMode.value = config.compareMode;
+    sampleSize.value = String(normalizeDataCompareSampleSize(config.sampleSize));
     keyColumnOverrides.value = normalizeKeyColumnOverrides(config.keyColumnsByTable);
     resetTableColumnMetadata();
     if (config.detailPreviewLimit) detailPreviewLimit.value = config.detailPreviewLimit;
@@ -935,6 +965,8 @@ function startCompare(): void {
       targetTables: [...targetTables.value],
       targetTable: targetTable.value,
       keyColumnsByTable: buildSessionKeyColumnsByTable(),
+      compareMode: compareMode.value,
+      sampleSize: normalizedSampleSize(),
       label: `${comparisonEndpointLabel(sourceConnectionId.value, sourceDatabase.value, sourceSchema.value)} → ${comparisonEndpointLabel(targetConnectionId.value, targetDatabase.value, targetSchema.value)}`,
     },
     tasks,
@@ -957,6 +989,43 @@ async function copySql() {
     toast(t("grid.copied"));
   } catch (e: any) {
     toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
+async function exportComparisonReport() {
+  if (!hasResults.value || comparing.value || planningSync.value) return;
+  const generatedAt = new Date();
+  const compareConfig = getDataCompareSession(activeSessionId.value)?.config;
+  const reportCompareMode = compareConfig?.compareMode ?? compareMode.value;
+  const reportSampleSize = compareConfig?.sampleSize ?? normalizedSampleSize();
+  try {
+    const report = buildDataCompareReportMarkdown({
+      source: comparisonEndpointLabel(compareConfig?.sourceConnectionId ?? sourceConnectionId.value, compareConfig?.sourceDatabase ?? sourceDatabase.value, compareConfig?.sourceSchema ?? sourceSchema.value),
+      target: comparisonEndpointLabel(compareConfig?.targetConnectionId ?? targetConnectionId.value, compareConfig?.targetDatabase ?? targetDatabase.value, compareConfig?.targetSchema ?? targetSchema.value),
+      compareMode: reportCompareMode,
+      compareModeLabel: t(reportCompareMode === "sample" ? "dataCompare.compareModeSample" : "dataCompare.compareModeFull"),
+      sampleSize: reportSampleSize,
+      generatedAt,
+      tables: batchResults.value,
+      syncSql: syncPlan.value.syncSql,
+      labels: {
+        title: t("dataCompare.reportTitle"),
+        overview: t("dataCompare.reportOverview"),
+        details: t("dataCompare.reportDetails"),
+        table: t("dataCompare.reportTable"),
+        sourceOnlyRows: t("dataCompare.reportSourceOnlyRows"),
+        targetOnlyRows: t("dataCompare.reportTargetOnlyRows"),
+        modifiedRows: t("dataCompare.reportModifiedRows"),
+        syncSql: t("dataCompare.reportSyncSql"),
+        syncSqlSelectionNote: t("dataCompare.reportSyncSqlSelectionNote"),
+        noSyncSql: t("dataCompare.reportNoSyncSql"),
+        partialResult: t("dataCompare.reportPartialResult"),
+      },
+    });
+    const saved = await saveTextFile(report, `data-compare-${compactLocalTimestamp(generatedAt)}.md`, "Markdown", "md");
+    if (saved !== false) toast(t("grid.exported"));
+  } catch (error: any) {
+    toast(t("grid.exportFailed", { message: error?.message || String(error) }), 5000);
   }
 }
 
@@ -1202,7 +1271,20 @@ watch(targetTable, () => {
 // Keep the selected config in sync with the form so "saved" really means the
 // current selection. Debounced because table multi-select toggles fire rapidly.
 watch(
-  () => [sourceConnectionId.value, sourceDatabase.value, sourceSchema.value, sourceTableSelection.value.join("\u0000"), targetConnectionId.value, targetDatabase.value, targetSchema.value, targetTable.value, detailPreviewLimit.value, JSON.stringify(keyColumnOverrides.value)],
+  () => [
+    sourceConnectionId.value,
+    sourceDatabase.value,
+    sourceSchema.value,
+    sourceTableSelection.value.join("\u0000"),
+    targetConnectionId.value,
+    targetDatabase.value,
+    targetSchema.value,
+    targetTable.value,
+    detailPreviewLimit.value,
+    compareMode.value,
+    sampleSize.value,
+    JSON.stringify(keyColumnOverrides.value),
+  ],
   () => {
     if (suppressConfigSave || initializingPrefill || !dataCompareConfigId.value) return;
     if (configSaveTimer) clearTimeout(configSaveTimer);
@@ -1492,6 +1574,50 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
+          <div class="space-y-2 border-t pt-3">
+            <div class="flex flex-wrap items-end gap-3">
+              <div class="space-y-1">
+                <Label class="text-xs font-medium">{{ t("dataCompare.compareMode") }}</Label>
+                <div class="inline-flex h-8 items-center rounded-md border p-0.5" role="group" :aria-label="t('dataCompare.compareMode')">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    class="h-7 rounded-sm px-2.5 text-xs"
+                    :class="compareMode === 'full' ? 'bg-primary text-primary-foreground hover:bg-primary/90' : ''"
+                    :aria-pressed="compareMode === 'full'"
+                    :disabled="comparing || executionLocked"
+                    data-testid="data-compare-mode-full"
+                    @click="compareMode = 'full'"
+                  >
+                    {{ t("dataCompare.compareModeFull") }}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    class="h-7 rounded-sm px-2.5 text-xs"
+                    :class="compareMode === 'sample' ? 'bg-primary text-primary-foreground hover:bg-primary/90' : ''"
+                    :aria-pressed="compareMode === 'sample'"
+                    :disabled="comparing || executionLocked"
+                    data-testid="data-compare-mode-sample"
+                    @click="compareMode = 'sample'"
+                  >
+                    {{ t("dataCompare.compareModeSample") }}
+                  </Button>
+                </div>
+              </div>
+
+              <div class="space-y-1">
+                <Label for="data-compare-sample-size" class="text-xs font-medium">{{ t("dataCompare.sampleSize") }}</Label>
+                <Input id="data-compare-sample-size" v-model="sampleSize" type="number" min="1" :max="MAX_DATA_COMPARE_SAMPLE_SIZE" step="1" class="h-8 w-36 text-xs tabular-nums" :disabled="comparing || executionLocked" data-testid="data-compare-sample-size" @blur="normalizeSampleSizeInput" />
+              </div>
+            </div>
+            <p class="text-[11px] text-muted-foreground">
+              {{ compareMode === "full" ? t("dataCompare.fullCompareHint") : t("dataCompare.sampleCompareHint", { count: normalizedSampleSize() }) }}
+            </p>
+          </div>
+
           <div v-if="comparing" class="flex items-center gap-2 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-xs text-muted-foreground">
             <Loader2 class="h-3.5 w-3.5 animate-spin text-primary" />
             <span>{{ compareProgressLabel || t("diff.progress.comparing") }}</span>
@@ -1735,6 +1861,7 @@ onBeforeUnmount(() => {
           }}
         </span>
         <Button variant="outline" size="sm" :disabled="!syncPlan.syncSql.trim()" @click="copySql"> <Copy class="w-3 h-3 mr-1" /> {{ t("diff.copySql") }} </Button>
+        <Button variant="outline" size="sm" :disabled="comparing || planningSync" @click="exportComparisonReport"> <Download class="w-3 h-3 mr-1" /> {{ t("dataCompare.reportDownload") }} </Button>
         <template v-if="txnSessionId && !executing">
           <span class="text-xs text-muted-foreground">{{ t("dataCompare.pendingTransaction") }}</span>
           <Button variant="outline" size="sm" :disabled="resolvingTransaction" @click="finishTransaction(false)">{{ t("toolbar.rollback") }}</Button>
