@@ -3174,6 +3174,20 @@ fn generate_mysql_foreign_key_alter_statements(
     statements
 }
 
+/// Single `setval` statement that moves the sequence behind `column` on `full_table`
+/// (already identifier-quoted) past the column's current maximum. `MAX(...::bigint)`
+/// keeps the expression type-safe for non-integer sequence-backed columns, and the
+/// statement is a no-op when `pg_get_serial_sequence` returns NULL for an unowned
+/// sequence.
+pub(crate) fn postgres_sequence_sync_statement(full_table: &str, column: &str) -> String {
+    let quoted_column = quote_identifier(column, &DatabaseType::Postgres);
+    format!(
+        "SELECT setval(pg_get_serial_sequence({}, {})::regclass, GREATEST(COALESCE(MAX({quoted_column}::bigint), 0), 1), MAX({quoted_column}::bigint) IS NOT NULL) FROM {full_table}",
+        quote_string_literal(full_table),
+        quote_string_literal(column)
+    )
+}
+
 /// `setval` statements that move a PostgreSQL sequence or identity column past the
 /// values already in the table.
 ///
@@ -3189,14 +3203,7 @@ fn generate_postgres_sequence_sync_sql(columns: &[db::ColumnInfo], table: &str, 
                 || is_postgres_identity_extra(column.extra.as_deref())
                 || (column.is_primary_key && column_is_auto_increment(column))
         })
-        .map(|column| {
-            let quoted_column = quote_identifier(&column.name, &DatabaseType::Postgres);
-            format!(
-                "SELECT setval(pg_get_serial_sequence({}, {})::regclass, GREATEST(COALESCE(MAX({quoted_column}::bigint), 0), 1), MAX({quoted_column}::bigint) IS NOT NULL) FROM {full_table}",
-                quote_string_literal(&full_table),
-                quote_string_literal(&column.name)
-            )
-        })
+        .map(|column| postgres_sequence_sync_statement(&full_table, &column.name))
         .collect()
 }
 
@@ -4433,6 +4440,13 @@ fn target_text_type(target_db: &DatabaseType) -> &'static str {
     }
 }
 
+fn has_max_length_param(lowered_source_type: &str) -> bool {
+    lowered_source_type
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .is_some_and(|(params, _)| params.trim() == "max")
+}
+
 /// DuckDB reads a bare `NUMERIC`/`DECIMAL` as DECIMAL(18, 3), which keeps only
 /// 15 integer digits, so a transferred NUMBER(18) key failed every insert with
 /// "Could not convert string ... to DECIMAL(18,3)" (#12846). A precision/scale
@@ -4514,6 +4528,13 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
         } else {
             "bigint"
         };
+    }
+
+    // SQL Server `timestamp` is a synonym for `rowversion`: an 8 byte binary row
+    // counter read as `0x...`, not a date and time. Mapping it to a temporal type
+    // made every insert fail with an invalid timestamp format (#13190).
+    if *source_db == DatabaseType::SqlServer && is_sqlserver_rowversion_type(&t) {
+        base = "binary";
     }
 
     if matches!(
@@ -4617,7 +4638,12 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
             }
         }
         "varchar" | "nvarchar" | "character varying" | "varchar2" => {
-            if t.contains('(') {
+            // `(max)` is SQL Server only syntax for an up to 2 GB string. Other
+            // targets reject `VARCHAR(max)` in CREATE TABLE (#13190), so the
+            // column becomes the target's unbounded text type instead.
+            if has_max_length_param(&t) && *target_db != DatabaseType::SqlServer {
+                target_text_type(target_db).into()
+            } else if t.contains('(') {
                 let len_part = transfer_length_params(&t, source_db, target_db);
                 match target_db {
                     target_db if is_postgres_transfer_dialect(target_db) => format!("VARCHAR{len_part}"),
@@ -9651,6 +9677,37 @@ where
     if matches!(request.content, TransferContent::DataOnly) {
         return Ok(TransferObjectOutcome::default());
     }
+    let routine_context = crate::schema::oracle_routines::capture_routine_transfer_context(
+        state,
+        &request.source_connection_id,
+        &request.target_connection_id,
+    )
+    .await?;
+    transfer_schema_objects_with_routine_context(
+        state,
+        request,
+        source_pool_key,
+        target_pool_key,
+        routine_context.as_ref(),
+        progress_callback,
+    )
+    .await
+}
+
+pub(crate) async fn transfer_schema_objects_with_routine_context<F>(
+    state: &AppState,
+    request: &TransferRequest,
+    source_pool_key: &str,
+    target_pool_key: &str,
+    routine_context: Option<&crate::schema::oracle_routines::RoutineTransferContext>,
+    progress_callback: F,
+) -> Result<TransferObjectOutcome, String>
+where
+    F: FnMut(TransferProgress),
+{
+    if matches!(request.content, TransferContent::DataOnly) {
+        return Ok(TransferObjectOutcome::default());
+    }
     let source_db_type = get_db_type(state, &request.source_connection_id).await?;
     let target_db_type = get_db_type(state, &request.target_connection_id).await?;
     if !should_transfer_schema_objects(&source_db_type, &target_db_type, request) {
@@ -9697,6 +9754,7 @@ where
                 &target_db_type,
                 source_pool_key,
                 target_pool_key,
+                routine_context,
                 progress_callback,
             )
             .await
@@ -9968,6 +10026,7 @@ async fn transfer_oracle_schema_objects<F>(
     target_db_type: &DatabaseType,
     source_pool_key: &str,
     target_pool_key: &str,
+    routine_context: Option<&crate::schema::oracle_routines::RoutineTransferContext>,
     mut progress_callback: F,
 ) -> Result<TransferObjectOutcome, String>
 where
@@ -10004,6 +10063,47 @@ where
             if exists {
                 outcome.skipped.push(format!("{kind:?}:{name}"));
                 progress(&mut outcome, TransferStatus::Running, None);
+                continue;
+            }
+            if let Some(context) =
+                routine_context.filter(|_| matches!(kind, TransferObjectKind::Procedure | TransferObjectKind::Function))
+            {
+                let identity = crate::schema::oracle_routines::RoutineIdentity {
+                    owner: source_schema.clone(),
+                    name: name.clone(),
+                    kind: if kind == TransferObjectKind::Procedure {
+                        db::ObjectSourceKind::Procedure
+                    } else {
+                        db::ObjectSourceKind::Function
+                    },
+                };
+                let result = crate::schema::oracle_routines::transfer_oracle_routine_core(
+                    state,
+                    context,
+                    crate::schema::oracle_routines::RoutineTransferInput {
+                        source_connection_id: request.source_connection_id.clone(),
+                        source_database: request.source_database.clone(),
+                        identity,
+                        target_connection_id: request.target_connection_id.clone(),
+                        target_database: request.target_database.clone(),
+                        target_owner: target_schema.clone(),
+                    },
+                )
+                .await;
+                match result {
+                    Ok(operation) if operation.verified() => {
+                        outcome.transferred.push(format!("{kind:?}:{name}"));
+                        progress(&mut outcome, TransferStatus::Running, None);
+                    }
+                    result => {
+                        let error = match result {
+                            Ok(operation) => operation.failure_message(),
+                            Err(error) => error,
+                        };
+                        outcome.failed.push(format!("{kind:?}:{name}"));
+                        progress(&mut outcome, TransferStatus::Error, Some(error));
+                    }
+                }
                 continue;
             }
             let query = oracle_object_source_query(&kind, &source_schema, &name)?;
@@ -23351,7 +23451,8 @@ SELECT 1 FROM dual"#
             map_column_type("varchar(20 byte)", &DatabaseType::Mysql, &DatabaseType::Oracle),
             "VARCHAR(20 byte)"
         );
-        assert_eq!(map_column_type("nvarchar(max)", &DatabaseType::SqlServer, &DatabaseType::Dameng), "VARCHAR(max)");
+        // SQL Server `(max)` has no Dameng spelling and becomes CLOB (#13190).
+        assert_eq!(map_column_type("nvarchar(max)", &DatabaseType::SqlServer, &DatabaseType::Dameng), "CLOB");
     }
 
     #[test]
@@ -23451,6 +23552,31 @@ SELECT 1 FROM dual"#
         assert_eq!(map_column_type("NUMBER(14,2)", &DatabaseType::Oracle, &DatabaseType::DuckDb), "DECIMAL(14,2)");
         assert_eq!(map_column_type("decimal(10, 4)", &DatabaseType::Mysql, &DatabaseType::DuckDb), "DECIMAL(10,4)");
         assert_eq!(map_column_type("numeric(38,38)", &DatabaseType::Postgres, &DatabaseType::DuckDb), "DECIMAL(38,38)");
+    }
+
+    #[test]
+    fn map_column_type_maps_sqlserver_max_length_strings_to_text() {
+        // `(max)` is SQL Server only syntax: DuckDB failed CREATE TABLE with
+        // `syntax error at or near "max"` on `VARCHAR(max)` (#13190).
+        for source_type in ["nvarchar(max)", "varchar(max)", "NVARCHAR(MAX)"] {
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::DuckDb), "TEXT");
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::Postgres), "TEXT");
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::Mysql), "TEXT");
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::Oracle), "CLOB");
+        }
+        assert_eq!(map_column_type("nvarchar(50)", &DatabaseType::SqlServer, &DatabaseType::DuckDb), "VARCHAR(50)");
+    }
+
+    #[test]
+    fn map_column_type_maps_sqlserver_rowversion_to_binary() {
+        // SQL Server `timestamp` is a rowversion (8 binary bytes), not a date and
+        // time, so its `0x...` values cannot be inserted into a TIMESTAMP column.
+        for source_type in ["timestamp", "rowversion"] {
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::DuckDb), "BLOB");
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::Postgres), "BYTEA");
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::Mysql), "BLOB");
+        }
+        assert_eq!(map_column_type("timestamp", &DatabaseType::Postgres, &DatabaseType::DuckDb), "TIMESTAMP");
     }
 
     #[test]
