@@ -102,7 +102,7 @@ pub struct BackendErrorDiagnostics {
     #[serde(skip_serializing_if = "Option::is_none")]
     exception_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    conversion: Option<AgentConversionDiagnostics>,
+    conversion: Option<Box<AgentConversionDiagnostics>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     adapter_code: Option<String>,
 }

@@ -682,7 +682,7 @@ pub struct AgentErrorContext {
     #[serde(default)]
     pub exception_class: Option<String>,
     #[serde(default)]
-    pub conversion: Option<AgentConversionDiagnostics>,
+    pub conversion: Option<Box<AgentConversionDiagnostics>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1065,7 +1065,7 @@ pub fn valid_agent_error_combination(context: &AgentErrorContext) -> bool {
 fn valid_agent_error_diagnostics(context: &AgentErrorContext) -> bool {
     valid_ascii_diagnostic(context.sql_state.as_deref(), 16)
         && valid_ascii_diagnostic(context.exception_class.as_deref(), 160)
-        && context.conversion.as_ref().is_none_or(AgentConversionDiagnostics::is_valid)
+        && context.conversion.as_deref().is_none_or(AgentConversionDiagnostics::is_valid)
         && context.agent_session_id.as_deref().is_none_or(valid_ascii_identifier)
 }
 
