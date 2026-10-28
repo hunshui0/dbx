@@ -682,7 +682,7 @@ pub struct AgentErrorContext {
     #[serde(default)]
     pub exception_class: Option<String>,
     #[serde(default)]
-    pub conversion: Option<Box<AgentConversionDiagnostics>>,
+    pub conversion: Option<AgentConversionDiagnostics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -731,7 +731,7 @@ pub enum ContractViolationReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentCallError {
-    Structured { rpc_code: i64, message: String, context: AgentErrorContext },
+    Structured { rpc_code: i64, message: String, context: Box<AgentErrorContext> },
     Legacy { rpc_code: Option<i64>, message: String, hints: LegacyAgentHints },
     ContractViolation { rpc_code: Option<i64>, message: String, reason: ContractViolationReason },
     Transport { message: String },
@@ -938,7 +938,9 @@ fn parse_agent_call_error(
         };
     };
     match parse_structured_error_context(data, expected_session_id) {
-        Ok(context) => AgentCallError::Structured { rpc_code: rpc_code.unwrap_or(-1), message, context },
+        Ok(context) => {
+            AgentCallError::Structured { rpc_code: rpc_code.unwrap_or(-1), message, context: Box::new(context) }
+        }
         Err(reason) => AgentCallError::ContractViolation { rpc_code, message, reason },
     }
 }
@@ -971,7 +973,7 @@ fn parse_pl_debug_call_error(
                 return AgentCallError::Structured {
                     rpc_code: rpc_code.unwrap_or(-1),
                     message: message.clone(),
-                    context,
+                    context: Box::new(context),
                 };
             }
         }
@@ -1065,7 +1067,7 @@ pub fn valid_agent_error_combination(context: &AgentErrorContext) -> bool {
 fn valid_agent_error_diagnostics(context: &AgentErrorContext) -> bool {
     valid_ascii_diagnostic(context.sql_state.as_deref(), 16)
         && valid_ascii_diagnostic(context.exception_class.as_deref(), 160)
-        && context.conversion.as_deref().is_none_or(AgentConversionDiagnostics::is_valid)
+        && context.conversion.as_ref().is_none_or(AgentConversionDiagnostics::is_valid)
         && context.agent_session_id.as_deref().is_none_or(valid_ascii_identifier)
 }
 
@@ -1427,7 +1429,9 @@ pub fn legacy_agent_call_error(error: String, agent_session_id: Option<&str>) ->
     let (rpc_code, message) = parse_agent_rpc_error_header(header);
     if let Some(data) = data.as_ref().filter(|data| data.get("contractVersion").is_some()) {
         return match parse_structured_error_context(data, agent_session_id) {
-            Ok(context) => AgentCallError::Structured { rpc_code: rpc_code.unwrap_or(-1), message, context },
+            Ok(context) => {
+                AgentCallError::Structured { rpc_code: rpc_code.unwrap_or(-1), message, context: Box::new(context) }
+            }
             Err(reason) => AgentCallError::ContractViolation { rpc_code, message, reason },
         };
     }
@@ -4706,7 +4710,7 @@ for line in sys.stdin:
         let structured = AgentCallError::Structured {
             rpc_code: -6007,
             message: "connection lost".to_string(),
-            context: AgentErrorContext {
+            context: Box::new(AgentErrorContext {
                 contract_version: 1,
                 category: AgentErrorCategory::Connection,
                 retryable: false,
@@ -4718,7 +4722,7 @@ for line in sys.stdin:
                 vendor_code: None,
                 exception_class: None,
                 conversion: None,
-            },
+            }),
         };
         let suffixed = format!("{}: fallback failed", structured.into_legacy_string());
         assert!(matches!(agent_error_from_legacy(&suffixed, Some("session-1")), AgentCallError::Structured { .. }));
@@ -4833,7 +4837,7 @@ for line in sys.stdin:
         let quarantined = AgentCallError::Structured {
             rpc_code: -1,
             message: "connection lost".to_string(),
-            context: AgentErrorContext {
+            context: Box::new(AgentErrorContext {
                 contract_version: 1,
                 category: AgentErrorCategory::Connection,
                 retryable: true,
@@ -4845,7 +4849,7 @@ for line in sys.stdin:
                 vendor_code: None,
                 exception_class: None,
                 conversion: None,
-            },
+            }),
         };
 
         assert_eq!(
@@ -4867,7 +4871,7 @@ for line in sys.stdin:
         let replace = AgentCallError::Structured {
             rpc_code: -1,
             message: "runtime saturated".to_string(),
-            context: AgentErrorContext {
+            context: Box::new(AgentErrorContext {
                 contract_version: 1,
                 category: AgentErrorCategory::Resource,
                 retryable: false,
@@ -4879,13 +4883,13 @@ for line in sys.stdin:
                 vendor_code: None,
                 exception_class: None,
                 conversion: None,
-            },
+            }),
         };
         assert_eq!(RecoveryPolicy::decide(&replace, RecoveryScope::Keepalive), RecoveryDecision::ReplaceRuntime);
         let structured_timeout = AgentCallError::Structured {
             rpc_code: -1,
             message: "timed out".to_string(),
-            context: AgentErrorContext {
+            context: Box::new(AgentErrorContext {
                 contract_version: 1,
                 category: AgentErrorCategory::Timeout,
                 retryable: false,
@@ -4897,7 +4901,7 @@ for line in sys.stdin:
                 vendor_code: None,
                 exception_class: None,
                 conversion: None,
-            },
+            }),
         };
         assert_eq!(
             RecoveryPolicy::decide(&structured_timeout, RecoveryScope::UserOperation),

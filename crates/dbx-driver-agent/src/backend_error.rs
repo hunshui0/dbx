@@ -102,7 +102,7 @@ pub struct BackendErrorDiagnostics {
     #[serde(skip_serializing_if = "Option::is_none")]
     exception_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    conversion: Option<Box<AgentConversionDiagnostics>>,
+    conversion: Option<AgentConversionDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     adapter_code: Option<String>,
 }
@@ -1319,7 +1319,7 @@ mod tests {
             let error = AgentCallError::Structured {
                 rpc_code: -1,
                 message: "safe failure".to_string(),
-                context: context(category, stage, outcome),
+                context: Box::new(context(category, stage, outcome)),
             };
             let envelope = BackendError::from_agent_call_error(&error);
             assert_eq!(envelope.code(), expected_code);
@@ -1425,11 +1425,11 @@ mod tests {
         let error = BackendError::from_agent_call_error(&AgentCallError::Structured {
             rpc_code: -1,
             message: "jdbc:postgresql://host/db?password=secret".to_string(),
-            context: context(
+            context: Box::new(context(
                 AgentErrorCategory::Connection,
                 AgentErrorStage::Request,
                 AgentOperationOutcome::NotStarted,
-            ),
+            )),
         });
         let value = serde_json::to_value(error).unwrap();
         assert_eq!(value["source"], "jdbcAgent");
@@ -1506,11 +1506,11 @@ mod tests {
         let error = BackendError::from_agent_call_error(&AgentCallError::Structured {
             rpc_code: -1,
             message: "connection failed: jdbc:postgresql://alice:url-secret@db.example/app".to_string(),
-            context: context(
+            context: Box::new(context(
                 AgentErrorCategory::Connection,
                 AgentErrorStage::Connect,
                 AgentOperationOutcome::NotStarted,
-            ),
+            )),
         });
 
         assert_eq!(error.detail(), Some("connection failed: jdbc:postgresql://alice:[redacted]@db.example/app"));
@@ -1522,7 +1522,11 @@ mod tests {
         let error = BackendError::from_agent_call_error(&AgentCallError::Structured {
             rpc_code: -1,
             message: message.to_string(),
-            context: context(AgentErrorCategory::Sql, AgentErrorStage::Execute, AgentOperationOutcome::Unknown),
+            context: Box::new(context(
+                AgentErrorCategory::Sql,
+                AgentErrorStage::Execute,
+                AgentOperationOutcome::Unknown,
+            )),
         });
 
         assert_eq!(error.detail(), Some(message));
@@ -1570,7 +1574,7 @@ mod tests {
             let envelope = BackendError::from_agent_call_error(&AgentCallError::Structured {
                 rpc_code: -1,
                 message: "invalid combination".to_string(),
-                context: ctx,
+                context: Box::new(ctx),
             });
             assert_eq!(envelope.code(), "DBX-JDBC-5002");
             assert_eq!(envelope.operation_outcome(), BackendOperationOutcome::Unknown);
@@ -1646,7 +1650,11 @@ mod tests {
         let error = AgentCallError::Structured {
             rpc_code: -1,
             message: "connection lost".to_string(),
-            context: context(AgentErrorCategory::Connection, AgentErrorStage::Execute, AgentOperationOutcome::Unknown),
+            context: Box::new(context(
+                AgentErrorCategory::Connection,
+                AgentErrorStage::Execute,
+                AgentOperationOutcome::Unknown,
+            )),
         };
         let legacy =
             crate::db::agent_driver::append_legacy_error_context(&error.into_legacy_string(), "SQL text omitted");
