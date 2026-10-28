@@ -24,8 +24,11 @@ mod iris_tests;
 
 mod db2;
 mod ddl_plan;
+pub(crate) mod mysql_xugu;
+pub(crate) mod oracle_table_contract;
 mod overwrite_clear;
 mod structure_plan;
+pub(crate) mod xugu_objects;
 
 pub use overwrite_clear::clear_foreign_key_linked_overwrite_targets;
 
@@ -265,9 +268,12 @@ pub enum TransferObjectKind {
     MaterializedView,
     Procedure,
     Function,
+    Package,
+    PackageBody,
     Trigger,
     Sequence,
     Event,
+    Synonym,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -306,10 +312,17 @@ pub fn transfer_object_kinds_for_family(family: &TransferObjectFamily) -> Vec<Tr
 }
 
 pub fn transfer_object_kinds(db_type: &DatabaseType) -> Vec<TransferObjectKind> {
-    match transfer_object_family(db_type) {
+    if *db_type == DatabaseType::Xugu {
+        return xugu_objects::supported_kinds();
+    }
+    let mut kinds = match transfer_object_family(db_type) {
         Some(family) => transfer_object_kinds_for_family(&family),
         None => Vec::new(),
+    };
+    if matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle) {
+        kinds.extend([TransferObjectKind::Package, TransferObjectKind::PackageBody]);
     }
+    kinds
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,6 +372,8 @@ pub struct TransferRequest {
     /// Production database confirmation for drop_target_before_create.
     #[serde(default)]
     pub drop_target_confirmed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_packages: Option<crate::schema::oracle_routines::OraclePackageTransferRequest>,
 }
 
 fn default_quote_target_column_names() -> bool {
@@ -377,6 +392,8 @@ pub struct TransferOwnershipPreview {
     /// re-reads source and target metadata before executing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structure: Option<TransferStructurePreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_packages: Option<crate::schema::oracle_routines::OraclePackageTransferPreview>,
 }
 
 /// SQL plan preview for a `drop_target_before_create` (rebuild) transfer.
@@ -487,6 +504,8 @@ impl TransferStructureOperation {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferStructurePreviewTable {
+    #[serde(skip)]
+    pub(crate) oracle_plan: Option<ddl_plan::PreparedTableDdl>,
     pub source_table: String,
     pub target_table: String,
     /// The target table already exists and this transfer plans no structure DDL for it,
@@ -526,6 +545,15 @@ impl<'a> TransferObjectSelectionMode<'a> {
 }
 
 impl TransferRequest {
+    pub(crate) fn has_package_selection(&self) -> bool {
+        self.objects.as_ref().is_some_and(|objects| {
+            objects.iter().any(|selection| {
+                matches!(selection.object_type, TransferObjectKind::Package | TransferObjectKind::PackageBody)
+                    && !selection.names.is_empty()
+            })
+        })
+    }
+
     fn object_selection_mode(&self) -> TransferObjectSelectionMode<'_> {
         match self.objects.as_deref() {
             Some(selections) => TransferObjectSelectionMode::Explicit(selections),
@@ -570,6 +598,12 @@ pub struct TransferTableResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferProgress {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_package_approval: Option<crate::schema::oracle_routines::OraclePackageTransferPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_package_preflight: Option<crate::schema::oracle_routines::OraclePackageTransferPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_routine_operation: Option<crate::schema::oracle_routines::RoutineOperationRecord>,
     pub transfer_id: String,
     pub table: String,
     pub table_index: usize,
@@ -696,6 +730,43 @@ fn qualified_table_with_identifier_quote(
     }
 }
 
+/// Whether write SQL should use an identifier quote the caller resolved for the connection
+/// instead of the static transfer mapping. Callers that pass `None` keep the transfer mapping, so
+/// their generated SQL is unchanged.
+fn uses_explicit_identifier_quote(db_type: &DatabaseType, identifier_quote: Option<&str>) -> bool {
+    identifier_quote.is_some() && crate::sql_dialect::uses_connection_identifier_quote(Some(*db_type), identifier_quote)
+}
+
+/// Quotes a write-target identifier with the connection's identifier quote, falling back to
+/// [`quote_identifier`] when there is none.
+pub(crate) fn quote_identifier_with_explicit_quote(
+    name: &str,
+    db_type: &DatabaseType,
+    identifier_quote: Option<&str>,
+) -> String {
+    if uses_explicit_identifier_quote(db_type, identifier_quote) {
+        quote_identifier_with_identifier_quote(name, db_type, identifier_quote)
+    } else {
+        quote_identifier(name, db_type)
+    }
+}
+
+/// Qualifies a write-target table with the connection's identifier quote, falling back to
+/// [`qualified_table`] when there is none.
+pub(crate) fn qualified_table_with_explicit_quote(
+    table: &str,
+    schema: &str,
+    db_type: &DatabaseType,
+    catalog: Option<&str>,
+    identifier_quote: Option<&str>,
+) -> String {
+    if uses_explicit_identifier_quote(db_type, identifier_quote) {
+        qualified_table_with_identifier_quote(table, schema, db_type, catalog, identifier_quote)
+    } else {
+        qualified_table(table, schema, db_type, catalog)
+    }
+}
+
 pub fn validate_transfer_target_table_names(request: &TransferRequest) -> Result<(), String> {
     let mut targets: HashMap<String, String> = HashMap::new();
     for source_table in &request.tables {
@@ -718,6 +789,13 @@ pub fn validate_transfer_target_table_names(request: &TransferRequest) -> Result
 /// target for the cross-family DDL pipeline (the executor rejects it).
 pub fn cross_family_transferable_object_kinds(source: &DatabaseType, target: &DatabaseType) -> Vec<TransferObjectKind> {
     use TransferObjectKind::*;
+    if *source == DatabaseType::Xugu || *target == DatabaseType::Xugu {
+        return if *source == DatabaseType::Xugu && *target == DatabaseType::Xugu {
+            xugu_objects::supported_kinds()
+        } else {
+            vec![]
+        };
+    }
     if is_same_transfer_family(source, target) {
         return transfer_object_kinds(source);
     }
@@ -1108,6 +1186,15 @@ pub fn validate_transfer_database_pair(
     source_db_type: &DatabaseType,
     target_db_type: &DatabaseType,
 ) -> Result<(), String> {
+    if request.has_package_selection()
+        && !(matches!((source_db_type, target_db_type), (DatabaseType::Xugu, DatabaseType::Xugu))
+            && request.oracle_packages.is_none())
+        && ![source_db_type, target_db_type]
+            .into_iter()
+            .all(|product| matches!(product, DatabaseType::Oracle | DatabaseType::OceanbaseOracle))
+    {
+        return Err("Package transfer requires actual Oracle or OceanBase Oracle endpoints; the Oracle family alone does not establish package support".into());
+    }
     if transfer_support_level(source_db_type).is_none() {
         return Err(format!("{} 暂未声明数据传输兼容级别", source_db_type.as_str()));
     }
@@ -1141,11 +1228,23 @@ pub fn validate_transfer_database_pair(
     if !matches!(source_db_type, DatabaseType::Xugu) && !matches!(target_db_type, DatabaseType::Xugu) {
         return Ok(());
     }
-    if !matches!((source_db_type, target_db_type), (DatabaseType::Xugu, DatabaseType::Xugu)) {
-        return Err("虚谷数据传输当前仅支持虚谷到虚谷".to_string());
+    let mysql_to_xugu = mysql_xugu::is_pair(source_db_type, target_db_type);
+    if !matches!((source_db_type, target_db_type), (DatabaseType::Xugu, DatabaseType::Xugu)) && !mysql_to_xugu {
+        return Err("虚谷数据传输当前仅支持虚谷到虚谷，以及 MySQL 到虚谷的表传输".to_string());
     }
-    if request.objects.as_ref().is_some_and(|objects| !objects.is_empty()) {
-        return Err("虚谷数据传输当前仅支持表对象".to_string());
+    if mysql_to_xugu
+        && request.objects.as_ref().is_some_and(|objects| {
+            objects
+                .iter()
+                .any(|selection| selection.object_type != TransferObjectKind::Table && !selection.names.is_empty())
+        })
+    {
+        return Err("MySQL 到虚谷当前仅支持表结构和表数据".into());
+    }
+    if request.objects.as_ref().is_some_and(|objects| {
+        objects.iter().any(|selection| !xugu_objects::supported_kinds().contains(&selection.object_type))
+    }) {
+        return Err("虚谷数据传输不支持所选对象类型".to_string());
     }
     if request.mode == TransferMode::Upsert || request.drop_target_before_create {
         return Err("虚谷数据传输当前仅支持追加或覆盖，暂不支持更新插入或重建".to_string());
@@ -1367,6 +1466,11 @@ pub fn target_object_exists_sql(
     name: &str,
     kind: &TransferObjectKind,
 ) -> Result<String, String> {
+    if matches!(kind, TransferObjectKind::Package | TransferObjectKind::PackageBody)
+        && !matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
+    {
+        return Err("Package existence requires actual Oracle or OceanBase Oracle".into());
+    }
     let schema = quote_string_literal(schema);
     let name = quote_string_literal(name);
     let q = |literal: &str| literal.to_string();
@@ -1419,6 +1523,8 @@ pub fn target_object_exists_sql(
             | TransferObjectKind::MaterializedView
             | TransferObjectKind::Procedure
             | TransferObjectKind::Function
+            | TransferObjectKind::Package
+            | TransferObjectKind::PackageBody
             | TransferObjectKind::Trigger
             | TransferObjectKind::Sequence,
         ) => format!(
@@ -1428,6 +1534,8 @@ pub fn target_object_exists_sql(
                 TransferObjectKind::MaterializedView => "'MATERIALIZED VIEW'",
                 TransferObjectKind::Procedure => "'PROCEDURE'",
                 TransferObjectKind::Function => "'FUNCTION'",
+                TransferObjectKind::Package => "'PACKAGE'",
+                TransferObjectKind::PackageBody => "'PACKAGE BODY'",
                 TransferObjectKind::Trigger => "'TRIGGER'",
                 _ => "'SEQUENCE'",
             })
@@ -1958,7 +2066,7 @@ fn transfer_table_needs_inline_postgres_schema_ensure(
     source_db_type: &DatabaseType,
     target_db_type: &DatabaseType,
 ) -> bool {
-    is_postgres_transfer_dialect(target_db_type)
+    is_postgres_family_target(target_db_type)
         && !matches!((source_db_type, target_db_type), (DatabaseType::Postgres, DatabaseType::Postgres))
 }
 
@@ -2544,19 +2652,63 @@ async fn execute_transfer_write_statement(
     }
 }
 
+fn rewrite_postgres_search_path(input: &str, source_schema: &str, target_schema: &str) -> String {
+    let quoted_source = quote_identifier(source_schema, &DatabaseType::Postgres);
+    let quoted_target = quote_identifier(target_schema, &DatabaseType::Postgres);
+    let set_re = Regex::new(r#"(?i)(^|[\r\n;]\s*)(SET\s+search_path\s*(?:=|\bTO\b)\s*)([^;\r\n]+)(;?)"#)
+        .expect("valid search_path regex");
+
+    set_re
+        .replace_all(input, |captures: &regex::Captures| {
+            let prefix = &captures[1];
+            let set_clause = &captures[2];
+            let args = &captures[3];
+            let semicolon = &captures[4];
+
+            let mut replaced_any = false;
+            let parts: Vec<String> = args
+                .split(',')
+                .map(|part| {
+                    let trimmed = part.trim();
+                    if trimmed == source_schema
+                        || trimmed == quoted_source
+                        || trimmed.eq_ignore_ascii_case(source_schema)
+                        || trimmed.trim_matches('"') == source_schema
+                    {
+                        replaced_any = true;
+                        quoted_target.clone()
+                    } else {
+                        trimmed.to_string()
+                    }
+                })
+                .collect();
+
+            if replaced_any {
+                format!("{prefix}{set_clause}{}{semicolon}", parts.join(", "))
+            } else {
+                captures[0].to_string()
+            }
+        })
+        .into_owned()
+}
+
 fn rewrite_postgres_schema_qualified_references(input: &str, source_schema: &str, target_schema: &str) -> String {
-    if source_schema.trim().is_empty() || source_schema == target_schema {
+    let effective_source = if source_schema.trim().is_empty() { "public" } else { source_schema };
+    let effective_target = if target_schema.trim().is_empty() { "public" } else { target_schema };
+    if effective_source == effective_target {
         return input.to_string();
     }
 
-    let quoted_source = format!("{}.", quote_identifier(source_schema, &DatabaseType::Postgres));
-    let quoted_target = format!("{}.", quote_identifier(target_schema, &DatabaseType::Postgres));
+    let quoted_source = format!("{}.", quote_identifier(effective_source, &DatabaseType::Postgres));
+    let quoted_target = format!("{}.", quote_identifier(effective_target, &DatabaseType::Postgres));
     let rewritten = input.replace(&quoted_source, &quoted_target);
-    let unquoted_pattern =
-        Regex::new(&format!(r#"(^|[^"\w]){}\."#, regex::escape(source_schema))).expect("valid postgres schema regex");
-    unquoted_pattern
+    let unquoted_pattern = Regex::new(&format!(r#"(^|[^"\w]){}\."#, regex::escape(effective_source)))
+        .expect("valid postgres schema regex");
+    let rewritten = unquoted_pattern
         .replace_all(&rewritten, |captures: &regex::Captures| format!("{}{}", &captures[1], quoted_target))
-        .into_owned()
+        .into_owned();
+
+    rewrite_postgres_search_path(&rewritten, effective_source, effective_target)
 }
 
 fn postgres_column_type_sql(
@@ -2683,7 +2835,7 @@ fn supports_deferred_mysql_foreign_keys(target_db: &DatabaseType) -> bool {
 }
 
 /// QuestDB is not included. It only uses the PGWire protocol. SQL DDL syntax is not compatible.
-fn is_postgres_family_target(target_db: &DatabaseType) -> bool {
+pub(crate) fn is_postgres_family_target(target_db: &DatabaseType) -> bool {
     matches!(
         target_db,
         DatabaseType::Postgres
@@ -5052,7 +5204,10 @@ fn generate_create_table_ddl_with_column_quoting(
 /// PostgreSQL/Kingbase plus Oracle-compatible OceanBase and Dameng.
 fn supports_comment_on_transfer_ddl(target_db: &DatabaseType) -> bool {
     is_postgres_transfer_dialect(target_db)
-        || matches!(target_db, DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng)
+        || matches!(
+            target_db,
+            DatabaseType::Gaussdb | DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng
+        )
 }
 
 /// Generate COMMENT ON COLUMN / ALTER TABLE COMMENT COLUMN / COMMENT ON TABLE
@@ -5178,7 +5333,16 @@ impl InsertSqlTemplate {
         catalog: Option<&str>,
         overrides_postgres_system_values: bool,
     ) -> Self {
-        Self::new_with_column_quoting(columns, table, schema, db_type, catalog, overrides_postgres_system_values, true)
+        Self::new_with_column_quoting(
+            columns,
+            table,
+            schema,
+            db_type,
+            catalog,
+            overrides_postgres_system_values,
+            true,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5190,11 +5354,18 @@ impl InsertSqlTemplate {
         catalog: Option<&str>,
         overrides_postgres_system_values: bool,
         quote_target_column_names: bool,
+        identifier_quote: Option<&str>,
     ) -> Self {
-        let full_table = qualified_table(table, schema, db_type, catalog);
+        let full_table = qualified_table_with_explicit_quote(table, schema, db_type, catalog, identifier_quote);
         let col_list = columns
             .iter()
-            .map(|column| transfer_column_identifier(column, db_type, quote_target_column_names))
+            .map(|column| {
+                if uses_explicit_identifier_quote(db_type, identifier_quote) {
+                    quote_identifier_with_identifier_quote(column, db_type, identifier_quote)
+                } else {
+                    transfer_column_identifier(column, db_type, quote_target_column_names)
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let overriding =
@@ -5699,6 +5870,7 @@ fn generate_upsert_typed_for_transfer(
                 catalog,
                 false,
                 quote_target_column_names,
+                None,
             );
             template.build(&value_rows_sql(rows, column_types, db_type, mysql_spatial_markers))
         }
@@ -6582,6 +6754,7 @@ fn generate_transfer_write_sql(
                 catalog,
                 overrides_postgres_system_values,
                 quote_target_column_names,
+                None,
             );
             template.build(&value_rows_sql(rows, column_types, db_type, mysql_spatial_markers))
         }
@@ -6615,7 +6788,7 @@ pub(crate) fn generate_insert_typed_sql_batches_from_value_rows(
     limits: SqlBatchLimits,
 ) -> Result<Vec<(String, usize)>, String> {
     generate_insert_typed_sql_batches_from_value_rows_with_options(
-        columns, value_rows, table, schema, db_type, catalog, limits, false,
+        columns, value_rows, table, schema, db_type, catalog, limits, false, None,
     )
 }
 
@@ -6629,10 +6802,20 @@ pub(crate) fn generate_insert_typed_sql_batches_from_value_rows_with_options(
     catalog: Option<&str>,
     limits: SqlBatchLimits,
     skip_duplicate_rows: bool,
+    identifier_quote: Option<&str>,
 ) -> Result<Vec<(String, usize)>, String> {
     if !skip_duplicate_rows {
         return generate_insert_sql_batches_from_value_rows(
-            columns, value_rows, table, schema, db_type, catalog, limits, false, true,
+            columns,
+            value_rows,
+            table,
+            schema,
+            db_type,
+            catalog,
+            limits,
+            false,
+            true,
+            identifier_quote,
         );
     }
 
@@ -6649,7 +6832,16 @@ pub(crate) fn generate_insert_typed_sql_batches_from_value_rows_with_options(
     let target_sql_bytes = limits.target_sql_bytes.max(1);
     let batch_sql_bytes = limits.hard_sql_bytes.map_or(target_sql_bytes, |hard| target_sql_bytes.min(hard));
 
-    let template = InsertSqlTemplate::new_with_column_quoting(columns, table, schema, db_type, catalog, false, true);
+    let template = InsertSqlTemplate::new_with_column_quoting(
+        columns,
+        table,
+        schema,
+        db_type,
+        catalog,
+        false,
+        true,
+        identifier_quote,
+    );
 
     let value_row_bytes = value_rows.iter().map(|row| sql_text_bytes(row, db_type)).collect::<Vec<_>>();
 
@@ -6757,6 +6949,7 @@ pub(crate) fn generate_primary_key_upsert_sql_batches_from_value_rows(
         adjusted_limits,
         false,
         true,
+        None,
     )?;
 
     batches
@@ -6812,6 +7005,7 @@ fn generate_insert_typed_sql_batches_for_transfer(
         limits,
         overrides_postgres_system_values,
         quote_target_column_names,
+        None,
     )
 }
 
@@ -6826,6 +7020,7 @@ fn generate_insert_sql_batches_from_value_rows(
     limits: SqlBatchLimits,
     overrides_postgres_system_values: bool,
     quote_target_column_names: bool,
+    identifier_quote: Option<&str>,
 ) -> Result<Vec<(String, usize)>, String> {
     if value_rows.is_empty() {
         return Ok(Vec::new());
@@ -6847,6 +7042,7 @@ fn generate_insert_sql_batches_from_value_rows(
         catalog,
         overrides_postgres_system_values,
         quote_target_column_names,
+        identifier_quote,
     );
     let value_row_bytes = value_rows.iter().map(|row| sql_text_bytes(row, db_type)).collect::<Vec<_>>();
     let mut statements = Vec::new();
@@ -9102,7 +9298,12 @@ pub async fn get_columns_for_transfer(
         }
         PoolKind::Postgres(p) => {
             let p = p.clone();
-            db::postgres::get_columns(&p, &schema, &table).await
+            let db_type = get_db_type(state, connection_id).await.ok();
+            if matches!(db_type, Some(DatabaseType::OpenGauss | DatabaseType::Gaussdb)) {
+                db::postgres::get_columns_compat_first(&p, &schema, &table).await
+            } else {
+                db::postgres::get_columns(&p, &schema, &table).await
+            }
         }
         PoolKind::Sqlite(p) => {
             let p = p.clone();
@@ -9530,10 +9731,13 @@ pub fn ordered_transfer_object_kinds(kinds: Vec<TransferObjectKind>) -> Vec<Tran
         TransferObjectKind::Sequence => 1,
         TransferObjectKind::View => 2,
         TransferObjectKind::MaterializedView => 2,
+        TransferObjectKind::Package => 3,
+        TransferObjectKind::Synonym => 4,
         TransferObjectKind::Function => 3,
         TransferObjectKind::Procedure => 4,
-        TransferObjectKind::Trigger => 5,
-        TransferObjectKind::Event => 6,
+        TransferObjectKind::PackageBody => 5,
+        TransferObjectKind::Trigger => 6,
+        TransferObjectKind::Event => 7,
     };
     let mut kinds = kinds;
     kinds.sort_by_key(rank);
@@ -9573,6 +9777,9 @@ pub fn object_kind_selected_or_defaulted(
     selections: Option<&[TransferObjectSelection]>,
     kind: &TransferObjectKind,
 ) -> bool {
+    if selections.is_none() && matches!(kind, TransferObjectKind::Package | TransferObjectKind::PackageBody) {
+        return false;
+    }
     selections.is_none_or(|selections| !selected_object_names(selections, kind).is_empty())
 }
 
@@ -9669,11 +9876,25 @@ pub async fn transfer_schema_objects<F>(
     request: &TransferRequest,
     source_pool_key: &str,
     target_pool_key: &str,
-    progress_callback: F,
+    mut progress_callback: F,
 ) -> Result<TransferObjectOutcome, String>
 where
     F: FnMut(TransferProgress),
 {
+    if request.has_package_selection() {
+        let source_db_type = get_db_type(state, &request.source_connection_id).await?;
+        let target_db_type = get_db_type(state, &request.target_connection_id).await?;
+        validate_transfer_database_pair(request, &source_db_type, &target_db_type)?;
+    }
+    let packages = match crate::schema::oracle_routines::claim_transfer_packages(state, request, None).await {
+        Ok(packages) => packages,
+        Err(error) => {
+            let progress = error.into_progress(request);
+            let message = progress.error.clone().unwrap();
+            progress_callback(progress);
+            return Err(message);
+        }
+    };
     if matches!(request.content, TransferContent::DataOnly) {
         return Ok(TransferObjectOutcome::default());
     }
@@ -9683,15 +9904,29 @@ where
         &request.target_connection_id,
     )
     .await?;
-    transfer_schema_objects_with_routine_context(
+    let mut outcome = transfer_schema_objects_with_routine_context(
         state,
         request,
         source_pool_key,
         target_pool_key,
         routine_context.as_ref(),
-        progress_callback,
+        &mut progress_callback,
     )
-    .await
+    .await?;
+    if let Some(packages) = packages {
+        let (package_outcome, cancelled, preflight_error) =
+            packages.run(state, request, outcome.failed.is_empty(), progress_callback).await;
+        outcome.transferred.extend(package_outcome.transferred);
+        outcome.skipped.extend(package_outcome.skipped);
+        outcome.failed.extend(package_outcome.failed);
+        if cancelled {
+            return Err("Cancelled".into());
+        }
+        if let Some(error) = preflight_error {
+            return Err(error);
+        }
+    }
+    Ok(outcome)
 }
 
 pub(crate) async fn transfer_schema_objects_with_routine_context<F>(
@@ -9705,13 +9940,22 @@ pub(crate) async fn transfer_schema_objects_with_routine_context<F>(
 where
     F: FnMut(TransferProgress),
 {
-    if matches!(request.content, TransferContent::DataOnly) {
+    if matches!(request.content, TransferContent::DataOnly) && !request.has_package_selection() {
         return Ok(TransferObjectOutcome::default());
     }
     let source_db_type = get_db_type(state, &request.source_connection_id).await?;
     let target_db_type = get_db_type(state, &request.target_connection_id).await?;
+    if request.has_package_selection() {
+        validate_transfer_database_pair(request, &source_db_type, &target_db_type)?;
+    }
+    if matches!(request.content, TransferContent::DataOnly) {
+        return Ok(TransferObjectOutcome::default());
+    }
     if !should_transfer_schema_objects(&source_db_type, &target_db_type, request) {
         return Ok(TransferObjectOutcome::default());
+    }
+    if source_db_type == DatabaseType::Xugu && target_db_type == DatabaseType::Xugu {
+        return Err("Xugu schema objects must run through the prepared transfer plan".into());
     }
     if !is_same_transfer_family(&source_db_type, &target_db_type) {
         return transfer_cross_family_schema_objects(
@@ -9801,6 +10045,9 @@ where
             let table = format!("schema object: {name}");
             let mut progress = |outcome: &mut TransferObjectOutcome, status: TransferStatus, error: Option<String>| {
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.clone(),
                     table_index: request.tables.len(),
@@ -10046,6 +10293,9 @@ where
             let table = format!("schema object: {name}");
             let mut progress = |outcome: &mut TransferObjectOutcome, status: TransferStatus, error: Option<String>| {
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.clone(),
                     table_index: request.tables.len(),
@@ -10192,6 +10442,9 @@ where
             let table = format!("schema object: {name}");
             let mut progress = |outcome: &mut TransferObjectOutcome, status: TransferStatus, error: Option<String>| {
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.clone(),
                     table_index: request.tables.len(),
@@ -10286,6 +10539,9 @@ where
             let table = format!("schema object: {name}");
             let mut progress = |outcome: &mut TransferObjectOutcome, status: TransferStatus, error: Option<String>| {
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.clone(),
                     table_index: request.tables.len(),
@@ -10483,6 +10739,7 @@ async fn get_postgres_schema_object_sources_for_transfer(
             source,
             editable: None,
             routine_parameters: None,
+            trigger: None,
         });
     }
     for row in execute_on_pool(state, pool_key, &routines_sql).await?.rows {
@@ -10503,6 +10760,7 @@ async fn get_postgres_schema_object_sources_for_transfer(
             source,
             editable: None,
             routine_parameters: None,
+            trigger: None,
         });
     }
 
@@ -10571,12 +10829,12 @@ fn postgres_table_dependency_selection_sql(schema: &str, tables: &[String]) -> O
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = {source_schema} AND c.relkind IN ('r','p','f') AND c.relname IN ({table_list}) \
          ), selected_dependencies(classid, objid) AS ( \
-             SELECT 'pg_catalog.pg_class'::regclass, oid FROM selected_tables \
-             UNION SELECT 'pg_catalog.pg_attrdef'::regclass, a.oid \
+             SELECT 'pg_catalog.pg_class'::regclass::oid, oid FROM selected_tables \
+             UNION SELECT 'pg_catalog.pg_attrdef'::regclass::oid, a.oid \
              FROM pg_catalog.pg_attrdef a JOIN selected_tables t ON t.oid = a.adrelid \
-             UNION SELECT 'pg_catalog.pg_constraint'::regclass, c.oid \
+             UNION SELECT 'pg_catalog.pg_constraint'::regclass::oid, c.oid \
              FROM pg_catalog.pg_constraint c JOIN selected_tables t ON t.oid = c.conrelid \
-             UNION SELECT 'pg_catalog.pg_class'::regclass, i.indexrelid \
+             UNION SELECT 'pg_catalog.pg_class'::regclass::oid, i.indexrelid \
              FROM pg_catalog.pg_index i JOIN selected_tables t ON t.oid = i.indrelid \
              UNION \
              SELECT d.refclassid, d.refobjid \
@@ -11092,6 +11350,25 @@ async fn build_rebuild_preview(
     Ok(TransferRebuildPreview { sql: phases.join("\n\n"), tables, backup_sql, cleanup_sql })
 }
 
+pub(crate) async fn build_package_transfer_structure(
+    state: &Arc<AppState>,
+    request: &TransferRequest,
+    source_db_type: &DatabaseType,
+    target_db_type: &DatabaseType,
+    source_pool_key: &str,
+    target_pool_key: &str,
+) -> Result<TransferStructurePreview, String> {
+    structure_plan::build_structure_preview(
+        state,
+        request,
+        source_db_type,
+        target_db_type,
+        source_pool_key,
+        target_pool_key,
+    )
+    .await
+}
+
 pub async fn preview_transfer_ownership(
     state: &Arc<AppState>,
     request: &TransferRequest,
@@ -11100,8 +11377,14 @@ pub async fn preview_transfer_ownership(
     source_pool_key: &str,
     target_pool_key: &str,
 ) -> Result<TransferOwnershipPreview, String> {
+    if request.has_package_selection() {
+        validate_transfer_request(request)?;
+    }
     validate_transfer_database_pair(request, source_db_type, target_db_type)?;
     // PostgreSQL-compatible transfers report role ownership gaps for the confirmation flow.
+    if mysql_xugu::is_pair(source_db_type, target_db_type) {
+        mysql_xugu::preflight(state, request, source_pool_key, target_pool_key).await?;
+    }
     let (missing_owners, target_owner) =
         if request.create_table && is_postgres_compat_transfer(source_db_type, target_db_type) {
             let has_prokind = postgres_transfer_catalog_capabilities(state, source_pool_key).await?.has_prokind;
@@ -11131,7 +11414,10 @@ pub async fn preview_transfer_ownership(
     // Structure-only transfers expose the statements their create pass will run. The other
     // content modes keep their existing previews: data-only runs no DDL, and
     // structure-and-data is deliberately unchanged here.
-    let structure = if matches!(request.content, TransferContent::StructureOnly) {
+    let mut structure = if matches!(request.content, TransferContent::StructureOnly)
+        || (request.has_package_selection()
+            && matches!(source_db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle))
+    {
         Some(
             structure_plan::build_structure_preview(
                 state,
@@ -11147,7 +11433,30 @@ pub async fn preview_transfer_ownership(
         None
     };
 
-    Ok(TransferOwnershipPreview { missing_owners, target_owner, rebuild, structure })
+    let oracle_packages =
+        crate::schema::oracle_routines::prepare_transfer_packages(state, request, structure.as_mut()).await?;
+    if let (Some(packages), Some(structure)) = (&oracle_packages, &mut structure) {
+        let sql = packages
+            .plan
+            .steps
+            .iter()
+            .filter(|step| !step.sql.trim().is_empty())
+            .map(|step| step.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n/\n");
+        if !sql.is_empty() {
+            structure.sql.push_str("\n\n");
+            structure.sql.push_str(&sql);
+        }
+        structure.schema_objects_expanded = request.objects.iter().flatten().all(|selection| {
+            selection.names.is_empty()
+                || matches!(
+                    selection.object_type,
+                    TransferObjectKind::Table | TransferObjectKind::Package | TransferObjectKind::PackageBody
+                )
+        });
+    }
+    Ok(TransferOwnershipPreview { missing_owners, target_owner, rebuild, structure, oracle_packages })
 }
 
 fn postgres_transfer_grant_statements_sql(
@@ -11728,6 +12037,9 @@ where
         offset += row_count as u64;
 
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: table.to_string(),
             table_index,
@@ -11862,8 +12174,10 @@ fn xugu_transfer_shares_agent_session(
     *source_db_type == DatabaseType::Xugu && source_pool_key == target_pool_key
 }
 
+#[allow(clippy::too_many_arguments)]
 fn xugu_transfer_page_sql(
     columns: &[db::ColumnInfo],
+    clob_indexes: &[usize],
     table: &str,
     schema: &str,
     catalog: Option<&str>,
@@ -11876,17 +12190,45 @@ fn xugu_transfer_page_sql(
     let order = postgres_order_by_expression(primary_keys, &DatabaseType::Xugu)
         .map(|expression| format!(" ORDER BY {expression}"))
         .unwrap_or_default();
-    format!("{}{order} LIMIT {limit} OFFSET {offset}", xugu_transfer_cursor_sql(columns, table, schema, catalog))
+    format!(
+        "{}{order} LIMIT {limit} OFFSET {offset}",
+        xugu_transfer_cursor_sql(columns, clob_indexes, table, schema, catalog)
+    )
+}
+
+/// Only Xugu-to-Xugu transfers need these auxiliary values. A raw empty CLOB
+/// currently arrives from the Go driver as a NUL byte, indistinguishable from
+/// real content without asking the source database about its actual value.
+fn xugu_transfer_clob_indexes(columns: &[db::ColumnInfo], source: &DatabaseType, target: &DatabaseType) -> Vec<usize> {
+    if *source != DatabaseType::Xugu || *target != DatabaseType::Xugu {
+        return Vec::new();
+    }
+    columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| (normalize_xugu_type_name(&column.data_type) == "CLOB").then_some(index))
+        .collect()
 }
 
 /// Build a source-side projection for Xugu transfer rows whose wire values are
 /// not safely represented by the Go driver's generic `database/sql` values.
 /// This stays on the Xugu path only; the returned strings are still formatted
 /// against the original column metadata when INSERT statements are generated.
-fn xugu_transfer_cursor_sql(columns: &[db::ColumnInfo], table: &str, schema: &str, catalog: Option<&str>) -> String {
+fn xugu_transfer_cursor_sql(
+    columns: &[db::ColumnInfo],
+    clob_indexes: &[usize],
+    table: &str,
+    schema: &str,
+    catalog: Option<&str>,
+) -> String {
+    let full_table = qualified_table(table, schema, &DatabaseType::Xugu, catalog);
+    let projection = xugu_transfer_projection(columns, clob_indexes);
+    format!("SELECT {projection} FROM {full_table}")
+}
+
+fn xugu_transfer_projection(columns: &[db::ColumnInfo], clob_indexes: &[usize]) -> String {
     let db_type = DatabaseType::Xugu;
-    let full_table = qualified_table(table, schema, &db_type, catalog);
-    let projection = columns
+    let mut projection = columns
         .iter()
         .map(|column| {
             let identifier = quote_identifier(&column.name, &db_type);
@@ -11930,9 +12272,62 @@ fn xugu_transfer_cursor_sql(columns: &[db::ColumnInfo], table: &str, schema: &st
             };
             format!("{expression} AS {identifier}")
         })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("SELECT {projection} FROM {full_table}")
+        .collect::<Vec<_>>();
+    for index in clob_indexes {
+        let identifier = quote_identifier(&columns[*index].name, &db_type);
+        let mut alias = format!("__dbx_clob_state_{index}");
+        while columns.iter().any(|column| column.name.eq_ignore_ascii_case(&alias)) {
+            alias.push('_');
+        }
+        // No text cast/hex expansion: large CLOBs retain their original bytes.
+        // NULL and an empty non-NULL CLOB must remain distinct on the target.
+        projection.push(format!(
+            "CASE WHEN {identifier} IS NULL THEN -1 WHEN LENGTH({identifier})=0 THEN 0 ELSE 1 END AS {}",
+            quote_identifier(&alias, &db_type)
+        ));
+    }
+    projection.join(", ")
+}
+
+fn normalize_xugu_transfer_clobs(
+    rows: &mut [Vec<serde_json::Value>],
+    columns: &[db::ColumnInfo],
+    clob_indexes: &[usize],
+) -> Result<(), String> {
+    if clob_indexes.is_empty() {
+        return Ok(());
+    }
+    let width = columns.len();
+    // Validate the complete batch before modifying it or building any INSERT.
+    for row in rows.iter() {
+        if row.len() != width + clob_indexes.len() {
+            return Err("Xugu CLOB transfer returned an unexpected number of columns".to_string());
+        }
+        for (marker, index) in clob_indexes.iter().enumerate() {
+            let value = &row[*index];
+            let valid = match row[width + marker].as_i64() {
+                Some(-1) => value.is_null(),
+                Some(0) => value.is_null() || matches!(value.as_str(), Some("" | "\0")),
+                Some(1) => value.as_str().is_some_and(|text| !text.is_empty() && !text.contains('\0')),
+                _ => false,
+            };
+            if !valid {
+                return Err(format!(
+                    "Xugu CLOB column '{}' returned inconsistent content or a non-empty value containing NUL; refusing lossy transfer",
+                    columns[*index].name
+                ));
+            }
+        }
+    }
+    for row in rows {
+        for (marker, index) in clob_indexes.iter().enumerate() {
+            if row[width + marker].as_i64() == Some(0) {
+                row[*index] = serde_json::Value::String(String::new());
+            }
+        }
+        row.truncate(width);
+    }
+    Ok(())
 }
 
 fn uses_agent_transfer_cursor(db_type: &DatabaseType) -> bool {
@@ -12218,6 +12613,9 @@ where
             }
 
             progress_callback(TransferProgress {
+                oracle_package_approval: None,
+                oracle_package_preflight: None,
+                oracle_routine_operation: None,
                 transfer_id: request.transfer_id.clone(),
                 table: format!("rename: {table}"),
                 table_index: i,
@@ -12491,7 +12889,7 @@ async fn create_transfer_target_table(
     // confirmation dialog and the actual creation can never disagree on the DDL
     // or the names inside it. Rebuild mode additionally fails closed here when
     // source metadata cannot be trusted.
-    let prepared = ddl_plan::prepare_table_ddl(
+    let mut prepared = ddl_plan::prepare_table_ddl(
         state,
         request,
         table,
@@ -12504,6 +12902,21 @@ async fn create_transfer_target_table(
         known_foreign_keys,
     )
     .await?;
+    if let Some(frozen) = request
+        .oracle_packages
+        .as_ref()
+        .and_then(|packages| packages.pending_tables.as_ref())
+        .and_then(|pending| pending.tables.iter().find(|frozen| frozen.source_table() == table))
+    {
+        let regenerated = frozen.verify_server_plan(
+            table,
+            &request.target_schema,
+            target_table,
+            &prepared.ddl,
+            prepared.source_evidence.clone().ok_or("The original table evidence is unavailable before CREATE")?,
+        )?;
+        prepared.ddl = regenerated.final_ddl().to_owned();
+    }
     let reused_source_ddl = prepared.reused_source_ddl;
     let ddl = prepared.ddl;
     let ddl = if pg_compat_transfer && !owned_sequences.is_empty() {
@@ -12722,6 +13135,12 @@ where
         return Err(format!("No columns found for table {table}"));
     }
     ensure_target_column_names_unique(request, table, &columns)?;
+    let mysql_to_xugu = mysql_xugu::is_pair(source_db_type, target_db_type);
+    let mysql_xugu_types = if mysql_to_xugu {
+        Some(columns.iter().map(mysql_xugu::column_type).collect::<Result<Vec<_>, _>>()?)
+    } else {
+        None
+    };
 
     let is_doris_source = {
         let configs = state.configs.read().await;
@@ -12742,6 +13161,7 @@ where
     .await?;
 
     let writable_columns = writable_transfer_columns(&columns, source_db_type, target_db_type);
+    let xugu_clob_indexes = xugu_transfer_clob_indexes(&writable_columns, source_db_type, target_db_type);
     let default_rows_only = mysql_generated_only_transfer(&columns, source_db_type, target_db_type)
         || xugu_rowversion_only_transfer(&columns, source_db_type, target_db_type);
     if writable_columns.is_empty() && !default_rows_only {
@@ -12753,6 +13173,12 @@ where
     // preexisting-target validation and write SQL compare/emit these, reads keep `col_names`.
     let mut target_col_names: Vec<String> = col_names.iter().map(|name| request.target_column_name(name)).collect();
     let mut col_types: Vec<Option<String>> = writable_columns.iter().map(|c| Some(c.data_type.clone())).collect();
+    if let Some(types) = &mysql_xugu_types {
+        col_types = writable_columns
+            .iter()
+            .map(|column| columns.iter().position(|c| c.name == column.name).map(|index| types[index].clone()))
+            .collect();
+    }
     let primary_key_columns = transfer_key_columns(&writable_columns, source_db_type);
     if should_copy_data(&request.content) {
         log::info!("[transfer] {} has {} columns, counting rows...", table, columns.len());
@@ -12911,14 +13337,15 @@ where
     // whether the batch needs the `SET IDENTITY_INSERT` wrapper, and without the
     // target metadata it stays false — SQL Server then rejects the explicit
     // identity values with 544.
-    let needs_target_columns = default_rows_only
+    let needs_target_columns = mysql_to_xugu
+        || default_rows_only
         || target_table_preexisting
         || (request.mode == TransferMode::Upsert && !transfer_upsert_falls_back_to_append(target_db_type))
         || matches!(
             target_db_type,
             DatabaseType::Postgres | DatabaseType::Dameng | DatabaseType::H2 | DatabaseType::SqlServer
         );
-    let target_columns = if needs_target_columns {
+    let mut target_columns = if needs_target_columns {
         get_columns_for_transfer(
             state,
             target_pool_key,
@@ -12934,11 +13361,25 @@ where
         Vec::new()
     };
 
+    if mysql_to_xugu {
+        mysql_xugu::enrich_target_temporal_precision(
+            state,
+            target_pool_key,
+            &request.target_schema,
+            &target_table,
+            &mut target_columns,
+        )
+        .await?;
+    }
+
     // Empty-column INSERTs are safe only when the target also computes every
     // value. Reject incompatible data-only targets before an overwrite truncates
     // them; otherwise ordinary columns could silently receive defaults instead.
     let target_default_rows_only = mysql_generated_only_transfer(&target_columns, target_db_type, target_db_type)
         || xugu_rowversion_only_transfer(&target_columns, target_db_type, target_db_type);
+    if mysql_to_xugu {
+        mysql_xugu::validate_target(&writable_columns, &target_columns)?;
+    }
     if default_rows_only && !target_default_rows_only {
         return Err(format!(
             "Target table '{target_table}' must contain only generated columns for default-row transfer"
@@ -13079,6 +13520,9 @@ where
             .map_err(|error| format!("Native Inceptor transfer failed for '{table}': {error}"))?;
         let copied = total_rows.expect("complex transfer count validated");
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: table.to_string(),
             table_index,
@@ -13133,6 +13577,9 @@ where
             batch_size as u64,
             &mut |rows| {
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.to_string(),
                     table_index,
@@ -13152,6 +13599,9 @@ where
                 total_transferred = rows;
                 log::info!("[transfer] {table}: COPY fast path moved {rows} rows in {:?}", started.elapsed());
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.to_string(),
                     table_index,
@@ -13195,6 +13645,7 @@ where
         if *source_db_type == DatabaseType::Xugu {
             xugu_transfer_cursor_sql(
                 &writable_columns,
+                &xugu_clob_indexes,
                 table,
                 &request.source_schema,
                 request.source_catalog.as_deref(),
@@ -13263,6 +13714,7 @@ where
             } else if xugu_same_session && !default_rows_only {
                 let sql = xugu_transfer_page_sql(
                     &writable_columns,
+                    &xugu_clob_indexes,
                     table,
                     &request.source_schema,
                     request.source_catalog.as_deref(),
@@ -13320,8 +13772,11 @@ where
                         request.source_catalog.as_deref(),
                     )
                 };
-                let (sql, mysql_spatial_markers) =
-                    mysql_spatial_transfer_select_sql(sql, &col_names, &col_types, source_db_type, target_db_type);
+                let (sql, mysql_spatial_markers) = if mysql_to_xugu {
+                    (mysql_xugu::project_page(&sql, &writable_columns)?, false)
+                } else {
+                    mysql_spatial_transfer_select_sql(sql, &col_names, &col_types, source_db_type, target_db_type)
+                };
                 // Cap the result at `batch_size` (not the 10k default row limit), so a
                 // large batch is never truncated into looking like a short final page.
                 (
@@ -13331,6 +13786,10 @@ where
             };
             let has_more = result.has_more;
             let row_count = result.rows.len();
+            normalize_xugu_transfer_clobs(&mut result.rows, &writable_columns, &xugu_clob_indexes)?;
+            if mysql_to_xugu {
+                mysql_xugu::validate_rows(&writable_columns, &result.rows)?;
+            }
 
             if row_count == 0 {
                 // A `ctid` window can be empty — its rows were deleted, or the
@@ -13376,21 +13835,38 @@ where
                     row.clear();
                 }
             }
-            let write_statements = generate_transfer_write_sql_batches_with_column_quoting(
-                &effective_mode,
-                &write_col_names,
-                &col_types,
-                &result.rows,
-                &target_table,
-                &request.target_schema,
-                target_db_type,
-                &pk_columns,
-                request.target_catalog.as_deref(),
-                overrides_postgres_system_values,
-                mysql_spatial_markers,
-                request.quote_target_column_names,
-                write_hard_limit,
-            )?;
+            let write_statements = if mysql_to_xugu {
+                mysql_xugu::write_batches(
+                    &write_col_names,
+                    &col_types,
+                    &result.rows,
+                    &target_table,
+                    &request.target_schema,
+                    request.target_catalog.as_deref(),
+                    SqlBatchLimits::for_database(
+                        target_db_type,
+                        max_transfer_write_rows(target_db_type, &effective_mode),
+                    )
+                    .with_hard_sql_bytes(write_hard_limit),
+                    request.quote_target_column_names,
+                )?
+            } else {
+                generate_transfer_write_sql_batches_with_column_quoting(
+                    &effective_mode,
+                    &write_col_names,
+                    &col_types,
+                    &result.rows,
+                    &target_table,
+                    &request.target_schema,
+                    target_db_type,
+                    &pk_columns,
+                    request.target_catalog.as_deref(),
+                    overrides_postgres_system_values,
+                    mysql_spatial_markers,
+                    request.quote_target_column_names,
+                    write_hard_limit,
+                )?
+            };
             for (statement_index, batch_sql) in write_statements.iter().enumerate() {
                 execute_transfer_write_statement(
                     state,
@@ -13424,6 +13900,9 @@ where
             offset += row_count as u64;
 
             progress_callback(TransferProgress {
+                oracle_package_approval: None,
+                oracle_package_preflight: None,
+                oracle_routine_operation: None,
                 transfer_id: request.transfer_id.clone(),
                 table: table.to_string(),
                 table_index,
@@ -13457,7 +13936,7 @@ where
             &target_table,
             &request.target_schema,
             &write_col_names,
-            target_table_preexisting,
+            target_table_preexisting || mysql_to_xugu,
         )
         .await?;
     }
@@ -13873,6 +14352,11 @@ where
 {
     validate_transfer_database_pair(request, source_db_type, target_db_type)?;
     let state = state.clone();
+    if mysql_xugu::is_pair(source_db_type, target_db_type) {
+        let mut table_request = request.clone();
+        table_request.tables = vec![table.to_string()];
+        mysql_xugu::preflight(&state, &table_request, source_pool_key, target_pool_key).await?;
+    }
     let request = request.clone();
     let table = table.to_string();
     let source_db_type = *source_db_type;
@@ -14046,6 +14530,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("extension: {}", extension.extension_name),
             table_index,
@@ -14067,6 +14554,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("enum: {}", enum_type.type_name),
             table_index,
@@ -14088,6 +14578,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("domain: {}", domain.domain_name),
             table_index,
@@ -14114,6 +14607,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("sequence: {}", sequence.name),
             table_index,
@@ -14249,6 +14745,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("schema object: {}", object.name),
             table_index,
@@ -14309,6 +14808,9 @@ where
             }
             completed_steps += 1;
             progress_callback(TransferProgress {
+                oracle_package_approval: None,
+                oracle_package_preflight: None,
+                oracle_routine_operation: None,
                 transfer_id: request.transfer_id.clone(),
                 table: format!("materialized view: {}", view.view_name),
                 table_index,
@@ -14343,6 +14845,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("trigger: {}", trigger.trigger_name),
             table_index,
@@ -14363,6 +14868,9 @@ where
             .map_err(|e| format!("Failed to drop PostgreSQL trigger {}: {e}", trigger.trigger_name))?;
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("trigger: {}", trigger.trigger_name),
             table_index,
@@ -14391,6 +14899,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: "row security policies".to_string(),
             table_index,
@@ -14412,6 +14923,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: "ownership".to_string(),
             table_index,
@@ -14443,6 +14957,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: "grants".to_string(),
             table_index,
@@ -15190,6 +15707,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
         db::QueryResult {
             columns: Vec::new(),
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -15482,6 +16000,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             batch_size: 1000,
             drop_target_before_create: false,
             drop_target_confirmed: false,
+            oracle_packages: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["content"], "structureOnly");
@@ -15521,6 +16040,33 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             let dm = transfer_object_kinds(&DatabaseType::Dameng);
             assert!(dm.contains(&TransferObjectKind::Trigger));
             assert!(dm.contains(&TransferObjectKind::Sequence));
+            assert!(!dm.contains(&TransferObjectKind::Package));
+            for product in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+                let kinds = transfer_object_kinds(&product);
+                assert!(kinds.contains(&TransferObjectKind::Package));
+                assert!(kinds.contains(&TransferObjectKind::PackageBody));
+                assert!(target_object_exists_sql(
+                    &product,
+                    "Owner.With.Dot",
+                    "Pkg.With.Dot😀",
+                    &TransferObjectKind::Package
+                )
+                .unwrap()
+                .contains("OBJECT_TYPE = 'PACKAGE'"));
+                assert!(target_object_exists_sql(
+                    &product,
+                    "Owner.With.Dot",
+                    "Pkg.With.Dot😀",
+                    &TransferObjectKind::PackageBody
+                )
+                .unwrap()
+                .contains("OBJECT_TYPE = 'PACKAGE BODY'"));
+            }
+            assert!(
+                target_object_exists_sql(&DatabaseType::Dameng, "OWNER", "PKG", &TransferObjectKind::Package).is_err()
+            );
+            assert!(!object_kind_selected_or_defaulted(None, &TransferObjectKind::Package));
+            assert!(!object_kind_selected_or_defaulted(None, &TransferObjectKind::PackageBody));
             let sqlserver = transfer_object_kinds(&DatabaseType::SqlServer);
             assert!(sqlserver.contains(&TransferObjectKind::View));
             assert!(sqlserver.contains(&TransferObjectKind::Procedure));
@@ -15571,11 +16117,12 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 table_filters: std::collections::HashMap::new(),
                 drop_target_before_create: false,
                 drop_target_confirmed: false,
+                oracle_packages: None,
             }
         }
 
         #[test]
-        fn xugu_transfer_is_same_engine_table_only_and_append_or_overwrite() {
+        fn xugu_transfer_is_same_engine_only_and_append_or_overwrite() {
             let request = base_request();
             assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Xugu).is_ok());
             // Existing non-Xugu transfer combinations retain their prior policy.
@@ -15584,8 +16131,9 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             let err =
                 validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Postgres).unwrap_err();
             assert!(err.contains("虚谷到虚谷"), "{err}");
-            let err = validate_transfer_database_pair(&request, &DatabaseType::Mysql, &DatabaseType::Xugu).unwrap_err();
-            assert!(err.contains("虚谷到虚谷"), "{err}");
+            assert!(validate_transfer_database_pair(&request, &DatabaseType::Mysql, &DatabaseType::Xugu).is_ok());
+            assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Mysql).is_err());
+            assert!(validate_transfer_database_pair(&request, &DatabaseType::Doris, &DatabaseType::Xugu).is_err());
 
             for mode in [TransferMode::Append, TransferMode::Overwrite] {
                 let request = TransferRequest { mode, ..request.clone() };
@@ -15597,6 +16145,44 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 .contains("追加或覆盖"));
             let rebuild = TransferRequest { drop_target_before_create: true, ..request.clone() };
             assert!(validate_transfer_database_pair(&rebuild, &DatabaseType::Xugu, &DatabaseType::Xugu).is_err());
+        }
+
+        #[test]
+        fn explicit_package_requests_round_trip_and_reject_unsupported_products_before_filtering() {
+            let request = TransferRequest {
+                objects: Some(vec![
+                    TransferObjectSelection {
+                        object_type: TransferObjectKind::Package,
+                        names: vec!["Pkg.With.Dot:😀".into()],
+                    },
+                    TransferObjectSelection {
+                        object_type: TransferObjectKind::PackageBody,
+                        names: vec!["Pkg.With.Dot:😀".into()],
+                    },
+                ]),
+                ..base_request()
+            };
+            let wire = serde_json::to_value(&request).unwrap();
+            assert_eq!(wire["objects"][0]["objectType"], "PACKAGE");
+            assert_eq!(wire["objects"][1]["objectType"], "PACKAGE_BODY");
+            let restored: TransferRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(restored.objects, request.objects);
+            for source in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+                for target in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+                    assert!(validate_transfer_database_pair(&restored, &source, &target).is_ok());
+                }
+                for target in [DatabaseType::Dameng, DatabaseType::Mysql, DatabaseType::Postgres, DatabaseType::Xugu] {
+                    assert!(validate_transfer_database_pair(&restored, &source, &target)
+                        .unwrap_err()
+                        .contains("actual Oracle"));
+                    assert!(validate_transfer_database_pair(&restored, &target, &source)
+                        .unwrap_err()
+                        .contains("actual Oracle"));
+                }
+            }
+            let legacy = TransferRequest { objects: None, ..restored };
+            assert!(!legacy.has_package_selection());
+            assert!(validate_transfer_database_pair(&legacy, &DatabaseType::Dameng, &DatabaseType::Oracle).is_ok());
         }
 
         #[test]
@@ -15632,7 +16218,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
         }
 
         #[test]
-        fn xugu_structure_transfer_rejects_renamed_tables_and_non_table_objects() {
+        fn xugu_structure_transfer_preserves_names_and_accepts_native_objects() {
             let request = TransferRequest { target_table_name_case: TransferTableNameCase::Upper, ..base_request() };
             assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Xugu)
                 .unwrap_err()
@@ -15645,9 +16231,29 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 }]),
                 ..base_request()
             };
-            assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Xugu)
-                .unwrap_err()
-                .contains("仅支持表对象"));
+            assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Xugu).is_ok());
+            for kind in [
+                TransferObjectKind::Package,
+                TransferObjectKind::Synonym,
+                TransferObjectKind::Sequence,
+                TransferObjectKind::Procedure,
+                TransferObjectKind::Function,
+                TransferObjectKind::Trigger,
+            ] {
+                let request = TransferRequest {
+                    objects: Some(vec![TransferObjectSelection { object_type: kind, names: vec!["O".into()] }]),
+                    ..base_request()
+                };
+                assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Xugu).is_ok());
+            }
+            let unsupported = TransferRequest {
+                objects: Some(vec![TransferObjectSelection {
+                    object_type: TransferObjectKind::Event,
+                    names: vec!["E".into()],
+                }]),
+                ..base_request()
+            };
+            assert!(validate_transfer_database_pair(&unsupported, &DatabaseType::Xugu, &DatabaseType::Xugu).is_err());
         }
 
         #[test]
@@ -15675,6 +16281,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 objects: Some(Vec::new()),
                 drop_target_before_create: false,
                 drop_target_confirmed: false,
+                oracle_packages: None,
             };
             assert!(validate_transfer_request(&base).is_ok());
 
@@ -15717,6 +16324,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 objects: Some(Vec::new()),
                 drop_target_before_create: false,
                 drop_target_confirmed: false,
+                oracle_packages: None,
             };
 
             // drop_target_before_create=false → valid
@@ -16798,6 +17406,11 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 &DatabaseType::Postgres,
                 &DatabaseType::Kingbase
             ));
+            assert!(transfer_table_needs_inline_postgres_schema_ensure(&DatabaseType::Gaussdb, &DatabaseType::Gaussdb));
+            assert!(transfer_table_needs_inline_postgres_schema_ensure(
+                &DatabaseType::Postgres,
+                &DatabaseType::Gaussdb
+            ));
         }
 
         #[test]
@@ -16834,6 +17447,19 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             assert!(sql.contains("'ENUM'::text"));
             assert!(sql.contains("'DOMAIN'::text"));
             assert!(sql.contains("'EXTENSION'::text"));
+        }
+
+        #[test]
+        fn postgres_table_dependency_recursive_cte_unifies_classid_to_oid() {
+            let sql = postgres_table_dependency_selection_sql("public", &["orders".into()]).unwrap();
+            for needle in [
+                "SELECT 'pg_catalog.pg_class'::regclass::oid, oid FROM selected_tables",
+                "UNION SELECT 'pg_catalog.pg_attrdef'::regclass::oid, a.oid",
+                "UNION SELECT 'pg_catalog.pg_constraint'::regclass::oid, c.oid",
+                "UNION SELECT 'pg_catalog.pg_class'::regclass::oid, i.indexrelid",
+            ] {
+                assert!(sql.contains(needle));
+            }
         }
 
         #[test]
@@ -16913,6 +17539,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                     source: "SELECT 1".into(),
                     editable: None,
                     routine_parameters: None,
+                    trigger: None,
                 },
                 db::ObjectSource {
                     name: "v2".into(),
@@ -16921,6 +17548,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                     source: "SELECT 2".into(),
                     editable: None,
                     routine_parameters: None,
+                    trigger: None,
                 },
             ];
             let selection =
@@ -17044,6 +17672,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             batch_size: 1000,
             drop_target_before_create: false,
             drop_target_confirmed: false,
+            oracle_packages: None,
         }
     }
 
@@ -17402,7 +18031,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
         assert!(xugu_transfer_shares_agent_session(&DatabaseType::Xugu, "conn:SYSTEM", "conn:SYSTEM"));
         assert!(!xugu_transfer_shares_agent_session(&DatabaseType::Xugu, "conn:SYSTEM", "conn:GIS"));
         assert!(!xugu_transfer_shares_agent_session(&DatabaseType::Postgres, "conn", "conn"));
-        let sql = xugu_transfer_page_sql(&[test_column("G", "GEOMETRY")], "SHAPES", "APP", None, &[], 1000, 1000);
+        let sql = xugu_transfer_page_sql(&[test_column("G", "GEOMETRY")], &[], "SHAPES", "APP", None, &[], 1000, 1000);
         assert!(sql.contains("ST_AsEWKB(\"G\")"));
         assert!(sql.ends_with("LIMIT 1000 OFFSET 1000"));
 
@@ -17410,6 +18039,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
         // plain projection keeps the previous behavior.
         let keyed = xugu_transfer_page_sql(
             &[test_column("ID", "INTEGER"), test_column("G", "GEOMETRY")],
+            &[],
             "SHAPES",
             "APP",
             None,
@@ -18369,6 +18999,105 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
     }
 
     #[test]
+    fn gaussdb_reused_ddl_rewrites_search_path_and_schema_qualifiers_for_target_schema() {
+        // Issue #13049: GaussDB's reused DDL includes `SET search_path = <source_schema>;`
+        // and schema qualifiers. When transferring across schemas, the search_path and
+        // table qualifiers must both be redirected to the target schema so that:
+        // 1. Cross-DB transfers don't fail with "ERROR: schema '<source_schema>' does not exist".
+        // 2. Same-DB transfers to a new empty schema don't set search_path to the old schema,
+        //    which would cause subsequent object resolution to collide with preexisting tables.
+        let ddl = "SET search_path = public;\n\
+                   CREATE TABLE \"public\".\"items\" (\"id\" integer);\n\
+                   COMMENT ON TABLE \"public\".\"items\" IS 'items';";
+
+        let rewritten = rewrite_transfer_source_table_ddl(
+            ddl,
+            "public",
+            "new_schema",
+            &DatabaseType::Gaussdb,
+            &DatabaseType::Gaussdb,
+            "items",
+            "items",
+        )
+        .expect("rewritten DDL");
+
+        assert!(rewritten.contains("SET search_path = \"new_schema\";"));
+        assert!(rewritten.contains("CREATE TABLE \"new_schema\".\"items\""));
+        assert!(rewritten.contains("COMMENT ON TABLE \"new_schema\".\"items\""));
+        assert!(!rewritten.contains("SET search_path = public;"));
+        assert!(!rewritten.contains("\"public\"."));
+
+        // Defaults empty source or target schema to "public"
+        let rewritten_from_empty = rewrite_transfer_source_table_ddl(
+            ddl,
+            "",
+            "new_schema",
+            &DatabaseType::Gaussdb,
+            &DatabaseType::Gaussdb,
+            "items",
+            "items",
+        )
+        .expect("rewritten DDL");
+        assert!(rewritten_from_empty.contains("SET search_path = \"new_schema\";"));
+        assert!(rewritten_from_empty.contains("CREATE TABLE \"new_schema\".\"items\""));
+
+        let statements = transfer_ddl_statements(&rewritten, &DatabaseType::Gaussdb);
+        assert_eq!(
+            statements,
+            vec![
+                "SET search_path = \"new_schema\"".to_string(),
+                "CREATE TABLE \"new_schema\".\"items\" (\"id\" integer)".to_string(),
+                "COMMENT ON TABLE \"new_schema\".\"items\" IS 'items'".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrite_postgres_search_path_handles_quoted_unquoted_and_multiple_schemas() {
+        assert_eq!(
+            rewrite_postgres_search_path("SET search_path = public;", "public", "target"),
+            "SET search_path = \"target\";"
+        );
+        assert_eq!(
+            rewrite_postgres_search_path("SET search_path = \"public\";", "public", "target"),
+            "SET search_path = \"target\";"
+        );
+        assert_eq!(
+            rewrite_postgres_search_path("SET search_path TO public;", "public", "target"),
+            "SET search_path TO \"target\";"
+        );
+        assert_eq!(
+            rewrite_postgres_search_path("SET search_path = public, pg_catalog;", "public", "target"),
+            "SET search_path = \"target\", pg_catalog;"
+        );
+        assert_eq!(
+            rewrite_postgres_search_path("SET search_path = \"tenant's\";", "tenant's", "target"),
+            "SET search_path = \"target\";"
+        );
+        // Unrelated schemas are preserved
+        assert_eq!(
+            rewrite_postgres_search_path("SET search_path = other_schema;", "public", "target"),
+            "SET search_path = other_schema;"
+        );
+        // Comments and strings containing search_path are not corrupted
+        let comment = "-- SET search_path = public;\nSET search_path = public;";
+        assert_eq!(
+            rewrite_postgres_search_path(comment, "public", "target"),
+            "-- SET search_path = public;\nSET search_path = \"target\";"
+        );
+    }
+
+    #[test]
+    fn supports_comment_on_transfer_ddl_includes_gaussdb() {
+        assert!(supports_comment_on_transfer_ddl(&DatabaseType::Gaussdb));
+        assert!(supports_comment_on_transfer_ddl(&DatabaseType::Postgres));
+        assert!(supports_comment_on_transfer_ddl(&DatabaseType::Kingbase));
+        assert!(supports_comment_on_transfer_ddl(&DatabaseType::Oracle));
+        assert!(supports_comment_on_transfer_ddl(&DatabaseType::Dameng));
+        assert!(!supports_comment_on_transfer_ddl(&DatabaseType::Mysql));
+    }
+
+    #[test]
     fn postgres_transfer_ddl_keeps_non_foreign_key_alter_statements() {
         // Only FK-ADD ALTERs are deferred; CHECK/SET ALTERs and literals that merely
         // mention "foreign key" must survive the filter.
@@ -18565,6 +19294,94 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
     }
 
     #[test]
+    fn xugu_empty_clob_workaround_is_scoped_to_xugu_pairs_and_clob_columns() {
+        let columns = vec![test_column("ID", "INTEGER"), test_column("BODY", "clob"), test_column("B", "BLOB")];
+        assert_eq!(xugu_transfer_clob_indexes(&columns, &DatabaseType::Xugu, &DatabaseType::Xugu), vec![1]);
+        for (source, target) in [
+            (DatabaseType::Mysql, DatabaseType::Xugu),
+            (DatabaseType::Xugu, DatabaseType::Mysql),
+            (DatabaseType::Postgres, DatabaseType::Postgres),
+            (DatabaseType::Dameng, DatabaseType::Dameng),
+        ] {
+            let indexes = xugu_transfer_clob_indexes(&columns, &source, &target);
+            assert!(indexes.is_empty());
+            let mut rows = vec![vec![json!(1), json!("\0"), json!("0x00")]];
+            let original = rows.clone();
+            normalize_xugu_transfer_clobs(&mut rows, &columns, &indexes).unwrap();
+            assert_eq!(rows, original);
+        }
+        assert!(xugu_transfer_clob_indexes(&columns[..1], &DatabaseType::Xugu, &DatabaseType::Xugu).is_empty());
+        // This fix must not enable the currently unsupported Xugu row-filter path.
+        assert!(!transfer_table_filter_supported(&DatabaseType::Xugu));
+        assert_eq!(
+            xugu_transfer_cursor_sql(&columns, &[], "T", "APP", None),
+            r#"SELECT "ID" AS "ID", "BODY" AS "BODY", CASE WHEN "B" IS NULL THEN NULL ELSE '0x'||RAWTOHEX("B") END AS "B" FROM "APP"."T""#
+        );
+    }
+
+    #[test]
+    fn xugu_empty_clob_markers_cover_cursor_and_pages_without_name_collisions() {
+        let columns =
+            vec![test_column("ID", "INTEGER"), test_column("BODY", "CLOB"), test_column("__DBX_CLOB_STATE_1", "CLOB")];
+        let indexes = xugu_transfer_clob_indexes(&columns, &DatabaseType::Xugu, &DatabaseType::Xugu);
+        let cursor = xugu_transfer_cursor_sql(&columns, &indexes, "T", "APP", None);
+        assert!(cursor.contains(
+            r#"CASE WHEN "BODY" IS NULL THEN -1 WHEN LENGTH("BODY")=0 THEN 0 ELSE 1 END AS "__dbx_clob_state_1_""#
+        ));
+        assert!(cursor.contains(r#"LENGTH("__DBX_CLOB_STATE_1")=0"#));
+        assert!(!cursor.contains("CAST("));
+        assert!(!cursor.contains("RAWTOHEX("));
+        let page = xugu_transfer_page_sql(&columns, &indexes, "T", "APP", None, &["ID".into()], 2, 2);
+        assert!(page.starts_with(&cursor));
+        assert!(page.ends_with(r#" ORDER BY "ID" LIMIT 2 OFFSET 2"#));
+    }
+
+    #[test]
+    fn xugu_empty_clob_normalization_preserves_null_spaces_unicode_and_large_text() {
+        let columns = vec![test_column("ID", "INTEGER"), test_column("A", "CLOB"), test_column("B", "CLOB")];
+        let large = "中文 it's a large CLOB\n".repeat(10_000);
+        let mut rows = vec![
+            vec![json!(1), json!(null), json!("\0"), json!(-1), json!(0)],
+            vec![json!(2), json!(""), json!(" "), json!(0), json!(1)],
+            vec![json!(3), json!(large), json!("中文 it's CLOB"), json!(1), json!(1)],
+            vec![json!(4), json!(null), json!(null), json!(0), json!(-1)],
+        ];
+        normalize_xugu_transfer_clobs(&mut rows, &columns, &[1, 2]).unwrap();
+        assert_eq!(rows[0], vec![json!(1), json!(null), json!("")]);
+        assert_eq!(rows[1], vec![json!(2), json!(""), json!(" ")]);
+        assert_eq!(rows[2], vec![json!(3), json!(large), json!("中文 it's CLOB")]);
+        assert_eq!(rows[3], vec![json!(4), json!(""), json!(null)]);
+        assert_eq!(escape_value_typed(&rows[0][1], &DatabaseType::Xugu, Some("CLOB")), "NULL");
+        assert_eq!(escape_value_typed(&rows[0][2], &DatabaseType::Xugu, Some("CLOB")), "''");
+        assert_eq!(escape_value_typed(&rows[1][2], &DatabaseType::Xugu, Some("CLOB")), "' '");
+        assert_eq!(escape_value_typed(&rows[2][2], &DatabaseType::Xugu, Some("CLOB")), "'中文 it''s CLOB'");
+        normalize_xugu_transfer_clobs(&mut [], &columns, &[1, 2]).unwrap();
+    }
+
+    #[test]
+    fn xugu_empty_clob_normalization_rejects_ambiguous_or_malformed_batches_without_mutation() {
+        let columns = vec![test_column("BODY", "CLOB")];
+        for invalid in [
+            vec![json!("\0")],
+            vec![json!("\0"), json!(0), json!(0)],
+            vec![json!("data"), json!(null)],
+            vec![json!("data"), json!(2)],
+            vec![json!("data"), json!("0")],
+            vec![json!("data"), json!(0)],
+            vec![json!("data"), json!(-1)],
+            vec![json!(null), json!(1)],
+            vec![json!(""), json!(1)],
+            vec![json!("\0"), json!(1)],
+            vec![json!("a\0b"), json!(1)],
+        ] {
+            let mut rows = vec![vec![json!("\0"), json!(0)], invalid];
+            let original = rows.clone();
+            assert!(normalize_xugu_transfer_clobs(&mut rows, &columns, &[0]).is_err());
+            assert_eq!(rows, original);
+        }
+    }
+
+    #[test]
     fn xugu_transfer_cursor_projects_lossy_driver_types_as_text_or_hex() {
         let columns = vec![
             test_column("ID", "INTEGER"),
@@ -18578,7 +19395,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
         ];
 
         assert_eq!(
-            xugu_transfer_cursor_sql(&columns, "ITEMS", "APP", None),
+            xugu_transfer_cursor_sql(&columns, &[], "ITEMS", "APP", None),
             r#"SELECT "ID" AS "ID", CASE WHEN "BLOB_C" IS NULL THEN NULL ELSE '0x'||RAWTOHEX("BLOB_C") END AS "BLOB_C", RTRIM(CAST("BIT_C" AS VARCHAR(8))) AS "BIT_C", RTRIM(CAST("VARBIT_C" AS VARCHAR(32767))) AS "VARBIT_C", CAST("TIME_C" AS VARCHAR(64)) AS "TIME_C", CAST("TIME_TZ_C" AS VARCHAR(256)) AS "TIME_TZ_C", CAST("IV_YM_C" AS VARCHAR(256)) AS "IV_YM_C", "NOTE" AS "NOTE" FROM "APP"."ITEMS""#
         );
     }
@@ -18592,7 +19409,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             test_column("B3", "BOX3D"),
         ];
         assert_eq!(
-            xugu_transfer_cursor_sql(&columns, "SHAPES", "APP", None),
+            xugu_transfer_cursor_sql(&columns, &[], "SHAPES", "APP", None),
             r#"SELECT CASE WHEN "G" IS NULL THEN NULL ELSE '0x'||RAWTOHEX(ST_AsEWKB("G")) END AS "G", CASE WHEN "GG" IS NULL THEN NULL ELSE '0x'||RAWTOHEX(ST_AsEWKB(CAST("GG" AS GEOMETRY))) END AS "GG", CASE WHEN "B2" IS NULL THEN NULL ELSE '0x'||RAWTOHEX(ST_AsEWKB(CAST("B2" AS GEOMETRY))) END AS "B2", CASE WHEN "B3" IS NULL THEN NULL ELSE '0x'||RAWTOHEX(ST_AsEWKB(CAST("B3" AS GEOMETRY))) END AS "B3" FROM "APP"."SHAPES""#
         );
     }
@@ -20682,6 +21499,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_generates_index_and_foreign_key_sql() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20740,6 +21558,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_includes_opclass_for_gin_trigram() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20771,6 +21590,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
         // (`syntax error at or near "NOT"`), so the transfer must fall back to the
         // plain form there (issue #8853).
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20809,6 +21629,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_no_opclass_when_all_default() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20843,6 +21664,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
         // `indclass` into `column_opclasses`, so transfer DDL must append it to an
         // expression key just like a real column.
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20872,6 +21694,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_mixed_opclass_and_default() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20900,6 +21723,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_preserves_per_key_ordering_and_include_columns() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20933,6 +21757,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_ignores_access_method_options_for_non_btree_indexes() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20962,6 +21787,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_empty_column_opclasses_vec_falls_back_to_no_opclass() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -22726,6 +23552,7 @@ SELECT 1 FROM dual"#
             None,
             SqlBatchLimits { max_rows: 100, target_sql_bytes: 1024, hard_sql_bytes: None },
             true,
+            None,
         )
         .unwrap();
 
@@ -22747,6 +23574,7 @@ SELECT 1 FROM dual"#
             None,
             SqlBatchLimits { max_rows: 100, target_sql_bytes: 1024, hard_sql_bytes: None },
             true,
+            None,
         )
         .unwrap();
 
@@ -22769,6 +23597,7 @@ SELECT 1 FROM dual"#
             None,
             SqlBatchLimits { max_rows: 100, target_sql_bytes: 1024, hard_sql_bytes: None },
             true,
+            None,
         )
         .unwrap();
 
@@ -24391,6 +25220,9 @@ CREATE INDEX items_name_idx ON public.items (id);"#;
             try_send_transfer_progress(
                 &sender,
                 TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: "transfer".to_string(),
                     table: "table".to_string(),
                     table_index: 0,
