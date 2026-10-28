@@ -118,8 +118,8 @@ import { xuguDatafileDetailRows, xuguTablespaceDetailRows } from "@/lib/sidebar/
 import { useDragSort } from "@/composables/useDragSort";
 import { sidebarTreeRuntimeKey } from "@/lib/sidebar/sidebarTreeRuntime";
 import { treeNodePinKey } from "@/lib/app/pinnedItems";
+import { customTypeCapabilities, supportsOracleTypeAttributeExpansion } from "@/lib/database/databaseObjectCapabilities";
 import { sidebarTreeDisplayLabel, sidebarTreeSecondaryValue } from "@/lib/sidebar/sidebarTreeLabel";
-import { customTypeCapabilities } from "@/lib/database/databaseObjectCapabilities";
 import { shouldActivateTreeNodeOnSingleClick } from "@/lib/sidebar/treeNodeClick";
 
 const { t } = useI18n();
@@ -338,6 +338,7 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
     case "dameng-roles":
       return { icon: ShieldCheck, colorClass: "text-primary" };
     case "dameng-job-admin":
+    case "database-job-admin":
       return { icon: CalendarClock, colorClass: "text-primary" };
     case "saved-sql-root":
       return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-blue-500" };
@@ -435,6 +436,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Clock, colorClass: "text-orange-400" };
     case "group-packages":
       return { icon: Package, colorClass: "text-cyan-500" };
+    case "group-package-bodies":
+      return { icon: Package, colorClass: "text-cyan-500" };
     case "group-types":
       return { icon: Braces, colorClass: "text-violet-500" };
     case "group-database-indexes":
@@ -465,7 +468,7 @@ function displayLabel(node: TreeNode): string {
 }
 
 function treeNodeSecondaryValue(node: TreeNode): string | undefined {
-  return sidebarTreeSecondaryValue(node, t);
+  return sidebarTreeSecondaryValue(node, t, node.connectionId ? effectiveDatabaseTypeForConnection(connectionStore.getConfig(node.connectionId)) : undefined);
 }
 
 function visibleLabel(node: TreeNode): string {
@@ -772,7 +775,7 @@ const canExpand = computed(() => {
   // loadable members; types without members (enum/domain/range/base) do not
   // expand even if the catalog row lists child metadata.
   if (activeNode.value.type === "type" && customTypeCapabilities(currentDatabaseType()).details) {
-    return activeNode.value.hasMembers === true;
+    return activeNode.value.hasMembers === true || (activeNode.value.hasMembers === undefined && supportsOracleTypeAttributeExpansion(currentDatabaseType()));
   }
   return canTreeNodeShowExpander({
     type: activeNode.value.type,
@@ -972,7 +975,6 @@ const tableSearchStyle = computed(() => {
   const color = connectionColor.value;
   const rowBackgroundColor = color ? hexToRgba(color, isActiveConnectionScope.value ? 0.14 : 0.08) : "transparent";
   return {
-    paddingLeft: paddingLeft.value,
     "--tree-table-search-row-bg": rowBackgroundColor,
     "--tree-table-search-input-bg": color ? hexToRgba(color, isActiveConnectionScope.value ? 0.05 : 0.03) : "color-mix(in srgb, var(--background) 56%, transparent)",
     "--tree-table-search-border": color ? hexToRgba(color, isActiveConnectionScope.value ? 0.12 : 0.08) : "color-mix(in srgb, var(--border) 36%, transparent)",
@@ -1553,8 +1555,9 @@ function onKeydown(event: KeyboardEvent) {
 </script>
 
 <template>
-  <div v-if="node.type === 'table-search-control'" data-sidebar-table-search-control class="tree-table-search-control pr-2" :class="isCompactSidebar ? 'h-6 py-0' : 'h-7 py-0.5'" :style="tableSearchStyle" @click.stop @dblclick.stop @mousedown.stop @keydown="onTableSearchControlKeydown">
-    <div class="tree-table-search-control__content flex w-full min-w-0 items-center gap-1.5">
+  <div v-if="node.type === 'table-search-control'" data-sidebar-table-search-control class="tree-table-search-control" :class="isCompactSidebar ? 'h-6 py-0' : 'h-7 py-0.5'" :style="tableSearchStyle" @click.stop @dblclick.stop @mousedown.stop @keydown="onTableSearchControlKeydown">
+    <!-- Keep indentation inside the viewport-sized content so trailing controls fit. -->
+    <div class="tree-table-search-control__content flex w-full min-w-0 items-center gap-1.5 pr-2" :style="{ paddingLeft }">
       <div class="relative min-w-0 flex-1">
         <Search class="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
         <Input
@@ -1722,6 +1725,7 @@ function onKeydown(event: KeyboardEvent) {
                   node.type === 'group-udf-functions' ||
                   node.type === 'group-columns' ||
                   node.type === 'group-indexes' ||
+                  node.type === 'group-database-indexes' ||
                   node.type === 'group-fkeys' ||
                   node.type === 'group-triggers' ||
                   node.type === 'group-events' ||
@@ -1732,6 +1736,7 @@ function onKeydown(event: KeyboardEvent) {
                   node.type === 'group-synonyms' ||
                   node.type === 'group-jobs' ||
                   node.type === 'group-packages' ||
+                  node.type === 'group-package-bodies' ||
                   node.type === 'group-types' ||
                   node.type === 'group-partitions' ||
                   node.type === 'type-attributes' ||

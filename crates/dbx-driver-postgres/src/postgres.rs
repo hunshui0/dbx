@@ -142,6 +142,8 @@ pub struct PostgresTablePartitionLocalObjects {
     pub has_primary_key: bool,
     pub unique_constraints: BTreeSet<String>,
     pub foreign_keys: BTreeSet<String>,
+    /// Native definitions retained by the batched partition-tree DDL path.
+    pub foreign_key_definitions: BTreeMap<String, String>,
     pub indexes: BTreeSet<String>,
     /// CHECK constraints with a local definition on this partition, as
     /// reported by pg_constraint.conislocal. A merged constraint may remain
@@ -2179,6 +2181,7 @@ async fn execute_select_prepared(
     Ok(PreparedSelectOutcome::Complete(Box::new(QueryResult {
         columns,
         column_types,
+        deferred_large_value_cells: Vec::new(),
         column_sortables: Vec::new(),
         spatial_columns,
         spatial_values,
@@ -2288,6 +2291,7 @@ async fn execute_select_text(
     Ok(QueryResult {
         column_types: matching_pg_text_column_types(&columns, prepared_column_types),
         columns,
+        deferred_large_value_cells: Vec::new(),
         column_sortables: Vec::new(),
         spatial_columns,
         spatial_values,
@@ -4470,12 +4474,11 @@ pub async fn get_table_partition_info(
     }
 
     let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &table];
-    let rows = query_with_compat_fallback(
-        "get_table_partition_info",
-        &[postgres_table_partition_info_sql(), postgres_table_partition_info_compat_sql()],
-        |sql| postgres_query_cached(client, sql, &params),
-    )
-    .await?;
+    let rows =
+        query_with_compat_fallback("get_table_partition_info", &postgres_table_partition_info_query_tiers(), |sql| {
+            postgres_query_cached(client, sql, &params)
+        })
+        .await?;
     let Some(row) = rows.first() else {
         let inherits_parents = if has_inherits_parent {
             get_table_inherits_parents_inner(client, schema, table).await?
@@ -5064,6 +5067,27 @@ fn postgres_partition_tree_compat_sql() -> &'static str {
      WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','f')"
 }
 
+/// Redshift is based on PostgreSQL 8.0.2 and has neither `pg_foreign_table`
+/// nor `pg_foreign_server` (both PostgreSQL 9.1+), so the pre-10 compat query
+/// still fails there. Keep the same column shape with NULL foreign-table
+/// fields; Redshift has no declarative partitions, so the requested relation
+/// is the whole tree (issue #13293).
+fn postgres_partition_tree_legacy_sql() -> &'static str {
+    "SELECT c.oid::bigint AS oid, n.nspname::text AS schema, c.relname::text AS relname, \
+            NULL::bigint AS parent_oid, NULL::text AS parent_schema, NULL::text AS parent_relname, \
+            c.relkind::text AS relkind, \
+            NULL::text AS partition_bound, NULL::text AS partition_key, \
+            NULL::text AS foreign_server, \
+            NULL::text[] AS foreign_options \
+     FROM pg_catalog.pg_class c \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','f')"
+}
+
+fn postgres_partition_tree_query_tiers() -> [&'static str; 3] {
+    [postgres_partition_tree_sql(), postgres_partition_tree_compat_sql(), postgres_partition_tree_legacy_sql()]
+}
+
 /// The whole partition tree rooted at (schema, table) — the root itself plus
 /// every descendant partition at any depth — plus each node's partition info,
 /// in a single round trip. Used by `pg_ddl_with_partitions` instead of
@@ -5078,12 +5102,11 @@ pub async fn fetch_postgres_partition_tree(
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let client = &EncodingClient::new(&client);
     let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &table];
-    let rows = query_with_compat_fallback(
-        "fetch_postgres_partition_tree",
-        &[postgres_partition_tree_sql(), postgres_partition_tree_compat_sql()],
-        |sql| postgres_query_cached(client, sql, &params),
-    )
-    .await?;
+    let rows =
+        query_with_compat_fallback("fetch_postgres_partition_tree", &postgres_partition_tree_query_tiers(), |sql| {
+            postgres_query_cached(client, sql, &params)
+        })
+        .await?;
     Ok(rows
         .into_iter()
         .filter_map(|row| {
@@ -5411,6 +5434,7 @@ async fn list_indexes_for_relations_with_sql(
         let all_key_options: Vec<i16> = row.try_get::<_, Vec<i16>>(12).unwrap_or_default();
         let key_options = if all_key_options.len() == split_at { all_key_options } else { Vec::new() };
         result.entry(relid).or_default().push(IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -5752,7 +5776,13 @@ pub async fn get_table_partition_local_objects_for_relations_with_sql(
         let object_kind = row.try_get::<_, String>(1).unwrap_or_default();
         let object_name = row.try_get::<_, String>(2).unwrap_or_default();
         let object_type = row.try_get::<_, Option<String>>(3).ok().flatten().unwrap_or_default();
-        apply_partition_local_object_row(result.entry(relid).or_default(), &object_kind, object_name, &object_type);
+        let entry = result.entry(relid).or_default();
+        if object_kind == "constraint" && object_type == "f" {
+            if let Some(definition) = pg_row_try_optional_text(row, 4) {
+                entry.foreign_key_definitions.insert(object_name.clone(), definition);
+            }
+        }
+        apply_partition_local_object_row(entry, &object_kind, object_name, &object_type);
     }
     Ok(result)
 }
@@ -5765,23 +5795,24 @@ fn postgres_table_partition_local_objects_for_relations_query_tiers() -> [&'stat
 }
 
 pub fn postgres_table_partition_local_objects_for_relations_sql() -> &'static str {
-    "SELECT con.conrelid::bigint AS relid, 'constraint'::text AS object_kind, con.conname AS object_name, con.contype::text AS object_type \
+    "SELECT con.conrelid::bigint AS relid, 'constraint'::text AS object_kind, con.conname AS object_name, con.contype::text AS object_type, \
+            CASE WHEN con.contype = 'f' THEN pg_catalog.pg_get_constraintdef(con.oid, true) END AS definition \
      FROM pg_catalog.pg_constraint con \
      WHERE con.conrelid = ANY($1::bigint[]) AND con.contype IN ('p','u','f') \
        AND COALESCE(NULLIF(pg_catalog.row_to_json(con)->>'conparentid', '')::oid, 0) = 0 \
      UNION ALL \
-     SELECT con.conrelid::bigint, 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type \
+     SELECT con.conrelid::bigint, 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type, NULL::text \
      FROM pg_catalog.pg_constraint con \
      WHERE con.conrelid = ANY($1::bigint[]) AND con.contype = 'c' AND con.conislocal \
      UNION ALL \
-     SELECT ix.indrelid::bigint, 'index'::text AS object_kind, idx.relname AS object_name, NULL::text AS object_type \
+     SELECT ix.indrelid::bigint, 'index'::text AS object_kind, idx.relname AS object_name, NULL::text AS object_type, NULL::text \
      FROM pg_catalog.pg_index ix \
      JOIN pg_catalog.pg_class idx ON idx.oid = ix.indexrelid \
      WHERE ix.indrelid = ANY($1::bigint[]) \
        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = idx.oid) \
      UNION ALL \
      SELECT a.attrelid::bigint, 'column_default'::text AS object_kind, a.attname AS object_name, \
-            CASE WHEN ad.oid IS NOT NULL THEN 'overridden' ELSE 'dropped' END AS object_type \
+            CASE WHEN ad.oid IS NOT NULL THEN 'overridden' ELSE 'dropped' END AS object_type, NULL::text \
      FROM pg_catalog.pg_attribute a \
      JOIN pg_catalog.pg_inherits i ON i.inhrelid = a.attrelid \
      JOIN pg_catalog.pg_attribute pa \
@@ -5804,22 +5835,23 @@ pub fn postgres_table_partition_local_objects_for_relations_sql() -> &'static st
 // compatibility tier can omit only that filter and keep the same batched
 // result shape.
 pub fn postgres_table_partition_local_objects_for_relations_compat_sql() -> &'static str {
-    "SELECT con.conrelid::bigint AS relid, 'constraint'::text AS object_kind, con.conname AS object_name, con.contype::text AS object_type \
+    "SELECT con.conrelid::bigint AS relid, 'constraint'::text AS object_kind, con.conname AS object_name, con.contype::text AS object_type, \
+            CASE WHEN con.contype = 'f' THEN pg_catalog.pg_get_constraintdef(con.oid, true) END AS definition \
      FROM pg_catalog.pg_constraint con \
      WHERE con.conrelid = ANY($1::bigint[]) AND con.contype IN ('p','u','f') \
      UNION ALL \
-     SELECT con.conrelid::bigint, 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type \
+     SELECT con.conrelid::bigint, 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type, NULL::text \
      FROM pg_catalog.pg_constraint con \
      WHERE con.conrelid = ANY($1::bigint[]) AND con.contype = 'c' AND con.conislocal \
      UNION ALL \
-     SELECT ix.indrelid::bigint, 'index'::text AS object_kind, idx.relname AS object_name, NULL::text AS object_type \
+     SELECT ix.indrelid::bigint, 'index'::text AS object_kind, idx.relname AS object_name, NULL::text AS object_type, NULL::text \
      FROM pg_catalog.pg_index ix \
      JOIN pg_catalog.pg_class idx ON idx.oid = ix.indexrelid \
      WHERE ix.indrelid = ANY($1::bigint[]) \
        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = idx.oid) \
      UNION ALL \
      SELECT a.attrelid::bigint, 'column_default'::text AS object_kind, a.attname AS object_name, \
-            CASE WHEN ad.oid IS NOT NULL THEN 'overridden' ELSE 'dropped' END AS object_type \
+            CASE WHEN ad.oid IS NOT NULL THEN 'overridden' ELSE 'dropped' END AS object_type, NULL::text \
      FROM pg_catalog.pg_attribute a \
      JOIN pg_catalog.pg_inherits i ON i.inhrelid = a.attrelid \
      JOIN pg_catalog.pg_attribute pa \
@@ -6244,6 +6276,28 @@ fn postgres_table_partition_info_compat_sql() -> &'static str {
      LIMIT 1"
 }
 
+/// Redshift (PostgreSQL 8.0.2) lacks `pg_foreign_table`/`pg_foreign_server`
+/// (PostgreSQL 9.1+), so the pre-10 compat query still fails there. Keep the
+/// same column shape with NULL foreign-table fields (issue #13293).
+fn postgres_table_partition_info_legacy_sql() -> &'static str {
+    "SELECT NULL::text AS parent_schema, NULL::text AS parent_table, NULL::text AS partition_bound, \
+            NULL::text AS partition_key, \
+            NULL::text AS foreign_server, \
+            NULL::text[] AS foreign_options \
+     FROM pg_catalog.pg_class c \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','f') \
+     LIMIT 1"
+}
+
+fn postgres_table_partition_info_query_tiers() -> [&'static str; 3] {
+    [
+        postgres_table_partition_info_sql(),
+        postgres_table_partition_info_compat_sql(),
+        postgres_table_partition_info_legacy_sql(),
+    ]
+}
+
 fn postgres_table_inherits_parents_sql() -> &'static str {
     // Traditional-inheritance parents only: a declarative partition child
     // is also a `pg_inherits` row, but its parent has relkind 'p', which we
@@ -6575,6 +6629,38 @@ fn redshift_routine_objects_sql() -> &'static str {
        AND schema_name = $1 \
        AND function_type IN ('STORED PROCEDURE', 'REGULAR FUNCTION') \
      ORDER BY sort_order, object_name"
+}
+
+/// Source of a Redshift stored procedure.
+///
+/// Redshift's `pg_proc` is the PostgreSQL 8.0 catalog: it has no `prokind`
+/// (PostgreSQL 11) and no `pg_get_functiondef` (PostgreSQL 8.4). The routine
+/// kind is exposed by the Redshift-only `pg_proc_info` view, and a stored
+/// procedure's complete `CREATE [OR REPLACE] PROCEDURE` text is stored in
+/// `pg_proc.prosrc`, so it is read directly (issue #13293). The signature from
+/// `svv_redshift_functions` only orders same-named procedures; it is not a
+/// filter so a formatting difference can never hide the only match.
+pub fn redshift_procedure_source_sql(schema: &str, name: &str, signature: Option<&str>) -> String {
+    let signature_order = signature
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            format!(
+                "CASE WHEN pg_catalog.oidvectortypes(p.proargtypes) = {} THEN 0 ELSE 1 END, ",
+                pg_quote_literal(value)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "SELECT p.prosrc \
+         FROM pg_catalog.pg_proc p \
+         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+         JOIN pg_catalog.pg_proc_info pi ON pi.prooid = p.oid \
+         WHERE n.nspname = {} AND p.proname = {} AND pi.prokind = 'p' \
+         ORDER BY {signature_order}p.oid LIMIT 1",
+        pg_quote_literal(schema),
+        pg_quote_literal(name)
+    )
 }
 
 /// SQL for listing user-defined types in one schema.
@@ -7896,6 +7982,11 @@ fn build_custom_type_ddl(
                 warnings: all,
             }
         }
+        CustomTypeKind::Object | CustomTypeKind::Collection | CustomTypeKind::Other => CustomTypeDdl {
+            sql: String::new(),
+            complete: false,
+            warnings: vec!["Not a PostgreSQL custom type category".to_string()],
+        },
     }
 }
 
@@ -7970,6 +8061,9 @@ pub async fn get_custom_type_details(pool: &Pool, schema: &str, name: &str) -> R
             warnings.extend(custom_type_range_attributes(client, info.oid, true, &mut properties).await);
         }
         CustomTypeKind::Base => {}
+        CustomTypeKind::Object | CustomTypeKind::Collection | CustomTypeKind::Other => {
+            return Err("not a PostgreSQL custom type category".to_string());
+        }
     }
 
     let ddl = build_custom_type_ddl(schema, name, kind, &info, &members, &properties, &warnings);
@@ -7981,6 +8075,7 @@ pub async fn get_custom_type_details(pool: &Pool, schema: &str, name: &str) -> R
         members,
         properties,
         ddl: Some(ddl),
+        oracle_metadata: None,
     })
 }
 
@@ -8814,7 +8909,9 @@ fn postgres_query_body_dml(body: &SetExpr) -> Option<&Statement> {
 /// retrieval path. DML without `RETURNING` needs `execute` for its command
 /// tag/affected-row count, while DML with `RETURNING` produces a result set.
 pub fn postgres_statement_returns_rows(sql: &str) -> bool {
-    if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "EXPLAIN", "TABLE"]) {
+    // FETCH returns a cursor result set (including column metadata when empty),
+    // unlike MOVE, which only reports the number of cursor rows skipped.
+    if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "EXPLAIN", "TABLE", "FETCH"]) {
         return true;
     }
 
@@ -8872,6 +8969,7 @@ pub async fn execute_query_with_max_rows(
             QueryResult {
                 columns: vec![],
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: Vec::new(),
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -9712,6 +9810,7 @@ async fn execute_query_with_max_rows_inner(
         affected.map_err(pg_error_to_string).map(|affected| QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -9965,6 +10064,7 @@ async fn list_indexes_with_sql(
             let all_key_options: Vec<i16> = row.try_get::<_, Vec<i16>>(11).unwrap_or_default();
             let key_options = if all_key_options.len() == split_at { all_key_options } else { Vec::new() };
             IndexInfo {
+                owner: None,
                 key_directions: Vec::new(),
                 visibility: None,
                 key_metadata_complete: false,
@@ -10290,6 +10390,7 @@ pub async fn list_triggers(pool: &Pool, schema: &str, table: &str) -> Result<Vec
             valid: None,
             comment: None,
             created_at: None,
+            oracle_metadata: None,
             statement: None,
         })
         .collect())
@@ -12467,6 +12568,82 @@ mod tests {
         assert!(!postgres_requires_single_schema_search_path(
             "ERROR: syntax error at or near \"$\" in context \"SELECT * FROM t WHERE id = $1\", at line 1"
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL database"]
+    async fn live_postgres_cursor_fetch_returns_result_sets() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect");
+        let client = pool.get().await.expect("checkout pinned session");
+        client
+            .batch_execute(
+                "CREATE OR REPLACE PROCEDURE pg_temp.open_test_cursors(INOUT c1 refcursor, INOUT c2 refcursor) \
+             LANGUAGE plpgsql AS $$ BEGIN \
+             OPEN c1 FOR SELECT 42::integer AS id, 'cursor value'::text AS label; \
+             OPEN c2 FOR SELECT 7::integer AS id WHERE false; END $$;",
+            )
+            .await
+            .expect("create session-local procedure");
+
+        // Exercise cached prepared, unnamed, and text-protocol execution on
+        // one pinned session, as required by transaction-scoped refcursors.
+        for (prefer_text, unnamed) in [(false, false), (false, true), (true, false)] {
+            client.batch_execute("BEGIN; CALL pg_temp.open_test_cursors('c1', 'c2')").await.expect("open cursors");
+            let result = execute_query_with_max_rows_inner(
+                &client,
+                "FETCH ALL FROM \"c1\"",
+                Some(100),
+                prefer_text,
+                None,
+                unnamed,
+            )
+            .await
+            .expect("fetch rows");
+            assert_eq!(result.columns, vec!["id", "label"]);
+            let expected_id = if prefer_text { serde_json::json!("42") } else { serde_json::json!(42) };
+            assert_eq!(
+                result.rows,
+                vec![vec![expected_id, serde_json::json!("cursor value")]],
+                "text={prefer_text}, unnamed={unnamed}"
+            );
+
+            for sql in ["FETCH ALL FROM c1", "FETCH ALL FROM c2"] {
+                let empty = execute_query_with_max_rows_inner(&client, sql, Some(100), prefer_text, None, unnamed)
+                    .await
+                    .expect("fetch empty cursor");
+                assert!(!empty.columns.is_empty(), "empty FETCH must retain column metadata: {sql}");
+                assert!(empty.rows.is_empty());
+            }
+            client.batch_execute("ROLLBACK").await.expect("rollback");
+        }
+    }
+
+    #[test]
+    fn postgres_statement_returns_rows_for_cursor_fetch() {
+        for sql in [
+            "FETCH ALL FROM \"c1\"",
+            "fetch next from c1",
+            "FETCH FORWARD 10 FROM c1",
+            "FETCH BACKWARD ALL IN c1",
+            "FETCH ABSOLUTE 2 FROM c1",
+            "FETCH RELATIVE -1 FROM c1",
+            "FETCH FIRST FROM c1",
+            "FETCH LAST FROM c1",
+            "FETCH 0 FROM c1",
+            "-- read a refcursor\n/* result set */ FETCH ALL FROM c1",
+        ] {
+            assert!(postgres_statement_returns_rows(sql), "expected cursor rows for: {sql}");
+        }
+        for sql in [
+            "MOVE ALL FROM c1",
+            "DECLARE c1 CURSOR FOR SELECT 1",
+            "CLOSE c1",
+            "FETCHING c1",
+            "DO $$ BEGIN FETCH c1 INTO value; END $$",
+        ] {
+            assert!(!postgres_statement_returns_rows(sql), "expected command result for: {sql}");
+        }
     }
 
     #[test]
@@ -16282,6 +16459,51 @@ mod tests {
     }
 
     #[test]
+    fn redshift_procedure_source_uses_proc_info_and_prosrc() {
+        let sql = redshift_procedure_source_sql("tenant's", "load_orders", None);
+        assert!(sql.contains("SELECT p.prosrc"));
+        assert!(sql.contains("JOIN pg_catalog.pg_proc_info pi ON pi.prooid = p.oid"));
+        assert!(sql.contains("pi.prokind = 'p'"));
+        assert!(sql.contains("n.nspname = 'tenant''s'"));
+        assert!(sql.contains("p.proname = 'load_orders'"));
+        // Redshift's pg_proc is the 8.0 catalog; these would fail there.
+        assert!(!sql.contains("pg_get_functiondef"));
+        assert!(!sql.contains("p.prokind"));
+    }
+
+    #[test]
+    fn redshift_procedure_source_orders_by_signature_without_filtering() {
+        let sql = redshift_procedure_source_sql("public", "load_orders", Some("integer, character varying"));
+        assert!(sql.contains(
+            "CASE WHEN pg_catalog.oidvectortypes(p.proargtypes) = 'integer, character varying' THEN 0 ELSE 1 END, p.oid"
+        ));
+        assert!(!sql.contains("AND pg_catalog.oidvectortypes"));
+        let without_signature = redshift_procedure_source_sql("public", "load_orders", None);
+        assert!(without_signature.contains("ORDER BY p.oid LIMIT 1"));
+        assert!(!without_signature.contains("CASE WHEN"));
+    }
+
+    #[test]
+    fn partition_query_tiers_fall_back_without_foreign_catalogs() {
+        let tree = postgres_partition_tree_query_tiers();
+        assert!(tree[0].contains("pg_catalog.pg_foreign_table"));
+        assert!(tree[1].contains("pg_catalog.pg_foreign_table"));
+        assert!(!tree[2].contains("pg_foreign_table"));
+        assert!(!tree[2].contains("pg_foreign_server"));
+        assert!(!tree[2].contains("relispartition"));
+        assert!(!tree[2].contains("pg_get_partkeydef"));
+        assert!(tree[2].contains("NULL::text[] AS foreign_options"));
+
+        let info = postgres_table_partition_info_query_tiers();
+        assert!(info[1].contains("pg_catalog.pg_foreign_table"));
+        assert!(!info[2].contains("pg_foreign_table"));
+        assert!(!info[2].contains("pg_foreign_server"));
+        assert!(!info[2].contains("relispartition"));
+        assert!(!info[2].contains("pg_get_expr"));
+        assert!(info[2].contains("NULL::text[] AS foreign_options"));
+    }
+
+    #[test]
     fn redshift_relation_objects_sql_avoids_unsupported_postgres_helpers() {
         let sql = list_objects_sql(false, false, false, false, true, false, false, false);
         assert!(sql.contains("pg_catalog.pg_class"));
@@ -16315,6 +16537,7 @@ mod tests {
                 "character_maximum_length".to_string(),
             ],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),

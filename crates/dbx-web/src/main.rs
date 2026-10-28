@@ -791,6 +791,7 @@ async fn serve() -> Result<(), String> {
         .route("/schema/mysql/auto-increment", get(routes::schema::get_mysql_table_auto_increment))
         .route("/schema/schemas", get(routes::schema::list_schemas))
         .route("/schema/tables", get(routes::schema::list_tables))
+        .route("/schema/table-comment", get(routes::schema::get_table_comment))
         .route("/schema/objects", get(routes::schema::list_objects))
         .route("/schema/object-statistics", get(routes::schema::list_object_statistics))
         .route("/schema/completion-objects", get(routes::schema::list_completion_objects))
@@ -798,6 +799,21 @@ async fn serve() -> Result<(), String> {
         .route("/schema/object-source", get(routes::schema::get_object_source))
         .route("/schema/event-info", get(routes::schema::get_event_info))
         .route("/schema/custom-type-details", get(routes::schema::get_custom_type_details))
+        .route("/schema/native-jobs/context", post(routes::native_jobs::open_context))
+        .route("/schema/native-jobs/list", post(routes::native_jobs::list))
+        .route("/schema/native-jobs/references", post(routes::native_jobs::references))
+        .route("/schema/native-jobs/read", post(routes::native_jobs::read))
+        .route("/schema/native-jobs/prepare", post(routes::native_jobs::prepare))
+        .route("/schema/native-jobs/apply", post(routes::native_jobs::apply))
+        .route("/schema/native-jobs/status", post(routes::native_jobs::status))
+        .route("/schema/native-jobs/cancel", post(routes::native_jobs::cancel))
+        .route("/schema/oracle-type-data", post(routes::schema::verify_oracle_type_data))
+        .route("/schema/oracle-type-evolution", post(routes::schema::prepare_oracle_type_evolution))
+        .route(
+            "/schema/oracle-type-management-snapshot",
+            get(routes::schema::get_oracle_type_management_snapshot)
+                .post(routes::schema::read_oracle_type_management_snapshot),
+        )
         .route("/schema/columns", get(routes::schema::list_columns))
         .route("/plugin/table-metadata", post(routes::schema::get_plugin_table_metadata))
         .route("/schema/all-columns", get(routes::schema::get_all_columns))
@@ -854,6 +870,7 @@ async fn serve() -> Result<(), String> {
         .route("/tab-runtime-cache/prune", post(routes::tab_runtime_cache::prune_tab_runtime_cache))
         .route("/tab-runtime-cache/owner", delete(routes::tab_runtime_cache::delete_tab_runtime_cache_owner))
         // Query
+        .merge(routes::pl_debug::router())
         .route("/query/execute", post(routes::query::execute_query))
         .route("/query/execute-conditional-update", post(routes::query::execute_conditional_update))
         .route("/query/execute-multi", post(routes::query::execute_multi))
@@ -899,6 +916,7 @@ async fn serve() -> Result<(), String> {
         .route("/query/build-drop-schema-sql", post(routes::query::build_drop_schema_sql))
         .route("/query/build-duplicate-table-structure-sql", post(routes::query::build_duplicate_table_structure_sql))
         .route("/query/build-copy-table-data-sql", post(routes::query::build_copy_table_data_sql))
+        .route("/query/build-oracle-type-management-sql", post(routes::query::build_oracle_type_management_sql))
         .route(
             "/query/build-executable-object-source-statements",
             post(routes::query::build_executable_object_source_statements),
@@ -907,6 +925,7 @@ async fn serve() -> Result<(), String> {
             "/query/validate-oracle-executable-object-source",
             post(routes::query::validate_oracle_executable_object_source),
         )
+        .route("/query/prepare-oracle-trigger-sql", post(routes::query::prepare_oracle_trigger_sql))
         .route(
             "/query/fingerprint-oracle-routine-object-source",
             post(routes::query::fingerprint_oracle_routine_object_source),
@@ -1477,6 +1496,14 @@ async fn serve() -> Result<(), String> {
             "/app-settings/mcp-policy",
             get(routes::app_settings::load_mcp_global_policy).put(routes::app_settings::save_mcp_global_policy),
         )
+        .route("/app-settings/mcp-tool-catalog", get(routes::app_settings::load_mcp_tool_catalog))
+        .route("/app-settings/mcp-access-policy", get(routes::app_settings::load_mcp_access_policy))
+        .route("/app-settings/mcp-access-policy/recover", post(routes::app_settings::reset_invalid_mcp_access_policy))
+        .route("/app-settings/mcp-access-policy/plugin-scope", put(routes::app_settings::set_mcp_plugin_scope_rule))
+        .route("/app-settings/plugin-mcp", get(routes::app_settings::list_plugin_mcp_views))
+        .route("/app-settings/plugin-mcp/view", post(routes::app_settings::load_plugin_mcp_view))
+        .route("/app-settings/plugin-mcp/scopes", post(routes::app_settings::list_plugin_mcp_scopes))
+        .route("/app-settings/plugin-mcp/grant", put(routes::app_settings::save_plugin_mcp_grant))
         .route("/app-settings/mcp-http-status", get(routes::app_settings::load_web_mcp_http_status))
         .route("/app-settings/mcp-http", put(routes::app_settings::save_web_mcp_http_settings))
         .route("/app-settings/mcp-http/rotate-token", post(routes::app_settings::rotate_web_mcp_token))

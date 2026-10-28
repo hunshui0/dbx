@@ -23,6 +23,16 @@ const context = {
 };
 
 describe("case-sensitive database objects", () => {
+  it.each(["oracle", "oceanbase-oracle", "dameng"] as const)("preserves schema index identities in both %s layouts", (databaseType) => {
+    const objects: ObjectInfo[] = [{ name: " Ix (a) ", object_type: "INDEX", schema: " Index Owner ", parent_schema: "Table Owner", parent_name: " T(a) " }];
+    const simple = buildSimpleObjectTreeNodes({ ...context, databaseType, objects });
+    const grouped = buildGroupedObjectTreeNodes({ ...context, databaseType, objects }).find((group) => group.type === "group-database-indexes")?.children;
+    for (const nodes of [simple, grouped]) {
+      expect(nodes).toHaveLength(1);
+      expect(nodes?.[0]).toMatchObject({ type: "index", objectScope: "schema", objectName: " Ix (a) ", schema: " Index Owner ", parentSchema: "Table Owner", parentName: " T(a) " });
+    }
+  });
+
   it("publishes each changed partition group once per page while retaining exact identities", () => {
     const current = buildTableTreeNodes({
       ...context,
@@ -738,5 +748,38 @@ describe("tablePageRowAnchorKey", () => {
   it("keeps a partition's parent in the key so same-named child tables stay distinct", () => {
     expect(tablePageRowAnchorKey("p_2024", "app", "orders")).not.toBe(tablePageRowAnchorKey("p_2024", "app", "customers"));
     expect(tablePageRowAnchorKey("p_2024", "app")).not.toBe(tablePageRowAnchorKey("p_2024", "app", "orders"));
+  });
+});
+
+describe("package and package body groups (#13239)", () => {
+  function pkg(type: string, name: string): ObjectInfo {
+    return { name, object_type: type, schema: "app" } as ObjectInfo;
+  }
+
+  it("splits packages and package bodies into separate groups", () => {
+    const nodes = buildGroupedObjectTreeNodes({
+      ...context,
+      objects: [pkg("PACKAGE", "ledger"), pkg("PACKAGE_BODY", "ledger"), pkg("PACKAGE", "reports")],
+      databaseType: "oracle",
+    });
+    const packagesGroup = nodes.find((node) => node.type === "group-packages");
+    const bodiesGroup = nodes.find((node) => node.type === "group-package-bodies");
+    expect(bodiesGroup).toBeDefined();
+    const packageChildren = packagesGroup!.children!.map((node) => node.label);
+    expect(packageChildren).toEqual(["ledger", "reports"]);
+    expect(bodiesGroup!.children!.map((node) => node.label)).toEqual(["ledger"]);
+  });
+
+  it("keeps the body-only package visible inside the bodies group", () => {
+    const nodes = buildGroupedObjectTreeNodes({
+      ...context,
+      objects: [pkg("PACKAGE_BODY", "orphan")],
+      databaseType: "oracle",
+    });
+    const bodiesGroup = nodes.find((node) => node.type === "group-package-bodies");
+    expect(bodiesGroup!.children!.map((node) => node.label)).toEqual(["orphan"]);
+    // Empty groups may be omitted entirely rather than rendered with zero children.
+    const packagesGroup = nodes.find((node) => node.type === "group-packages");
+    expect(!packagesGroup || (packagesGroup.children ?? []).length === 0).toBe(true);
   });
 });

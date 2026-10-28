@@ -159,6 +159,18 @@ pub struct BackendError {
 }
 
 impl BackendError {
+    pub fn from_pl_debug_admission_rejection(message: &str) -> Self {
+        Self::new(
+            catalog_entry(CatalogCode::PlDebugAdmissionRejected),
+            BackendErrorSource::LegacyBackend,
+            BackendErrorOrigin::backend(),
+            BackendOperationOutcome::NotStarted,
+            BTreeMap::new(),
+            bounded_detail(message),
+            None,
+        )
+    }
+
     pub fn from_manual_transaction_failure(
         kind: ManualTransactionFailureKind,
         outcome: TransactionOutcome,
@@ -461,6 +473,7 @@ impl BackendError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CatalogCode {
+    PlDebugAdmissionRejected,
     ConnectionFailed,
     ConnectionInterrupted,
     TimeoutNotStarted,
@@ -511,6 +524,15 @@ const NO_PARAMS: &[ParamSpec] = &[];
 
 fn catalog_entry(code: CatalogCode) -> &'static CatalogEntry {
     const ENTRIES: &[(CatalogCode, CatalogEntry)] = &[
+        (
+            CatalogCode::PlDebugAdmissionRejected,
+            CatalogEntry {
+                code: "DBX-PLDEBUG-1001",
+                message_key: "backendErrors.plDebug.admissionRejected",
+                params: NO_PARAMS,
+                help_url: None,
+            },
+        ),
         (
             CatalogCode::TransactionUnsupported,
             CatalogEntry {
@@ -1297,7 +1319,7 @@ mod tests {
             let error = AgentCallError::Structured {
                 rpc_code: -1,
                 message: "safe failure".to_string(),
-                context: context(category, stage, outcome),
+                context: Box::new(context(category, stage, outcome)),
             };
             let envelope = BackendError::from_agent_call_error(&error);
             assert_eq!(envelope.code(), expected_code);
@@ -1403,11 +1425,11 @@ mod tests {
         let error = BackendError::from_agent_call_error(&AgentCallError::Structured {
             rpc_code: -1,
             message: "jdbc:postgresql://host/db?password=secret".to_string(),
-            context: context(
+            context: Box::new(context(
                 AgentErrorCategory::Connection,
                 AgentErrorStage::Request,
                 AgentOperationOutcome::NotStarted,
-            ),
+            )),
         });
         let value = serde_json::to_value(error).unwrap();
         assert_eq!(value["source"], "jdbcAgent");
@@ -1484,11 +1506,11 @@ mod tests {
         let error = BackendError::from_agent_call_error(&AgentCallError::Structured {
             rpc_code: -1,
             message: "connection failed: jdbc:postgresql://alice:url-secret@db.example/app".to_string(),
-            context: context(
+            context: Box::new(context(
                 AgentErrorCategory::Connection,
                 AgentErrorStage::Connect,
                 AgentOperationOutcome::NotStarted,
-            ),
+            )),
         });
 
         assert_eq!(error.detail(), Some("connection failed: jdbc:postgresql://alice:[redacted]@db.example/app"));
@@ -1500,7 +1522,11 @@ mod tests {
         let error = BackendError::from_agent_call_error(&AgentCallError::Structured {
             rpc_code: -1,
             message: message.to_string(),
-            context: context(AgentErrorCategory::Sql, AgentErrorStage::Execute, AgentOperationOutcome::Unknown),
+            context: Box::new(context(
+                AgentErrorCategory::Sql,
+                AgentErrorStage::Execute,
+                AgentOperationOutcome::Unknown,
+            )),
         });
 
         assert_eq!(error.detail(), Some(message));
@@ -1548,7 +1574,7 @@ mod tests {
             let envelope = BackendError::from_agent_call_error(&AgentCallError::Structured {
                 rpc_code: -1,
                 message: "invalid combination".to_string(),
-                context: ctx,
+                context: Box::new(ctx),
             });
             assert_eq!(envelope.code(), "DBX-JDBC-5002");
             assert_eq!(envelope.operation_outcome(), BackendOperationOutcome::Unknown);
@@ -1624,7 +1650,11 @@ mod tests {
         let error = AgentCallError::Structured {
             rpc_code: -1,
             message: "connection lost".to_string(),
-            context: context(AgentErrorCategory::Connection, AgentErrorStage::Execute, AgentOperationOutcome::Unknown),
+            context: Box::new(context(
+                AgentErrorCategory::Connection,
+                AgentErrorStage::Execute,
+                AgentOperationOutcome::Unknown,
+            )),
         };
         let legacy =
             crate::db::agent_driver::append_legacy_error_context(&error.into_legacy_string(), "SQL text omitted");

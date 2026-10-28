@@ -98,7 +98,16 @@ import {
 } from "@/lib/connection/timeoutLimits";
 import { buildOracleTnsConnectionString, normalizeOracleTnsAdminPath, parseOracleTnsConnectionString } from "@/lib/connection/oracleTnsConnection";
 import { applyConnectionDeepLinkUpdate, resolveConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLinkUpdate";
-import { connectionDeepLinkServiceHydrationValue, parseConnectionDeepLink, parseConnectionDeepLinkUpdate, parseServiceConnectionUrl, type ConnectionDeepLinkDraft, type ConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLink";
+import {
+  connectionDeepLinkServiceHydrationValue,
+  parseConnectionDeepLink,
+  parseConnectionDeepLinkUpdate,
+  parseServiceConnectionUrl,
+  shouldAutoConfirmConnectionDeepLink,
+  shouldAutoConfirmConnectionPrefill,
+  type ConnectionDeepLinkDraft,
+  type ConnectionDeepLinkUpdate,
+} from "@/lib/connection/connectionDeepLink";
 import { connectionUrlPlaceholder as getUrlPlaceholder } from "@/lib/connection/connectionPresentation";
 import { parseGaussdbHosts, serializeGaussdbHosts, type GaussdbHostEntry } from "@/lib/connection/gaussdbHosts";
 import { h2ConnectionModeForConfig, h2FileJdbcUrlWithPath, h2FilePathFromJdbcUrl, isH2SplitJdbcUrl, type H2ConnectionMode } from "@/lib/database/h2Connection";
@@ -134,7 +143,7 @@ import { assertCompleteDatabaseCategories, databaseSelectionForCategory } from "
 import { loadConnectionPickerView, saveConnectionPickerView, type DbPickerView } from "@/lib/connection/connectionPickerViewPreference";
 import { buildRocketMqConfig, hydrateRocketMqConfig, isRocketMqConfigValid, rocketMqConnectionTarget } from "@/lib/connection/rocketmqConfig";
 import { normalizeRabbitmqAddresses, parseRabbitmqAddress } from "@/lib/connection/rabbitmqAddresses";
-import { pluginFieldIsRequired, pluginFieldIsVisible } from "@/lib/plugins/pluginFieldConditions";
+import { pluginFieldHasValue as pluginFieldHasValueOf, pluginFieldIsRequired, pluginFieldIsVisible } from "@/lib/plugins/pluginFieldConditions";
 import { detectMqUiAuthKind, isMqAuthKindAllowedForSystem, type MqUiAuthKind } from "@/lib/connection/mqAuth";
 import { driverInstallProgressChannel, driverInstallProgressPercent, isDriverInstallProgressForOperation, requestAgentInstallCancellation, resolveAgentInstallOutcome, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
 import { requiresSqlServerLegacyCompatibilityComponent, setSqlServerLegacyCompatibilityConfig, sqlServerUsesLegacyCompatibility, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
@@ -188,6 +197,8 @@ import { hasCloudflareD1Credentials, isCloudflareD1Connection, normalizeCloudfla
 import { hasSpannerResourcePath, isSpannerConnection, normalizeSpannerConnection } from "@/lib/connection/spannerResourcePath";
 import {
   buildElasticsearchExternalConfig,
+  elasticsearchAuthTypeFromConfig,
+  type ElasticsearchAuthType,
   elasticsearchConnectionModeFromConfig,
   elasticsearchConnectivityCheckDisabledFromConfig,
   elasticsearchConnectivityCheckPathFromConfig,
@@ -491,6 +502,7 @@ function resetCassandraTlsFields(externalConfig: unknown) {
   Object.assign(cassandraTls, cassandraTlsConfigFromExternalConfig(externalConfig));
 }
 
+const elasticsearchAuthType = ref<ElasticsearchAuthType>("basic");
 const elasticsearchConnectionMode = ref<ElasticsearchConnectionMode>("direct");
 const elasticsearchKibanaBasePath = ref("");
 const elasticsearchConnectivityCheckPath = ref("");
@@ -500,7 +512,15 @@ const elasticsearchConnectionPorts = ref<Record<ElasticsearchConnectionMode, num
   direct: 9200,
   kibana: 5601,
 });
+function switchElasticsearchAuthType(authType: ElasticsearchAuthType) {
+  if (authType === elasticsearchAuthType.value) return;
+  elasticsearchAuthType.value = authType;
+  form.value.password = "";
+  resetTestState();
+}
+
 function resetElasticsearchProxyFields(externalConfig?: unknown) {
+  elasticsearchAuthType.value = elasticsearchAuthTypeFromConfig(externalConfig);
   const mode = elasticsearchConnectionModeFromConfig(externalConfig);
   elasticsearchConnectionMode.value = mode;
   elasticsearchKibanaBasePath.value = elasticsearchKibanaBasePathFromConfig(externalConfig);
@@ -3108,6 +3128,9 @@ function applyRequestedPluginProvider(target: PluginCenterFocus | null | undefin
 }
 
 function switchOceanbaseMode(mode: "mysql" | "oracle") {
+  const port = form.value.port;
+  const sourceProfile = oceanbaseSubMode.value === "mysql" ? "oceanbase" : "oceanbase-oracle";
+  const preservePort = port !== driverProfiles[sourceProfile].port;
   oceanbaseSubMode.value = mode;
   if (mode === "mysql") {
     applyProfile("oceanbase", false);
@@ -3115,6 +3138,7 @@ function switchOceanbaseMode(mode: "mysql" | "oracle") {
     applyProfile("oceanbase-oracle", false);
     selectedType.value = "oceanbase";
   }
+  if (preservePort) form.value.port = port;
   resetTestState();
 }
 
@@ -3128,6 +3152,12 @@ function switchGbaseProfile(profile: GbaseProfile) {
 
 let applyingConnectionUpdate = false;
 let appliedConnectionUpdate: ConnectionDeepLinkUpdate | null = null;
+
+/**
+ * 免确认保存的去重键。必须早于下面这个 `immediate` watcher 声明——更新链接的
+ * 自动保存就在该 watcher 里触发，晚声明会命中 TDZ。
+ */
+const submittedAutoCreatePrefillKey = ref<string | null>(null);
 
 function finishApplyingConnectionUpdate() {
   void nextTick(() => {
@@ -3320,7 +3350,10 @@ watch(
       customDriverName.value = isCustomCompatibleProfile() ? config.driver_label || "" : "";
       dialogStep.value = "config";
       configTab.value = initialConfigTab();
-      if (props.updatePrefill) finishApplyingConnectionUpdate();
+      if (props.updatePrefill) {
+        finishApplyingConnectionUpdate();
+        submitUpdateIfAutoConfirmed(props.updatePrefill);
+      }
       // Form/profile watchers normalize derived fields in this flush. Capture
       // the saved baseline afterwards so those initial changes are not treated
       // as user edits that invalidate persisted database metadata.
@@ -4397,8 +4430,7 @@ function pluginFieldValue(field: PluginFormField): PluginFormFieldValue {
 }
 
 function pluginFieldHasValue(field: PluginFormField): boolean {
-  const value = pluginFieldValue(field);
-  return typeof value === "string" ? value.trim().length > 0 : value !== undefined;
+  return pluginFieldHasValueOf(field, pluginFieldValue(field));
 }
 
 function pluginFieldValueByKey(key: string): PluginFormFieldValue {
@@ -4893,6 +4925,7 @@ function connectionConfigForSshTunnelTest(id: string): ConnectionConfig {
 
 function connectionConfigForSubmit(id: string, generatedName = "", validatePluginRequired = true): ConnectionConfig {
   let config: LegacyConnectionConfig;
+  let preserveExistingShowDatabaseLinks = false;
   if (isPluginConnection.value) {
     const entry = selectedPluginProvider.value;
     if (!entry) throw new Error(pluginLoadError.value || t("connection.pluginProviderUnavailable"));
@@ -5219,7 +5252,11 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
       config.external_config = { ...existing, auth };
     }
   } else if (config.db_type === "elasticsearch") {
-    config.external_config = buildElasticsearchExternalConfig(elasticsearchConnectionMode.value, elasticsearchKibanaBasePath.value, elasticsearchConnectivityCheckPath.value, elasticsearchIndexGroupingPattern.value, elasticsearchConnectivityCheckDisabled.value);
+    config.external_config = buildElasticsearchExternalConfig(elasticsearchConnectionMode.value, elasticsearchKibanaBasePath.value, elasticsearchConnectivityCheckPath.value, elasticsearchIndexGroupingPattern.value, elasticsearchConnectivityCheckDisabled.value, elasticsearchAuthType.value);
+    if (elasticsearchAuthType.value === "apiKey") {
+      config.username = "";
+      config.password = config.password.trim();
+    }
   } else if (config.db_type === "meilisearch") {
     config.username = "";
     config.password = config.password.trim();
@@ -5466,8 +5503,18 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
         config.connection_string = config.connection_string?.trim() || JDBCX_DEFAULT_URL;
         config.jdbc_driver_class = config.jdbc_driver_class?.trim() || JDBCX_JDBC_DRIVER_CLASS;
       } else {
-        config.host = "";
-        config.port = 0;
+        const keepsExistingTarget = editingId.value === id && props.editConfig?.id === id && config.db_type === props.editConfig.db_type && config.driver_profile === props.editConfig.driver_profile && config.connection_string === props.editConfig.connection_string;
+        if (!keepsExistingTarget) {
+          config.host = "";
+          config.port = 0;
+        } else if (props.editConfig.production_badge_scope == null && config.production_badge_scope === sidebarProductionBadgeScope(props.editConfig)) {
+          config.production_badge_scope = undefined;
+        }
+        preserveExistingShowDatabaseLinks = keepsExistingTarget && !supportsOracleDatabaseLinks(config.db_type);
+        if (preserveExistingShowDatabaseLinks) {
+          // Generic JDBC has no DB-link toggle; retain the saved target setting.
+          config.show_database_links = props.editConfig?.show_database_links;
+        }
         config.connection_string = config.connection_string?.trim() || "";
       }
     } else if (config.db_type === "prestosql") {
@@ -5541,7 +5588,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.visible_databases = Array.isArray(config.visible_databases) && config.visible_databases.length > 0 ? config.visible_databases : undefined;
   }
   if (!config.show_system_schemas) config.show_system_schemas = undefined;
-  if (config.show_database_links !== false) config.show_database_links = undefined;
+  if (config.show_database_links !== false && !preserveExistingShowDatabaseLinks) config.show_database_links = undefined;
   if (!config.sidebar_auto_load_all_tables) config.sidebar_auto_load_all_tables = undefined;
   if (config.visible_schemas && Object.keys(config.visible_schemas).length === 0) config.visible_schemas = undefined;
   if (config.agent_java_options && config.agent_java_options.length === 0) config.agent_java_options = undefined;
@@ -6357,9 +6404,7 @@ function resetForm(options: { preservePickerState?: boolean } = {}) {
   resetTestState();
 }
 
-const submittedOneTimePrefillKey = ref<string | null>(null);
-
-function oneTimePrefillKey(draft: ConnectionDeepLinkDraft) {
+function prefillDraftKey(draft: ConnectionDeepLinkDraft) {
   return JSON.stringify([
     draft.name,
     draft.dbType,
@@ -6380,11 +6425,31 @@ function oneTimePrefillKey(draft: ConnectionDeepLinkDraft) {
   ]);
 }
 
-function submitOneTimePrefill(draft: ConnectionDeepLinkDraft) {
-  if (!draft.oneTime) return;
-  const key = oneTimePrefillKey(draft);
-  if (submittedOneTimePrefillKey.value === key) return;
-  submittedOneTimePrefillKey.value = key;
+/**
+ * 免确认保存连接深链。
+ *
+ * `one_time` 临时连接一直是自动提交的；设置项 `deepLinkConnectionConfirmMode`
+ * 打开对应形态后，新建（`create`）与带 `id` 的更新（`update`）链接也走同一条路径：
+ * 弹窗完成预填后立刻保存，用户不需要再点确认。
+ *
+ * 仍然复用弹窗自己的 `save()`，因此驱动安装、URL 解析、校验等逻辑与手动保存完全一致；
+ * 一旦校验失败，`save()` 返回 false 且弹窗保持打开，用户可以继续手动补全。
+ */
+function submitPrefillIfAutoConfirmed(draft: ConnectionDeepLinkDraft) {
+  if (!shouldAutoConfirmConnectionPrefill(draft, settingsStore.editorSettings.deepLinkConnectionConfirmMode)) return;
+  const key = prefillDraftKey(draft);
+  if (submittedAutoCreatePrefillKey.value === key) return;
+  submittedAutoCreatePrefillKey.value = key;
+  void nextTick(() => save());
+}
+
+/** 带 `id` 的更新链接：预填完成后按设置决定是否直接保存。 */
+function submitUpdateIfAutoConfirmed(update: ConnectionDeepLinkUpdate) {
+  if (!shouldAutoConfirmConnectionDeepLink("update", settingsStore.editorSettings.deepLinkConnectionConfirmMode)) return;
+  const key = `update:${update.connectionId}:${JSON.stringify(update.patch)}`;
+  if (submittedAutoCreatePrefillKey.value === key) return;
+  submittedAutoCreatePrefillKey.value = key;
+  // 让表单 watcher 先跑完一轮派生字段归一化，再按当前表单内容保存。
   void nextTick(() => save());
 }
 
@@ -6454,7 +6519,7 @@ function applyConnectionDraftToForm(draft: ConnectionDeepLinkDraft) {
 function applyConnectionPrefill(draft: ConnectionDeepLinkDraft) {
   resetForm();
   applyConnectionDraftToForm(draft);
-  submitOneTimePrefill(draft);
+  submitPrefillIfAutoConfirmed(draft);
 }
 
 watch(
@@ -6462,7 +6527,7 @@ watch(
   (value) => {
     if (!value) {
       const draftId = editingId.value ? null : draftTestConnectionId.value;
-      submittedOneTimePrefillKey.value = null;
+      submittedAutoCreatePrefillKey.value = null;
       resetForm();
       if (draftId) {
         void api.disconnectDb(draftId).catch(() => undefined);
@@ -6767,7 +6832,7 @@ function validateTransportLayers(config: LegacyConnectionConfig) {
       const localPortState = sshLocalPortState(layer.local_port);
       if (localPortState === "invalid") throw new Error(t("connection.sshHopInvalidLocalPort", { hop: label }));
       if (localPortState === "valid" && index !== lastEnabledIndex) throw new Error(t("connection.sshHopLocalPortNotLast", { hop: label }));
-      if (localPortState === "valid" && !sshLocalPortSupportedForConnection(config, mqSystemKind.value)) throw new Error(t("connection.sshHopLocalPortUnsupported", { hop: label }));
+      if (localPortState === "valid" && !sshLocalPortSupportedForConnection(config, mqSystemKind.value, selectedPluginProvider.value?.contribution.proxy_route)) throw new Error(t("connection.sshHopLocalPortUnsupported", { hop: label }));
     }
   });
 }
@@ -9466,14 +9531,22 @@ function openExternalUrl(url: string) {
                       <Input v-model="form.informix_server" class="col-span-3" placeholder="ol_informix1170" />
                     </div>
 
-                    <div v-if="form.db_type !== 'meilisearch' && form.db_type !== 'spanner'" class="grid grid-cols-4 items-center gap-4">
+                    <div v-if="form.db_type === 'elasticsearch'" class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.mqAuth") }}</Label>
+                      <div class="col-span-3 flex items-center gap-2">
+                        <Button type="button" size="sm" :variant="elasticsearchAuthType === 'basic' ? 'default' : 'outline'" :aria-pressed="elasticsearchAuthType === 'basic'" @click="switchElasticsearchAuthType('basic')">{{ t("connection.mqAuthBasic") }}</Button>
+                        <Button type="button" size="sm" :variant="elasticsearchAuthType === 'apiKey' ? 'default' : 'outline'" :aria-pressed="elasticsearchAuthType === 'apiKey'" @click="switchElasticsearchAuthType('apiKey')">{{ t("connection.mqAuthApiKey") }}</Button>
+                      </div>
+                    </div>
+
+                    <div v-if="form.db_type !== 'meilisearch' && form.db_type !== 'spanner' && !(form.db_type === 'elasticsearch' && elasticsearchAuthType === 'apiKey')" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>
                       <Input v-model="form.username" class="col-span-3" />
                     </div>
 
                     <div v-if="form.db_type !== 'spanner'" class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">{{ form.db_type === "meilisearch" ? t("connection.mqAuthApiKey") : t("connection.password") }}</Label>
-                      <PasswordInput :show-toggle="!editingId" v-model="form.password" class="col-span-3" />
+                      <Label :class="connectionLabelClass">{{ form.db_type === "meilisearch" || (form.db_type === "elasticsearch" && elasticsearchAuthType === "apiKey") ? t("connection.mqAuthApiKey") : t("connection.password") }}</Label>
+                      <PasswordInput :show-toggle="!editingId" v-model="form.password" class="col-span-3" :placeholder="form.db_type === 'elasticsearch' && elasticsearchAuthType === 'apiKey' ? 'Base64(id:api_key)' : undefined" />
                     </div>
 
                     <SavePasswordCheckbox v-if="form.db_type !== 'spanner'" v-model="form.save_password" />

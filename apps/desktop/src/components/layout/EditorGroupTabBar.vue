@@ -41,6 +41,7 @@ import {
   ChevronsUpDown,
   Clock3,
   Copy,
+  Crosshair,
   Database,
   FoldHorizontal,
   ListFilter,
@@ -118,6 +119,7 @@ import {
   tabIconClass,
   tabTooltipLines,
 } from "@/lib/tabs/tabPresentation";
+import { queryTabExternalFilePath } from "@/lib/sql/sqlFileOpen";
 import { activeTabSidebarTarget } from "@/lib/sidebar/sidebarActiveTabTarget";
 import "./appTabBar.css";
 import type { QueryTab } from "@/types/database";
@@ -142,6 +144,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   "activate-tab": [tabId: string];
   "locate-tab": [tab: QueryTab];
+  "locate-sql-file": [tab: QueryTab];
+  "locate-sql-library-file": [tab: QueryTab];
   "toggle-zen-mode": [];
   "start-resize": [event: PointerEvent];
   "toggle-collapse": [];
@@ -285,7 +289,9 @@ const hasHorizontalFixedRows = computed(() => !isVerticalLayout.value && !isTwoR
 const tabBarClass = computed(() => [
   isClassicLayout.value ? "classic-tab-layout" : "separated-tab-layout",
   isVerticalLayout.value
-    ? `vertical-tab-layout h-full w-60 flex-col bg-background ${settingsStore.editorSettings.tabPlacement === "right" ? "border-l" : "border-r"}`
+    ? // Same rail tone as the classic top bar (issue #13236): a background-colored
+      // rail made active and inactive pills hard to tell apart.
+      `vertical-tab-layout h-full w-60 flex-col bg-muted ${settingsStore.editorSettings.tabPlacement === "right" ? "border-l" : "border-r"}`
     : isClassicLayout.value
       ? "bg-muted"
       : `bg-background ${settingsStore.editorSettings.tabPlacement === "bottom" ? "border-t" : "border-b"}`,
@@ -493,6 +499,8 @@ function databaseTabGroupKey(tab: QueryTab) {
 }
 
 function tabGroupKey(tab: QueryTab) {
+  // Standalone plugin pages must not share the unbound SQL tabs' empty key.
+  if (isConnectionlessPluginTab(tab)) return "connectionless:plugin";
   const connection = connectionStore.getConfig(tab.connectionId);
   if (settingsStore.editorSettings.tabGroupMode === "sidebar") return tab.connectionId;
   if (settingsStore.editorSettings.tabGroupMode === "connection") return tab.connectionId;
@@ -609,6 +617,7 @@ const editingTabGroupColor = ref("");
 const editingTabGroupFallbackColor = ref(tabGroupPalette[0]!);
 
 function tabGroupDefaultLabel(tab: QueryTab) {
+  if (!tab.connectionId) return t(isConnectionlessPluginTab(tab) ? "tabs.pluginTabs" : "tabs.ungroupedTabs");
   const connection = connectionStore.getConfig(tab.connectionId);
   if (settingsStore.editorSettings.tabGroupMode === "sidebar") return tabConnectionLabel(tab);
   if (settingsStore.editorSettings.tabGroupMode === "connection") return connection?.name || tab.connectionId;
@@ -1185,9 +1194,7 @@ const twoRowGroupItems = computed<TwoRowGroupItem[]>(() => {
     const tab = tabs[0]!;
     return {
       key,
-      // An unlabeled cluster is usually connectionless plugin tabs: a lone one
-      // names itself, several of them read better as "Plugins" than "Ungrouped".
-      label: tabGroupLabel(tab) || (tabs.length === 1 ? tabTitleText(tab) : tabs.every(isConnectionlessPluginTab) ? t("tabs.pluginTabs") : t("tabs.ungroupedTabs")),
+      label: tabGroupLabel(tab) || (tabs.length === 1 ? tabTitleText(tab) : t("tabs.ungroupedTabs")),
       count: tabs.length,
       tab,
       tabIds: tabs.map((item) => item.id),
@@ -1377,6 +1384,12 @@ function closeTabTooltip(tabId: string) {
 
 function isConnectionlessPluginTab(tab: QueryTab): boolean {
   return (tab.mode === "plugin-workbench" || tab.mode === "plugin-filesystem") && !tab.connectionId;
+}
+
+function isPluginTabGroup(tab: QueryTab): boolean {
+  const connection = connectionStore.getConfig(tab.connectionId);
+  // A plugin page can also belong to a regular database connection.
+  return connection ? connection.db_type === "plugin" : tab.mode === "plugin-workbench" || tab.mode === "plugin-filesystem";
 }
 
 /**
@@ -1687,6 +1700,18 @@ function getTabMenuItems(tab: QueryTab): ContextMenuItem[] {
       visible: !!activeTabSidebarTarget(tab),
       onLocate: () => emit("locate-tab", tab),
     }),
+    {
+      label: t("sidebar.locateSqlFile"),
+      icon: Crosshair,
+      visible: !!queryTabExternalFilePath(tab),
+      action: () => emit("locate-sql-file", tab),
+    },
+    {
+      label: t("sqlFileTree.locateActiveFile"),
+      icon: Crosshair,
+      visible: !!tab.savedSqlId,
+      action: () => emit("locate-sql-library-file", tab),
+    },
     { label: "", separator: true },
     createPinTabMenuItem({
       label: tab.pinned ? t("contextMenu.unpinTab") : t("contextMenu.pinTab"),
@@ -2133,7 +2158,8 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
             >
               <span class="tab-group-header-content">
                 <span class="tab-group-marker" aria-hidden="true" />
-                <ConnectionIcon v-if="group.key && settingsStore.editorSettings.tabGroupMode === 'sidebar'" :connection="connectionStore.getConfig(group.tab.connectionId)" class="tab-group-database-icon" aria-hidden="true" />
+                <PlugZap v-if="isPluginTabGroup(group.tab)" class="tab-group-database-icon text-violet-600 dark:text-violet-400" aria-hidden="true" />
+                <ConnectionIcon v-else-if="group.key && settingsStore.editorSettings.tabGroupMode === 'sidebar'" :connection="connectionStore.getConfig(group.tab.connectionId)" class="tab-group-database-icon" aria-hidden="true" />
                 <DatabaseIcon v-else :db-type="tabDatabaseIconType(group.tab)" class="tab-group-database-icon" aria-hidden="true" />
                 <span class="tab-group-label">{{ group.label }}</span>
                 <span class="tab-group-count">{{ group.count }}</span>
@@ -2251,7 +2277,8 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
                         <span class="tab-group-marker" aria-hidden="true" />
                         <Pin v-if="entry.pinned" class="tab-group-pin" aria-hidden="true" />
                         <ChevronDown class="tab-group-chevron" :class="{ 'tab-group-chevron--collapsed': isGroupCollapsed(entry.groupId) }" aria-hidden="true" />
-                        <ConnectionIcon v-if="entry.level === 'connection' && settingsStore.editorSettings.tabGroupMode === 'sidebar'" :connection="connectionStore.getConfig(entry.tab.connectionId)" class="tab-group-database-icon tab-group-connection-icon" aria-hidden="true" />
+                        <PlugZap v-if="entry.level === 'connection' && isPluginTabGroup(entry.tab)" class="tab-group-database-icon tab-group-connection-icon text-violet-600 dark:text-violet-400" aria-hidden="true" />
+                        <ConnectionIcon v-else-if="entry.level === 'connection' && settingsStore.editorSettings.tabGroupMode === 'sidebar'" :connection="connectionStore.getConfig(entry.tab.connectionId)" class="tab-group-database-icon tab-group-connection-icon" aria-hidden="true" />
                         <DatabaseIcon v-else-if="entry.level === 'connection'" :db-type="tabDatabaseIconType(entry.tab)" class="tab-group-database-icon tab-group-connection-icon" aria-hidden="true" />
                         <Database v-else class="tab-group-database-icon tab-group-library-icon text-yellow-500" aria-hidden="true" />
                         <span class="tab-group-label">{{ entry.label }}</span>
@@ -2350,10 +2377,10 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
                         <TooltipContent v-if="isConnectionlessPluginTab(entry.tab)" :side="tabTooltipSide" data-plugin-title-tooltip>
                           {{ tabTitleText(entry.tab) }}
                         </TooltipContent>
-                        <TooltipContent v-else :side="tabTooltipSide" class="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-x-2 text-xs">
+                        <TooltipContent v-else :side="tabTooltipSide" surface="popover" class="grid w-max min-w-40 max-w-[min(28rem,calc(100vw-24px))] grid-cols-[auto_minmax(0,1fr)] items-start gap-x-2 gap-y-1 p-2 text-xs leading-5">
                           <template v-for="line in tabTooltipLines(entry.tab, t)" :key="line.label">
-                            <span class="whitespace-nowrap font-medium opacity-70">{{ line.label }}</span>
-                            <span class="min-w-0 break-all">{{ line.value }}</span>
+                            <span class="whitespace-nowrap text-muted-foreground">{{ line.label }}</span>
+                            <span class="min-w-0 whitespace-pre-wrap break-all font-mono text-foreground/90">{{ line.value }}</span>
                           </template>
                         </TooltipContent>
                       </Tooltip>

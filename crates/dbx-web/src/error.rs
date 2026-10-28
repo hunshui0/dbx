@@ -131,7 +131,7 @@ mod tests {
         let error = BackendError::from_agent_call_error(&AgentCallError::Structured {
             rpc_code: -1,
             message: "relation customer_orders does not exist".to_string(),
-            context: AgentErrorContext {
+            context: Box::new(AgentErrorContext {
                 contract_version: 1,
                 category: AgentErrorCategory::Sql,
                 retryable: false,
@@ -143,7 +143,7 @@ mod tests {
                 vendor_code: None,
                 exception_class: Some("java.sql.SQLException".to_string()),
                 conversion: None,
-            },
+            }),
         });
 
         let response = AppError::from(error).into_response();
