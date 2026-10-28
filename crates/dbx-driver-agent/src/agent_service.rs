@@ -144,9 +144,9 @@ fn stop_external_managed_agent_processes_blocking(target: ManagedAgentProcessTar
 async fn stop_external_managed_agent_processes(target: ManagedAgentProcessTarget) -> Result<(), String> {
     #[cfg(windows)]
     {
-        return tokio::task::spawn_blocking(move || stop_external_managed_agent_processes_blocking(target))
+        tokio::task::spawn_blocking(move || stop_external_managed_agent_processes_blocking(target))
             .await
-            .map_err(|error| format!("Failed to inspect DBX agent processes: {error}"))?;
+            .map_err(|error| format!("Failed to inspect DBX agent processes: {error}"))?
     }
     #[cfg(not(windows))]
     {
