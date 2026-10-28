@@ -9614,7 +9614,7 @@ mod tests {
         let error = crate::db::agent_driver::AgentCallError::Structured {
             rpc_code: -6007,
             message: "driver is not installed".to_string(),
-            context: crate::db::agent_driver::AgentErrorContext {
+            context: Box::new(crate::db::agent_driver::AgentErrorContext {
                 contract_version: 1,
                 category: crate::db::agent_driver::AgentErrorCategory::Connection,
                 retryable: false,
@@ -9626,7 +9626,7 @@ mod tests {
                 vendor_code: None,
                 exception_class: None,
                 conversion: None,
-            },
+            }),
         }
         .into_legacy_string();
 

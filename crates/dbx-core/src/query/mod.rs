@@ -10988,7 +10988,7 @@ for line in sys.stdin:
         let error = QueryExecutionError::Agent(AgentCallError::Structured {
             rpc_code: -1,
             message: "connection lost".to_string(),
-            context: crate::db::agent_driver::AgentErrorContext {
+            context: Box::new(crate::db::agent_driver::AgentErrorContext {
                 contract_version: 1,
                 category: crate::db::agent_driver::AgentErrorCategory::Connection,
                 retryable: false,
@@ -11000,7 +11000,7 @@ for line in sys.stdin:
                 vendor_code: None,
                 exception_class: None,
                 conversion: None,
-            },
+            }),
         });
 
         assert_eq!(error.into_backend_error().code(), "DBX-JDBC-1002");

@@ -614,7 +614,11 @@ mod tests {
         let running = RunningQueries::default();
         let registered = running.register_task_for_terminal_confirmation("rejected".to_string(), Default::default());
         registered.finish_with_database_result::<()>(&Err(crate::query::QueryExecutionError::Agent(
-            AgentCallError::Structured { rpc_code: -32001, message: "Rejected by database".to_string(), context },
+            AgentCallError::Structured {
+                rpc_code: -32001,
+                message: "Rejected by database".to_string(),
+                context: Box::new(context),
+            },
         )));
         assert_eq!(running.wait_for_completion("rejected", Duration::ZERO).await.database_terminal, Some(true));
     }
