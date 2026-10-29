@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import DataCompareDialog from "@/components/diff/DataCompareDialog.vue";
 import type { DataCompareSession } from "@/composables/useDataCompareSession";
+import { createDataCompareSelection } from "@/lib/dataGrid/dataCompareSelection";
 
 const SOURCE_CONNECTION_ID = "oracle-11g";
 const TARGET_CONNECTION_ID = "oracle-jdbc-11g";
@@ -256,6 +257,52 @@ function setupMocks() {
 }
 
 describe("DataCompareDialog match columns", () => {
+  it.each([
+    { partial: true, inconclusive: false },
+    { partial: false, inconclusive: false },
+    { partial: true, inconclusive: true },
+  ])("reports row totals and completion honestly for %j", async ({ partial, inconclusive }) => {
+    setupMocks();
+    const session = configuredSession();
+    session.batchResults = [
+      {
+        sourceTable: "USERS",
+        targetTable: "USERS",
+        keyColumns: ["USER_ID"],
+        columns: ["USER_ID"],
+        columnInfo: [],
+        status: inconclusive ? "inconclusive" : "different",
+        added: 0,
+        removed: 0,
+        modified: 0,
+        sourceRowCount: inconclusive ? 178193 : 0,
+        targetRowCount: 178193,
+        sourceTruncated: false,
+        targetTruncated: partial,
+        rowBudget: 10000,
+        syncEligible: !partial,
+        whereCondition: "trn_date = '20261015'",
+        diff: { added: [], removed: [], modified: [] },
+        selection: { added: createDataCompareSelection(!partial), removed: createDataCompareSelection(!partial), modified: createDataCompareSelection(!partial) },
+        expanded: false,
+        showAll: { added: false, removed: false, modified: false },
+      },
+    ];
+    sessionMocks.session = session;
+    mountDialog({ sessionId: session.id });
+    await flushAsyncSetup();
+    const text = document.body.textContent!;
+    expect(text).toContain(i18n.global.t("dataCompare.rowCountsOnly", { source: inconclusive ? 178193 : 0, target: 178193 }));
+    expect(text.includes(i18n.global.t("dataCompare.rowCountMismatch"))).toBe(!inconclusive);
+    expect(text.includes(i18n.global.t("dataCompare.inconclusiveHint"))).toBe(inconclusive);
+    if (inconclusive) expect(text).toContain(i18n.global.t("dataCompare.statusInconclusive"));
+    expect(text).toContain("WHERE trn_date = '20261015'");
+    expect(text.includes(i18n.global.t("dataCompare.fullCompareCompleted"))).toBe(!partial);
+    expect(text.includes(i18n.global.t("dataCompare.truncatedBadge", { budget: 10000 }))).toBe(partial);
+    expect(text).not.toContain("已完成全量比较");
+    expect(text).not.toContain("full compare completed");
+  });
+
   it("accepts the expression after WHERE and passes it to this table's comparison", async () => {
     setupMocks();
     await openWithPrefilledSource("USERS");

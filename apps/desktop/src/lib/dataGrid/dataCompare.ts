@@ -93,7 +93,7 @@ export interface DataCompareResult {
 export interface DataCompareReportTable {
   sourceTable: string;
   targetTable: string;
-  status: "different" | "same" | "error";
+  status: "different" | "same" | "inconclusive" | "error";
   columns: string[];
   keyColumns: string[];
   ignoredColumns?: string[];
@@ -157,10 +157,11 @@ export function buildDataCompareReportMarkdown(options: DataCompareReportOptions
       removed: summary.removed + table.diff.removed.length,
       modified: summary.modified + table.diff.modified.length,
       sameTables: summary.sameTables + Number(table.status === "same"),
+      inconclusiveTables: summary.inconclusiveTables + Number(table.status === "inconclusive"),
       differentTables: summary.differentTables + Number(table.status === "different"),
       failedTables: summary.failedTables + Number(table.status === "error"),
     }),
-    { added: 0, removed: 0, modified: 0, sameTables: 0, differentTables: 0, failedTables: 0 },
+    { added: 0, removed: 0, modified: 0, sameTables: 0, inconclusiveTables: 0, differentTables: 0, failedTables: 0 },
   );
   const mode = options.compareMode === "sample" ? "sample" : "full";
   const overview = {

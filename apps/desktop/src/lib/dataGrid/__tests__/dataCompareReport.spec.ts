@@ -45,6 +45,22 @@ const table: DataCompareReportTable = {
 };
 
 describe("buildDataCompareReportMarkdown", () => {
+  it("keeps incomplete equality out of the identical table count", () => {
+    const report = buildDataCompareReportMarkdown({
+      source: "DB2",
+      target: "TiDB",
+      compareMode: "sample",
+      compareModeLabel: "Sample",
+      sampleSize: 10000,
+      generatedAt: new Date("2026-10-29T00:00:00Z"),
+      tables: [{ ...table, status: "inconclusive", sourceRowCount: 178193, targetRowCount: 178193, diff: { added: [], removed: [], modified: [] } }],
+      syncSql: "",
+      labels,
+    });
+    expect(report).toContain('"inconclusiveTables": 1');
+    expect(report).toContain('"sameTables": 0');
+    expect(report).toContain('"status": "inconclusive"');
+  });
   it("records the SQL predicate and marks otherwise unfiltered rows as filtered", () => {
     const report = buildDataCompareReportMarkdown({
       source: "DB2",

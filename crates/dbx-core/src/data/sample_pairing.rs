@@ -1,15 +1,22 @@
 use std::collections::HashSet;
 use std::hash::Hash;
 
-pub(super) fn retain_shared_sample_rows_by_key<Row, Key, KeyFn>(
+pub(super) fn pair_sample_rows_by_key<Row, Key, KeyFn>(
     source_rows: Vec<Row>,
     target_rows: Vec<Row>,
+    source_row_count: u64,
+    target_row_count: u64,
     key_for_row: KeyFn,
 ) -> (Vec<Row>, Vec<Row>)
 where
     Key: Eq + Hash,
     KeyFn: Fn(&Row) -> Key,
 {
+    // A counted-empty side proves that every sampled row on the other side is
+    // missing there. Intersecting keys would discard all these real differences.
+    if source_row_count == 0 || target_row_count == 0 {
+        return (source_rows, target_rows);
+    }
     let source_keys = source_rows.iter().map(&key_for_row).collect::<HashSet<_>>();
     let target_keys = target_rows.iter().map(&key_for_row).collect::<HashSet<_>>();
     let source_rows = source_rows.into_iter().filter(|row| target_keys.contains(&key_for_row(row))).collect();

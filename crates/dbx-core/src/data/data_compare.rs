@@ -22,7 +22,7 @@ use crate::transfer::{
 };
 
 use super::data_compare_filter::{combine_compare_filters, normalize_where_condition};
-use super::sample_pairing::retain_shared_sample_rows_by_key;
+use super::sample_pairing::pair_sample_rows_by_key;
 
 const DATA_SYNC_INSERT_BATCH_SIZE: usize = 500;
 const DATA_SYNC_CONDITION_BATCH_SIZE: usize = 200;
@@ -602,7 +602,7 @@ pub async fn prepare_data_compare_from_tables(
                 let src = normalize_numeric_compare_rows(&columns, src, &numeric_columns);
                 let tgt = normalize_numeric_compare_rows(&columns, tgt, &numeric_columns);
                 let column_indexes = column_index_map(&columns);
-                let (src, tgt) = retain_shared_sample_rows_by_key(src, tgt, |row| {
+                let (src, tgt) = pair_sample_rows_by_key(src, tgt, source_row_count, target_row_count, |row| {
                     key_for_row(row, &options.key_columns, &column_indexes)
                 });
                 let max_count = source_row_count.max(target_row_count);
@@ -3127,7 +3127,7 @@ mod tests {
             normalize_numeric_compare_rows(&columns, vec![vec![json!("001"), json!("5.00")]], &numeric_columns);
         let target_rows = normalize_numeric_compare_rows(&columns, vec![vec![json!(1), json!(5.0)]], &numeric_columns);
         let indexes = column_index_map(&columns);
-        let (source_rows, target_rows) = retain_shared_sample_rows_by_key(source_rows, target_rows, |row| {
+        let (source_rows, target_rows) = pair_sample_rows_by_key(source_rows, target_rows, 1, 1, |row| {
             key_for_row(row, &["id".to_string()], &indexes)
         });
         assert_eq!(source_rows.len(), 1);
@@ -4047,6 +4047,41 @@ mod tests {
                 assert!(diff.added.is_empty() && diff.removed.is_empty() && diff.modified.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn sampled_rows_are_real_differences_when_the_other_filtered_side_is_empty() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let keys = vec!["id".to_string()];
+        let indexes = column_index_map(&columns);
+        let rows = vec![vec![json!(1), json!("Ada")], vec![json!(2), json!("Bob")]];
+        for (source, target, source_count, target_count, expected_added, expected_removed) in [
+            (vec![], rows.clone(), 0, 178_193, 0, 2),
+            (rows.clone(), vec![], 178_193, 0, 2, 0),
+            (vec![], vec![], 0, 0, 0, 0),
+        ] {
+            let (source_rows, target_rows) =
+                pair_sample_rows_by_key(source, target, source_count, target_count, |row| {
+                    key_for_row(row, &keys, &indexes)
+                });
+            let diff = compare_data_rows(CompareDataRowsOptions {
+                columns: columns.clone(),
+                key_columns: keys.clone(),
+                source_rows,
+                target_rows,
+            })
+            .unwrap();
+            assert_eq!(diff.added.len(), expected_added);
+            assert_eq!(diff.removed.len(), expected_removed);
+            assert!(diff.modified.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_missing_sample_is_not_proof_that_a_nonempty_table_lacks_those_keys() {
+        let rows = vec![vec![json!(1)], vec![json!(2)]];
+        let (source, target) = pair_sample_rows_by_key(vec![], rows, 178_193, 178_193, |row| row[0].to_string());
+        assert!(source.is_empty() && target.is_empty());
     }
 
     #[test]

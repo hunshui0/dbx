@@ -35,7 +35,7 @@ export interface DataCompareTableTask {
   targetTable: string;
 }
 
-export type DataCompareTableStatus = "different" | "same" | "error";
+export type DataCompareTableStatus = "different" | "same" | "inconclusive" | "error";
 export type DiffKind = "added" | "removed" | "modified";
 
 export interface DataCompareTableResult {
@@ -265,7 +265,9 @@ function buildTableResult(task: DataCompareTableTask, preparation: DataCompareFr
   const added = preparation.result.added.length;
   const removed = preparation.result.removed.length;
   const modified = preparation.result.modified.length;
-  const status: DataCompareTableStatus = added || removed || modified ? "different" : "same";
+  // Paired-key sampling can have no shared rows even when filtered totals differ.
+  // Empty diff arrays therefore cannot override a definite count mismatch.
+  const status: DataCompareTableStatus = added || removed || modified || preparation.sourceRowCount !== preparation.targetRowCount ? "different" : preparation.sourceTruncated || preparation.targetTruncated ? "inconclusive" : "same";
   return tableResult({
     sourceTable: task.sourceTable,
     targetTable: task.targetTable,

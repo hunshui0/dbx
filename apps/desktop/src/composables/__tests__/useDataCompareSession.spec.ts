@@ -349,6 +349,58 @@ test("carries the row budget and truncation flags from the backend into the tabl
   assert.equal(isCompareRowSelected(session.batchResults[0]!.selection.added, 0), false);
 });
 
+test.each([
+  { source: 0, target: 178193, status: "different", partial: true },
+  { source: 178193, target: 0, status: "different", partial: true },
+  { source: 178193, target: 178194, status: "different", partial: true },
+  { source: 178193, target: 178193, status: "inconclusive", partial: true },
+  { source: 0, target: 0, status: "same", partial: false },
+])("uses filtered counts when paired samples contain no differences: %j", async ({ source, target, status, partial }) => {
+  apiMock.prepareDataCompareFromTables.mockResolvedValue({
+    ...preparationFor("users"),
+    result: { added: [], removed: [], modified: [] },
+    sourceRowCount: source,
+    targetRowCount: target,
+    sourceTruncated: partial && source > 0,
+    targetTruncated: partial && target > 0,
+    syncEligible: !partial,
+    rowBudget: 10000,
+  });
+  const session = await runSession(baseConfig({ compareMode: "sample", whereConditionsByTable: { users: "trn_date = '20261015'" } }), [{ sourceTable: "users", targetTable: "users" }]);
+  const table = session.batchResults[0]!;
+  assert.equal(table.status, status);
+  assert.equal(table.sourceRowCount, source);
+  assert.equal(table.targetRowCount, target);
+  assert.equal(table.whereCondition, "trn_date = '20261015'");
+  assert.equal(table.added + table.removed + table.modified, 0);
+  if (partial) {
+    assert.equal(table.syncEligible, false);
+    assert.deepEqual(buildDataCompareSyncPlanTables([table], "public"), []);
+  }
+  assert.equal(trackerMock.updateCompareTask.mock.calls.at(-1)?.[1].compareSameCount, status === "same" ? 1 : 0);
+  assert.equal(trackerMock.updateCompareTask.mock.calls.at(-1)?.[1].compareDifferentCount, status === "different" ? 1 : 0);
+});
+
+test.each(["source", "target"])("retains real sample differences when the %s side is empty", async (emptySide) => {
+  const row = { key: "1", keyValues: { user_id: 1 }, values: { user_id: 1 } };
+  const sourceEmpty = emptySide === "source";
+  apiMock.prepareDataCompareFromTables.mockResolvedValue({
+    ...preparationFor("users"),
+    sourceRowCount: sourceEmpty ? 0 : 178193,
+    targetRowCount: sourceEmpty ? 178193 : 0,
+    sourceTruncated: !sourceEmpty,
+    targetTruncated: sourceEmpty,
+    result: { added: sourceEmpty ? [] : [row], removed: sourceEmpty ? [row] : [], modified: [] },
+    syncEligible: false,
+  });
+  const session = await runSession(baseConfig({ compareMode: "sample" }), [{ sourceTable: "users", targetTable: "users" }]);
+  const table = session.batchResults[0]!;
+  assert.equal(table.status, "different");
+  assert.equal(table.added, sourceEmpty ? 0 : 1);
+  assert.equal(table.removed, sourceEmpty ? 1 : 0);
+  assert.deepEqual(buildDataCompareSyncPlanTables([table], "public"), []);
+});
+
 test("keeps a truncated missing-target table on the same row budget", async () => {
   apiMock.prepareDataCompareMissingTarget.mockResolvedValue({
     ...preparationFor("users"),

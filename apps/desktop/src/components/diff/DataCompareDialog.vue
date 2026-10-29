@@ -283,6 +283,7 @@ function normalizeSampleSizeInput(): void {
 }
 
 const sameTableCount = computed(() => batchResults.value.filter((item) => item.status === "same").length);
+const inconclusiveTableCount = computed(() => batchResults.value.filter((item) => item.status === "inconclusive").length);
 const differentTableCount = computed(() => batchResults.value.filter((item) => item.status === "different").length);
 const failedTableCount = computed(() => batchResults.value.filter((item) => item.status === "error").length);
 const totalAdded = computed(() => batchResults.value.reduce((sum, item) => sum + item.added, 0));
@@ -863,12 +864,14 @@ async function loadTables(side: "source" | "target") {
 function resultStatusLabel(status: DataCompareTableStatus): string {
   if (status === "different") return t("dataCompare.statusDifferent");
   if (status === "same") return t("dataCompare.statusSame");
+  if (status === "inconclusive") return t("dataCompare.statusInconclusive");
   return t("dataCompare.statusError");
 }
 
 function resultStatusClass(status: DataCompareTableStatus): string {
   if (status === "different") return "bg-amber-500/15 text-amber-700";
   if (status === "same") return "bg-emerald-500/15 text-emerald-700";
+  if (status === "inconclusive") return "bg-amber-500/15 text-amber-700";
   return "bg-destructive/15 text-destructive";
 }
 
@@ -1812,6 +1815,7 @@ onBeforeUnmount(() => {
               <div class="flex flex-wrap items-start justify-between gap-2">
                 <div class="min-w-0 space-y-2">
                   <div>{{ summary }}</div>
+                  <div v-if="inconclusiveTableCount" class="text-xs text-amber-700 dark:text-amber-400">{{ t("dataCompare.inconclusiveSummary", { count: inconclusiveTableCount }) }}</div>
                   <div class="text-xs text-muted-foreground">{{ selectedSummary }}</div>
                 </div>
                 <Button v-if="canExportDiffs" size="sm" variant="outline" class="h-7 shrink-0 text-xs" :disabled="exportingDiffs" @click="exportDiffResultsXlsx">
@@ -1906,12 +1910,17 @@ onBeforeUnmount(() => {
                           </div>
                           <div class="mt-1">
                             {{
-                              t("dataCompare.rowCounts", {
+                              t("dataCompare.rowCountsOnly", {
                                 source: item.sourceRowCount,
                                 target: item.targetRowCount,
                               })
                             }}
+                            <span v-if="!item.sourceTruncated && !item.targetTruncated"> · {{ t("dataCompare.fullCompareCompleted") }}</span>
                           </div>
+                          <div v-if="item.sourceRowCount !== item.targetRowCount" class="mt-1 text-amber-700 dark:text-amber-400">
+                            {{ t("dataCompare.rowCountMismatch") }}
+                          </div>
+                          <div v-if="item.status === 'inconclusive'" class="mt-1 text-amber-700 dark:text-amber-400">{{ t("dataCompare.inconclusiveHint") }}</div>
                           <div v-if="item.sourceTruncated || item.targetTruncated" class="mt-1 text-amber-700 dark:text-amber-400">
                             {{ t("dataCompare.truncatedBadge", { budget: item.rowBudget }) }}
                           </div>
