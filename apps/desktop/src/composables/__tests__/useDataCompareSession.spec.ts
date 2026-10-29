@@ -129,6 +129,18 @@ test("full compare sends an explicit mode that bypasses default row-count thresh
   assert.equal(options?.degradationThreshold.sampleSize, 10_000);
 });
 
+test.each([false, true])("retains numeric tolerance choice and keyed audit rows when enabled=%s", async (enabled) => {
+  const matches = enabled ? [{ key: "1", keyValues: { user_id: 1 }, sourceValues: { amount: "100" }, targetValues: { amount: "100.01" }, changes: [{ column: "amount", source: "100", target: "100.01", absoluteDifference: "0.01" }] }] : [];
+  apiMock.prepareDataCompareFromTables.mockResolvedValue({ ...preparationFor("users"), sourceRowCount: 1, targetRowCount: 1, result: { added: [], removed: [], modified: [], toleranceMatches: matches } });
+  const session = await runSession(baseConfig({ amountToleranceEnabled: enabled }), [{ sourceTable: "users", targetTable: "users" }]);
+  assert.equal(apiMock.prepareDataCompareFromTables.mock.calls[0]?.[0].amountToleranceEnabled, enabled);
+  assert.equal(session.config.amountToleranceEnabled, enabled);
+  assert.equal(session.batchResults[0]?.amountToleranceEnabled, enabled);
+  assert.equal(session.batchResults[0]?.status, "same");
+  assert.deepEqual(session.batchResults[0]?.diff.toleranceMatches, matches);
+  assert.deepEqual(buildDataCompareSyncPlanTables(session.batchResults, "public"), []);
+});
+
 test("sends exclusions for this table only and retains the filtered scope in results", async () => {
   const rules = [{ column: "USER_ID", excludeNull: true, excludeEmptyString: true, values: ["0", "NULL"] }];
   const input = baseConfig({ selectedSourceTables: ["users", "orders"], keyExclusionsByTable: { users: rules } });

@@ -51,6 +51,7 @@ const mocks = vi.hoisted(() => ({
   executeBatch: vi.fn(),
   prepareDataCompareFromTables: vi.fn(),
   prepareDataCompareMissingTarget: vi.fn(),
+  exportQueryResultsXlsx: vi.fn(),
 }));
 
 const sessionMocks = vi.hoisted(() => ({
@@ -99,6 +100,7 @@ vi.mock("@/lib/backend/api", () => ({
   executeBatch: mocks.executeBatch,
   prepareDataCompareFromTables: mocks.prepareDataCompareFromTables,
   prepareDataCompareMissingTarget: mocks.prepareDataCompareMissingTarget,
+  exportQueryResultsXlsx: mocks.exportQueryResultsXlsx,
 }));
 
 const mountedApps: App[] = [];
@@ -257,6 +259,63 @@ function setupMocks() {
 }
 
 describe("DataCompareDialog match columns", () => {
+  it("starts with tolerance disabled and sends the checked choice", async () => {
+    setupMocks();
+    await openWithPrefilledSource("USERS");
+    const checkbox = document.querySelector<HTMLInputElement>("#data-compare-amount-tolerance")!;
+    expect(checkbox.checked).toBe(false);
+    checkbox.click();
+    await flushAsyncSetup();
+    compareButton()?.click();
+    await flushAsyncSetup();
+    expect(mocks.prepareDataCompareFromTables.mock.calls[0]?.[0].amountToleranceEnabled).toBe(true);
+  });
+
+  it("shows and exports tolerance-only matches without requiring real modified rows", async () => {
+    setupMocks();
+    mocks.exportQueryResultsXlsx.mockResolvedValue(undefined);
+    const session = configuredSession();
+    session.config.amountToleranceEnabled = true;
+    session.batchResults = [
+      {
+        sourceTable: "USERS",
+        targetTable: "USERS",
+        keyColumns: ["USER_ID"],
+        columns: ["USER_ID", "AMOUNT"],
+        columnInfo: [],
+        amountToleranceEnabled: true,
+        status: "same",
+        added: 0,
+        removed: 0,
+        modified: 0,
+        sourceRowCount: 1,
+        targetRowCount: 1,
+        sourceTruncated: false,
+        targetTruncated: false,
+        rowBudget: 10000,
+        syncEligible: true,
+        diff: { added: [], removed: [], modified: [], toleranceMatches: [{ key: "1", keyValues: { USER_ID: 1 }, sourceValues: { AMOUNT: "100" }, targetValues: { AMOUNT: "100.01" }, changes: [{ column: "AMOUNT", source: "100", target: "100.01", absoluteDifference: "0.01" }] }] },
+        selection: { added: createDataCompareSelection(true), removed: createDataCompareSelection(true), modified: createDataCompareSelection(true) },
+        expanded: false,
+        showAll: { added: false, removed: false, modified: false },
+      },
+    ];
+    sessionMocks.session = session;
+    mountDialog({ sessionId: session.id });
+    await flushAsyncSetup();
+    expect(document.querySelector<HTMLInputElement>("#data-compare-amount-tolerance")!.checked).toBe(true);
+    expect(document.body.textContent).toContain(i18n.global.t("dataCompare.statusSameWithTolerance"));
+    const details = document.querySelector('[data-testid="data-compare-tolerance-details"]')!;
+    expect(details.textContent).toContain("USER_ID=1");
+    expect(details.textContent).toContain("100.01");
+    buttonWithText(i18n.global.t("dataCompare.exportDetailsWithTolerance"))!.click();
+    await flushAsyncSetup();
+    expect(mocks.exportQueryResultsXlsx).toHaveBeenCalledOnce();
+    const worksheets = mocks.exportQueryResultsXlsx.mock.calls[0]![1];
+    expect(worksheets).toHaveLength(1);
+    expect(worksheets[0].rows).toEqual([[1, "AMOUNT", "100", "100.01", "0.01", "0.01"]]);
+  });
+
   it.each([
     { partial: true, inconclusive: false },
     { partial: false, inconclusive: false },

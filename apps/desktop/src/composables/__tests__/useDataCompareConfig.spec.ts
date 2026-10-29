@@ -23,6 +23,21 @@ function snapshot(overrides: Record<string, unknown> = {}) {
 }
 
 describe("useDataCompareConfig", () => {
+  it("defaults tolerance off and preserves an enabled choice through save, reload and disable", async () => {
+    localStorage.clear();
+    vi.resetModules();
+    const { useDataCompareConfig } = await import("../useDataCompareConfig");
+    const state = useDataCompareConfig();
+    expect(state.createConfig("Strict", snapshot()).amountToleranceEnabled).toBe(false);
+    const enabled = state.createConfig("Tolerance", snapshot({ amountToleranceEnabled: true }));
+    expect(state.duplicateConfig(enabled.id)?.amountToleranceEnabled).toBe(true);
+    vi.resetModules();
+    const { useDataCompareConfig: restore } = await import("../useDataCompareConfig");
+    expect(restore().configs.value.find((config) => config.id === enabled.id)?.amountToleranceEnabled).toBe(true);
+    restore().updateConfig(enabled.id, { amountToleranceEnabled: false });
+    expect(JSON.parse(localStorage.getItem(CONFIG_KEY)!).find((config: { id: string }) => config.id === enabled.id).amountToleranceEnabled).toBe(false);
+  });
+
   beforeEach(() => {
     localStorage.clear();
     vi.resetModules();

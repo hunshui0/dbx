@@ -4,6 +4,7 @@ export type DataCompareCellValue = QueryResult["rows"][number][number];
 
 export type SamplingStrategy = "Random" | "ExtremeValues" | "Hybrid";
 export type DataCompareMode = "full" | "sample";
+export const DATA_COMPARE_AMOUNT_TOLERANCE = "0.01";
 
 /** Exclude a row when any selected match column meets one of these conditions. */
 export interface DataCompareKeyExclusion {
@@ -85,12 +86,34 @@ export interface DataCompareModifiedRow {
 }
 
 export interface DataCompareResult {
+  toleranceMatches?: DataCompareToleranceMatch[];
   added: DataCompareRow[];
   removed: DataCompareRow[];
   modified: DataCompareModifiedRow[];
 }
 
+export interface DataCompareToleranceMatch {
+  key: string;
+  keyValues: Record<string, DataCompareCellValue>;
+  sourceValues: Record<string, DataCompareCellValue>;
+  targetValues: Record<string, DataCompareCellValue>;
+  changes: Array<DataCompareChangedCell & { absoluteDifference: string }>;
+}
+
+/** One audit row per tolerated cell, preserving keyed source/target values as supplied. */
+export function buildDataCompareToleranceWorksheets(tables: ReadonlyArray<{ sourceTable: string; keyColumns: string[]; diff: Pick<DataCompareResult, "toleranceMatches"> }>, labels: { suffix: string; field: string; source: string; target: string; difference: string; threshold: string }) {
+  return tables
+    .filter((table) => table.diff.toleranceMatches?.length)
+    .map((table) => ({
+      sheetName: `${table.sourceTable}-${labels.suffix}`,
+      columns: [...table.keyColumns, labels.field, labels.source, labels.target, labels.difference, labels.threshold],
+      rows: table.diff.toleranceMatches!.flatMap((row) => row.changes.map((change) => [...table.keyColumns.map((key) => row.keyValues[key] ?? null), change.column, change.source, change.target, change.absoluteDifference, DATA_COMPARE_AMOUNT_TOLERANCE])),
+      autoFilter: false,
+    }));
+}
+
 export interface DataCompareReportTable {
+  amountToleranceEnabled?: boolean;
   sourceTable: string;
   targetTable: string;
   status: "different" | "same" | "inconclusive" | "error";
@@ -106,6 +129,7 @@ export interface DataCompareReportTable {
   rowBudget: number;
   syncEligible: boolean;
   diff: {
+    toleranceMatches?: DataCompareToleranceMatch[];
     added: Array<DataCompareRow & { selected: boolean }>;
     removed: Array<DataCompareRow & { selected: boolean }>;
     modified: Array<DataCompareModifiedRow & { selected: boolean }>;
@@ -114,6 +138,7 @@ export interface DataCompareReportTable {
 }
 
 export interface DataCompareReportLabels {
+  toleranceMatches?: string;
   title: string;
   overview: string;
   details: string;
@@ -156,12 +181,13 @@ export function buildDataCompareReportMarkdown(options: DataCompareReportOptions
       added: summary.added + table.diff.added.length,
       removed: summary.removed + table.diff.removed.length,
       modified: summary.modified + table.diff.modified.length,
+      toleranceMatchedRows: summary.toleranceMatchedRows + (table.diff.toleranceMatches?.length ?? 0),
       sameTables: summary.sameTables + Number(table.status === "same"),
       inconclusiveTables: summary.inconclusiveTables + Number(table.status === "inconclusive"),
       differentTables: summary.differentTables + Number(table.status === "different"),
       failedTables: summary.failedTables + Number(table.status === "error"),
     }),
-    { added: 0, removed: 0, modified: 0, sameTables: 0, inconclusiveTables: 0, differentTables: 0, failedTables: 0 },
+    { added: 0, removed: 0, modified: 0, toleranceMatchedRows: 0, sameTables: 0, inconclusiveTables: 0, differentTables: 0, failedTables: 0 },
   );
   const mode = options.compareMode === "sample" ? "sample" : "full";
   const overview = {
@@ -194,6 +220,8 @@ export function buildDataCompareReportMarkdown(options: DataCompareReportOptions
       addedCount: table.diff.added.length,
       removedCount: table.diff.removed.length,
       modifiedCount: table.diff.modified.length,
+      amountTolerance: table.amountToleranceEnabled ? DATA_COMPARE_AMOUNT_TOLERANCE : null,
+      toleranceMatchedRows: table.diff.toleranceMatches?.length ?? 0,
       ...(table.error ? { error: table.error } : {}),
     };
     return [
@@ -213,6 +241,10 @@ export function buildDataCompareReportMarkdown(options: DataCompareReportOptions
       `#### ${labels.modifiedRows} (${table.diff.modified.length})`,
       "",
       jsonBlock(table.diff.modified),
+      "",
+      `#### ${labels.toleranceMatches ?? "Tolerance matches"} (${table.diff.toleranceMatches?.length ?? 0})`,
+      "",
+      jsonBlock(table.diff.toleranceMatches ?? []),
     ].join("\n");
   });
   const sqlSection = options.syncSql.trim() ? `${labels.syncSqlSelectionNote}\n\n${fencedBlock("sql", options.syncSql.trim())}` : labels.noSyncSql;
@@ -238,6 +270,7 @@ export interface DataComparePreparation {
 }
 
 export interface DataCompareFromTablesOptions {
+  amountToleranceEnabled?: boolean;
   sourceConnectionId: string;
   sourceDatabase: string;
   sourceSchema: string;

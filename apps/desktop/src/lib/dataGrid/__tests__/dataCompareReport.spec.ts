@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildDataCompareReportMarkdown, type DataCompareReportLabels, type DataCompareReportTable } from "../dataCompare";
+import { buildDataCompareReportMarkdown, buildDataCompareToleranceWorksheets, type DataCompareReportLabels, type DataCompareReportTable } from "../dataCompare";
 
 const labels: DataCompareReportLabels = {
   title: "Report",
@@ -45,6 +45,25 @@ const table: DataCompareReportTable = {
 };
 
 describe("buildDataCompareReportMarkdown", () => {
+  it("exports all tolerance cases, including otherwise identical tables and mixed rows", () => {
+    const matches = [
+      { key: "acct", keyValues: { id: "0001" }, sourceValues: { amount: "99999999999999999999.99" }, targetValues: { amount: "99999999999999999999.98" }, changes: [{ column: "amount", source: "99999999999999999999.99", target: "99999999999999999999.98", absoluteDifference: "0.01" }] },
+    ];
+    const tables = [
+      { ...table, status: "same" as const, amountToleranceEnabled: true, diff: { added: [], removed: [], modified: [], toleranceMatches: matches } },
+      { ...table, amountToleranceEnabled: true, diff: { ...table.diff, toleranceMatches: matches } },
+    ];
+    const sheets = buildDataCompareToleranceWorksheets(tables, { suffix: "Tolerance", field: "Field", source: "Source", target: "Target", difference: "Difference", threshold: "Threshold" });
+    expect(sheets).toHaveLength(2);
+    expect(sheets[0]!.columns).toEqual(["id", "Field", "Source", "Target", "Difference", "Threshold"]);
+    expect(sheets[0]!.rows[0]).toEqual(["0001", "amount", "99999999999999999999.99", "99999999999999999999.98", "0.01", "0.01"]);
+    const report = buildDataCompareReportMarkdown({ source: "DB2", target: "TiDB", compareMode: "full", compareModeLabel: "Full", sampleSize: 10000, generatedAt: new Date("2026-10-29T00:00:00Z"), tables, syncSql: "", labels });
+    expect(report).toContain('"amountTolerance": "0.01"');
+    expect(report).toContain('"toleranceMatchedRows": 2');
+    expect(report).toContain('"absoluteDifference": "0.01"');
+    expect(report).toContain('"id": "0001"');
+    expect(report).toContain("99999999999999999999.98");
+  });
   it("keeps incomplete equality out of the identical table count", () => {
     const report = buildDataCompareReportMarkdown({
       source: "DB2",

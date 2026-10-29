@@ -21,6 +21,7 @@ import {
   DEFAULT_DATA_COMPARE_SAMPLE_SIZE,
   MAX_DATA_COMPARE_SAMPLE_SIZE,
   buildDataCompareReportMarkdown,
+  buildDataCompareToleranceWorksheets,
   inferCompareKeyColumns,
   normalizeDataCompareSampleSize,
   normalizeKeyColumns,
@@ -112,6 +113,7 @@ const targetTables = ref<string[]>([]);
 const detailPreviewLimit = ref(String(PREVIEW_LIMIT_OPTIONS[1]));
 const compareMode = ref<DataCompareMode>("full");
 const sampleSize = ref(String(DEFAULT_DATA_COMPARE_SAMPLE_SIZE));
+const amountToleranceEnabled = ref(false);
 const batchResults = shallowRef<DataCompareTableResult[]>([]);
 const syncPlan = shallowRef<DataCompareSyncPlan>(emptyDataCompareSyncPlan());
 const sqlPreview = computed(() => createBoundedTextPreview(syncPlan.value.syncSql, { maxCharacters: SQL_PREVIEW_MAX_CHARACTERS, maxLines: SQL_PREVIEW_MAX_LINES }));
@@ -289,6 +291,7 @@ const failedTableCount = computed(() => batchResults.value.filter((item) => item
 const totalAdded = computed(() => batchResults.value.reduce((sum, item) => sum + item.added, 0));
 const totalRemoved = computed(() => batchResults.value.reduce((sum, item) => sum + item.removed, 0));
 const totalModified = computed(() => batchResults.value.reduce((sum, item) => sum + item.modified, 0));
+const toleranceTotals = computed(() => batchResults.value.reduce((total, item) => ({ rows: total.rows + (item.diff.toleranceMatches?.length ?? 0), cells: total.cells + (item.diff.toleranceMatches?.reduce((count, row) => count + row.changes.length, 0) ?? 0) }), { rows: 0, cells: 0 }));
 const hasResults = computed(() => batchResults.value.length > 0);
 // A compare reads both sides up to a fixed row budget, so a table larger than that budget
 // is reported through `*Truncated`. Surfacing it here keeps a partial diff from looking
@@ -546,6 +549,7 @@ async function restoreDataCompareSession(session: DataCompareSession): Promise<v
     targetTable.value = config.targetTable;
     compareMode.value = config.compareMode;
     sampleSize.value = String(normalizeDataCompareSampleSize(config.sampleSize));
+    amountToleranceEnabled.value = config.amountToleranceEnabled === true;
     // Restore the per-table match columns so a reopened session keeps every
     // table's own selection instead of collapsing back to one global list.
     keyColumnOverrides.value = normalizeKeyColumnOverrides(config.keyColumnsByTable);
@@ -581,6 +585,7 @@ function dataCompareConfigSnapshot(): DataCompareConfigSnapshot {
     detailPreviewLimit: detailPreviewLimit.value,
     compareMode: compareMode.value,
     sampleSize: normalizedSampleSize(),
+    amountToleranceEnabled: amountToleranceEnabled.value,
     keyColumnsByTable: buildSessionKeyColumnsByTable(),
     ignoredColumnsByTable: { ...ignoredColumnOverrides.value },
     keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(keyExclusionOverrides.value),
@@ -640,6 +645,7 @@ async function applyDataCompareConfig(config: DataCompareConfig): Promise<void> 
     if (config.targetTable && targetTables.value.includes(config.targetTable)) targetTable.value = config.targetTable;
     compareMode.value = config.compareMode;
     sampleSize.value = String(normalizeDataCompareSampleSize(config.sampleSize));
+    amountToleranceEnabled.value = config.amountToleranceEnabled === true;
     keyColumnOverrides.value = normalizeKeyColumnOverrides(config.keyColumnsByTable);
     ignoredColumnOverrides.value = normalizeKeyColumnOverrides(config.ignoredColumnsByTable);
     keyExclusionOverrides.value = normalizeDataCompareKeyExclusionsByTable(config.keyExclusionsByTable);
@@ -861,9 +867,9 @@ async function loadTables(side: "source" | "target") {
   }
 }
 
-function resultStatusLabel(status: DataCompareTableStatus): string {
+function resultStatusLabel(status: DataCompareTableStatus, hasToleranceMatches = false): string {
   if (status === "different") return t("dataCompare.statusDifferent");
-  if (status === "same") return t("dataCompare.statusSame");
+  if (status === "same") return t(hasToleranceMatches ? "dataCompare.statusSameWithTolerance" : "dataCompare.statusSame");
   if (status === "inconclusive") return t("dataCompare.statusInconclusive");
   return t("dataCompare.statusError");
 }
@@ -901,7 +907,7 @@ function toggleShowAll(table: DataCompareTableResult, kind: DiffKind) {
 }
 
 /** 是否存在可导出的差异：至少一张表比对成功且带有 added/removed/modified 行。 */
-const canExportDiffs = computed(() => batchResults.value.some((item) => item.status === "different" && item.columns.length > 0 && (item.diff.added.length > 0 || item.diff.removed.length > 0 || item.diff.modified.length > 0)));
+const canExportDiffs = computed(() => batchResults.value.some((item) => (item.diff.toleranceMatches?.length ?? 0) > 0 || (item.status === "different" && item.columns.length > 0 && (item.diff.added.length > 0 || item.diff.removed.length > 0 || item.diff.modified.length > 0))));
 
 /**
  * 按列名取差异行的单元格值：added/removed 行的整行值分散在 `values` 与
@@ -932,7 +938,15 @@ function changedFieldsSummary(row: DataCompareModifiedRow): string {
  */
 async function exportDiffResultsXlsx() {
   const tables = batchResults.value.filter((item) => item.status === "different" && item.columns.length > 0 && (item.diff.added.length > 0 || item.diff.removed.length > 0 || item.diff.modified.length > 0));
-  if (tables.length === 0) return;
+  const toleranceWorksheets = buildDataCompareToleranceWorksheets(batchResults.value, {
+    suffix: t("dataCompare.toleranceMatches"),
+    field: t("dataCompare.toleranceField"),
+    source: t("dataCompare.toleranceSource"),
+    target: t("dataCompare.toleranceTarget"),
+    difference: t("dataCompare.toleranceDifference"),
+    threshold: t("dataCompare.toleranceThreshold"),
+  });
+  if (tables.length === 0 && toleranceWorksheets.length === 0) return;
 
   const kindColumn = t("dataCompare.exportDiffKind");
   const changedColumn = t("dataCompare.exportChangedFields");
@@ -946,6 +960,7 @@ async function exportDiffResultsXlsx() {
     ],
     autoFilter: false,
   }));
+  worksheets.push(...toleranceWorksheets);
 
   exportingDiffs.value = true;
   try {
@@ -1105,6 +1120,7 @@ function startCompare(): void {
       keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(keyExclusionOverrides.value),
       whereConditionsByTable: normalizeDataCompareWhereConditions(whereConditionOverrides.value),
       compareMode: compareMode.value,
+      amountToleranceEnabled: amountToleranceEnabled.value,
       sampleSize: normalizedSampleSize(),
       label: `${comparisonEndpointLabel(sourceConnectionId.value, sourceDatabase.value, sourceSchema.value)} → ${comparisonEndpointLabel(targetConnectionId.value, targetDatabase.value, targetSchema.value)}`,
     },
@@ -1149,6 +1165,7 @@ async function exportComparisonReport() {
       tables: batchResults.value.map((table) => ({
         ...table,
         diff: {
+          toleranceMatches: table.diff.toleranceMatches ?? [],
           added: table.diff.added.map((row, index) => ({ ...row, selected: isCompareRowSelected(table.selection.added, index) })),
           removed: table.diff.removed.map((row, index) => ({ ...row, selected: isCompareRowSelected(table.selection.removed, index) })),
           modified: table.diff.modified.map((row, index) => ({ ...row, selected: isCompareRowSelected(table.selection.modified, index) })),
@@ -1163,6 +1180,7 @@ async function exportComparisonReport() {
         sourceOnlyRows: t("dataCompare.reportSourceOnlyRows"),
         targetOnlyRows: t("dataCompare.reportTargetOnlyRows"),
         modifiedRows: t("dataCompare.reportModifiedRows"),
+        toleranceMatches: t("dataCompare.toleranceMatches"),
         syncSql: t("dataCompare.reportSyncSql"),
         syncSqlSelectionNote: t("dataCompare.reportSyncSqlSelectionNote"),
         noSyncSql: t("dataCompare.reportNoSyncSql"),
@@ -1803,6 +1821,13 @@ onBeforeUnmount(() => {
             <p class="text-[11px] text-muted-foreground">
               {{ compareMode === "full" ? t("dataCompare.fullCompareHint") : t("dataCompare.sampleCompareHint", { count: normalizedSampleSize() }) }}
             </p>
+            <div class="rounded-md border bg-muted/20 p-3 space-y-1.5">
+              <label class="flex items-center gap-2 text-xs font-medium" for="data-compare-amount-tolerance">
+                <input id="data-compare-amount-tolerance" v-model="amountToleranceEnabled" type="checkbox" class="h-3.5 w-3.5 accent-primary" :disabled="comparing || executionLocked" @change="clearResult" />
+                {{ t("dataCompare.amountTolerance") }}
+              </label>
+              <p class="text-[11px] text-muted-foreground">{{ t("dataCompare.amountToleranceHint") }}</p>
+            </div>
           </div>
 
           <div v-if="comparing" class="flex items-center gap-2 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-xs text-muted-foreground">
@@ -1815,12 +1840,13 @@ onBeforeUnmount(() => {
               <div class="flex flex-wrap items-start justify-between gap-2">
                 <div class="min-w-0 space-y-2">
                   <div>{{ summary }}</div>
+                  <div v-if="toleranceTotals.rows" class="text-xs text-amber-700 dark:text-amber-400">{{ t("dataCompare.toleranceMatchedSummary", toleranceTotals) }}</div>
                   <div v-if="inconclusiveTableCount" class="text-xs text-amber-700 dark:text-amber-400">{{ t("dataCompare.inconclusiveSummary", { count: inconclusiveTableCount }) }}</div>
                   <div class="text-xs text-muted-foreground">{{ selectedSummary }}</div>
                 </div>
                 <Button v-if="canExportDiffs" size="sm" variant="outline" class="h-7 shrink-0 text-xs" :disabled="exportingDiffs" @click="exportDiffResultsXlsx">
                   <Download class="h-3.5 w-3.5" />
-                  {{ t("dataCompare.exportDiff") }}
+                  {{ t(batchResults.some((item) => item.diff.toleranceMatches?.length) ? "dataCompare.exportDetailsWithTolerance" : "dataCompare.exportDiff") }}
                 </Button>
               </div>
             </div>
@@ -1893,7 +1919,7 @@ onBeforeUnmount(() => {
                       <td class="px-3 py-2 align-top font-mono text-muted-foreground">{{ item.targetTable }}</td>
                       <td class="px-3 py-2 align-top">
                         <span class="inline-flex rounded px-2 py-0.5 text-[11px]" :class="resultStatusClass(item.status)">
-                          {{ resultStatusLabel(item.status) }}
+                          {{ resultStatusLabel(item.status, !!item.diff.toleranceMatches?.length) }}
                         </span>
                       </td>
                       <td class="px-3 py-2 align-top text-muted-foreground">
@@ -1928,6 +1954,10 @@ onBeforeUnmount(() => {
                             {{ t("dataCompare.keyColumnsInline", { columns: item.keyColumns.join(", ") }) }}
                           </div>
                           <div v-if="item.ignoredColumns?.length" class="mt-1">{{ t("dataCompare.ignoredColumns") }}: {{ item.ignoredColumns.join(", ") }}</div>
+                          <div v-if="item.amountToleranceEnabled" class="mt-1 text-amber-700 dark:text-amber-400">{{ t("dataCompare.amountToleranceActive") }}</div>
+                          <div v-if="item.diff.toleranceMatches?.length" class="mt-1 font-medium text-amber-700 dark:text-amber-400">
+                            {{ t("dataCompare.toleranceMatchedSummary", { rows: item.diff.toleranceMatches.length, cells: item.diff.toleranceMatches.reduce((count, row) => count + row.changes.length, 0) }) }}
+                          </div>
                           <div v-if="item.whereCondition" class="mt-1 break-all font-mono">WHERE {{ item.whereCondition }}</div>
                           <div v-if="item.keyExclusions?.length" class="mt-1 break-all">{{ t("dataCompare.filteredRowsHint") }} {{ keyExclusionsSummary(item.keyExclusions) }}</div>
                           <div v-if="item.status === 'different'" class="mt-1">
@@ -1947,6 +1977,18 @@ onBeforeUnmount(() => {
             </div>
 
             <div class="space-y-3">
+              <details v-for="item in batchResults.filter((entry) => entry.diff.toleranceMatches?.length)" :key="`tolerance-${item.sourceTable}:${item.targetTable}`" class="rounded-lg border border-amber-500/40" data-testid="data-compare-tolerance-details">
+                <summary class="cursor-pointer px-3 py-2 text-xs font-medium">{{ item.sourceTable }} · {{ t("dataCompare.toleranceMatches") }} ({{ item.diff.toleranceMatches!.length }})</summary>
+                <div class="max-h-72 overflow-auto border-t">
+                  <div v-for="row in item.diff.toleranceMatches!.slice(0, detailPreviewLimitNumber)" :key="row.key" class="border-b px-3 py-2 text-xs last:border-b-0">
+                    <div class="font-mono break-all">{{ formatKeyValues(row.keyValues) }}</div>
+                    <div v-for="change in row.changes" :key="change.column" class="mt-1 break-all font-mono text-muted-foreground">
+                      {{ change.column }} · {{ t("dataCompare.toleranceSource") }}: {{ formatValue(change.source) }} · {{ t("dataCompare.toleranceTarget") }}: {{ formatValue(change.target) }} · {{ t("dataCompare.toleranceDifference") }}: {{ change.absoluteDifference }} ≤ 0.01
+                    </div>
+                  </div>
+                </div>
+                <p v-if="item.diff.toleranceMatches!.length > detailPreviewLimitNumber" class="border-t px-3 py-2 text-[11px] text-muted-foreground">{{ t("dataCompare.tolerancePreviewHint", { shown: detailPreviewLimitNumber, total: item.diff.toleranceMatches!.length }) }}</p>
+              </details>
               <div v-for="item in batchResults.filter((entry) => entry.status === 'different')" :key="`details-${item.sourceTable}:${item.targetTable}`" class="rounded-lg border overflow-hidden">
                 <button type="button" class="flex w-full items-center gap-2 border-b bg-muted/30 px-3 py-2 text-left text-sm font-medium" @click="toggleTableExpanded(item)">
                   <ChevronDown v-if="item.expanded" class="h-4 w-4 shrink-0" />

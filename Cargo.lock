@@ -2284,6 +2284,7 @@ dependencies = [
  "mysql_async",
  "nix 0.31.3",
  "notify",
+ "num-bigint 0.4.8",
  "percent-encoding",
  "portpicker",
  "prometheus-parse",

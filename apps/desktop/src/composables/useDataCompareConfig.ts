@@ -28,6 +28,7 @@ export interface DataCompareConfig {
   detailPreviewLimit: string;
   compareMode: DataCompareMode;
   sampleSize: number;
+  amountToleranceEnabled?: boolean;
   /** Explicit match columns per source table; absent entry means "use the primary key". */
   keyColumnsByTable: Record<string, string[]>;
   ignoredColumnsByTable?: Record<string, string[]>;
@@ -47,6 +48,7 @@ export interface DataCompareConfigSnapshot {
   detailPreviewLimit: string;
   compareMode: DataCompareMode;
   sampleSize: number;
+  amountToleranceEnabled?: boolean;
   keyColumnsByTable: Record<string, string[]>;
   ignoredColumnsByTable?: Record<string, string[]>;
   keyExclusionsByTable?: Record<string, DataCompareKeyExclusion[]>;
@@ -99,6 +101,7 @@ function sanitizeConfig(raw: unknown): DataCompareConfig | undefined {
     detailPreviewLimit: typeof item.detailPreviewLimit === "string" ? item.detailPreviewLimit : "",
     compareMode: item.compareMode === "sample" ? "sample" : "full",
     sampleSize: normalizeDataCompareSampleSize(item.sampleSize ?? DEFAULT_DATA_COMPARE_SAMPLE_SIZE),
+    amountToleranceEnabled: item.amountToleranceEnabled === true,
     keyColumnsByTable: sanitizeKeyColumns(item.keyColumnsByTable),
     ignoredColumnsByTable: sanitizeKeyColumns(item.ignoredColumnsByTable),
     keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(item.keyExclusionsByTable),
@@ -148,6 +151,7 @@ export function useDataCompareConfig() {
       ...snapshot,
       selectedSourceTables: [...snapshot.selectedSourceTables],
       sampleSize: normalizeDataCompareSampleSize(snapshot.sampleSize),
+      amountToleranceEnabled: snapshot.amountToleranceEnabled === true,
       keyColumnsByTable: sanitizeKeyColumns(snapshot.keyColumnsByTable),
       ignoredColumnsByTable: sanitizeKeyColumns(snapshot.ignoredColumnsByTable),
       keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(snapshot.keyExclusionsByTable),
@@ -171,6 +175,7 @@ export function useDataCompareConfig() {
       ...patch,
       ...(patch.selectedSourceTables ? { selectedSourceTables: [...patch.selectedSourceTables] } : {}),
       ...(patch.sampleSize !== undefined ? { sampleSize: normalizeDataCompareSampleSize(patch.sampleSize) } : {}),
+      ...(patch.amountToleranceEnabled !== undefined ? { amountToleranceEnabled: patch.amountToleranceEnabled === true } : {}),
       ...(patch.keyColumnsByTable ? { keyColumnsByTable: sanitizeKeyColumns(patch.keyColumnsByTable) } : {}),
       ...(patch.ignoredColumnsByTable ? { ignoredColumnsByTable: sanitizeKeyColumns(patch.ignoredColumnsByTable) } : {}),
       ...(patch.keyExclusionsByTable ? { keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(patch.keyExclusionsByTable) } : {}),

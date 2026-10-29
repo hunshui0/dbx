@@ -482,6 +482,7 @@ mod tests {
     fn sample_data_preparation() -> DataCompareFromTablesPreparation {
         DataCompareFromTablesPreparation {
             result: DataCompareResult {
+                tolerance_matches: Vec::new(),
                 added: vec![DataCompareRow {
                     key: "1".to_string(),
                     key_values: HashMap::from([("id".to_string(), json!(1))]),

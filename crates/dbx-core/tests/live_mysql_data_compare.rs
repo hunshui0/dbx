@@ -183,6 +183,7 @@ async fn run_live_mysql_data_compare_two_databases_with_differences() {
     let preparation = prepare_data_compare_from_tables(
         &state,
         DataCompareFromTablesOptions {
+            amount_tolerance_enabled: false,
             where_condition: None,
             source_connection_id: connection_id.clone(),
             source_database: source_database.clone(),
