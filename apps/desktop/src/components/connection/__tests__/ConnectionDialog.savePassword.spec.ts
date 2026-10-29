@@ -215,6 +215,22 @@ function savePasswordCheckbox(): HTMLInputElement | null {
 }
 
 describe("ConnectionDialog save-password checkbox", () => {
+  it.each(["copy", "cut"])("blocks %s from a stored password but keeps ordinary text copying", async (type) => {
+    await mountDialog(redisConnection());
+    const password = document.querySelector<HTMLInputElement>("input[type=password]")!;
+    const setData = vi.fn();
+    const event = new Event(type, { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", { value: { setData } });
+    password.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(setData).not.toHaveBeenCalled();
+
+    const plain = document.querySelector<HTMLInputElement>('input:not([type="password"]):not([type="checkbox"])')!;
+    const plainEvent = new Event(type, { bubbles: true, cancelable: true });
+    plain.dispatchEvent(plainEvent);
+    expect(plainEvent.defaultPrevented).toBe(false);
+  });
+
   it("renders on the Redis form and toggles form.save_password", async () => {
     await mountDialog(redisConnection());
 

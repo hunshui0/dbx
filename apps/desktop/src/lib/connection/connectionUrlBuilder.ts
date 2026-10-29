@@ -12,17 +12,13 @@ import { redactConnectionStringSecrets } from "@/lib/connection/connectionString
  * usable in application code are produced, and unknown dialects are hidden
  * from the menu instead of guessing a wrong URL.
  *
- * Password safety: the primary formats (`url`, `jdbcUrl`, `dsn`) never embed
- * the stored password. Formats that do (`password`, `urlWithPassword`,
- * `jdbcUrlWithCredentials`, `dsnWithPassword`) are only offered when a
- * password is actually available, and the caller gates them behind an
- * explicit confirmation.
+ * Clipboard output never includes passwords. Legacy password-bearing format
+ * names are rejected even if invoked outside the current menu.
  */
 
-export type ConnectionUrlCopyFormat = "url" | "urlWithPassword" | "jdbcUrl" | "jdbcUrlWithCredentials" | "hostPort" | "dsn" | "dsnWithPassword" | "psqlCommand" | "password";
+export type ConnectionUrlCopyFormat = "url" | "jdbcUrl" | "hostPort" | "dsn" | "psqlCommand";
 
-/** Formats whose output embeds the stored password; callers should confirm before copying. */
-export const CONNECTION_URL_COPY_WITH_PASSWORD_FORMATS: ReadonlySet<ConnectionUrlCopyFormat> = new Set(["urlWithPassword", "jdbcUrlWithCredentials", "dsnWithPassword", "password"]);
+type RemovedPasswordCopyFormat = "urlWithPassword" | "jdbcUrlWithCredentials" | "dsnWithPassword" | "password";
 
 export type ConnectionUrlCopyConfig = Pick<ConnectionConfig, "db_type" | "host" | "port" | "username" | "password" | "database" | "url_params" | "ssl" | "connection_string"> & Partial<Pick<ConnectionConfig, "driver_profile" | "oracle_connection_type" | "external_config">>;
 
@@ -230,15 +226,8 @@ function encodeOracleUrlCredential(value: string): string {
   return Array.from(value, (character) => (ORACLE_URL_CREDENTIAL_LITERAL_CHARACTERS.has(character) ? character : encodeURIComponent(character))).join("");
 }
 
-function buildUserInfo(config: ConnectionUrlCopyConfig, includePassword: boolean, encode: (value: string) => string = encodeCredential, encodeUser: (value: string) => string = encode): string {
+function buildUserInfo(config: ConnectionUrlCopyConfig, encodeUser: (value: string) => string): string {
   const user = effectiveUsername(config);
-  const password = config.password ?? "";
-  if (includePassword) {
-    if (user && password) return `${encodeUser(user)}:${encode(password)}@`;
-    if (user) return `${encodeUser(user)}@`;
-    if (password) return `:${encode(password)}@`;
-    return "";
-  }
   return user ? `${encodeUser(user)}@` : "";
 }
 
@@ -281,11 +270,11 @@ function standardUrlQuery(config: ConnectionUrlCopyConfig, scheme: string): stri
   return joinNonEmpty("&", [raw, ...extras]);
 }
 
-function buildStandardUrl(config: ConnectionUrlCopyConfig, options: ConnectionUrlCopyOptions & { includePassword: boolean }): string | null {
+function buildStandardUrl(config: ConnectionUrlCopyConfig, options: ConnectionUrlCopyOptions): string | null {
   const explicit = explicitConnectionString(config);
   const scheme = standardUrlScheme(config);
   if (explicit && (!scheme || looksLikeConnectionString(explicit))) {
-    return options.includePassword ? explicit : redactConnectionStringSecrets(explicit);
+    return redactConnectionStringSecrets(explicit);
   }
   if (!scheme) return null;
   const host = config.host?.trim() ?? "";
@@ -294,7 +283,7 @@ function buildStandardUrl(config: ConnectionUrlCopyConfig, options: ConnectionUr
   const database = effectiveDatabase(config, options);
   const encode = scheme === "oceanbase" ? encodeOceanBaseUrlCredential : config.db_type === "oracle" ? encodeOracleUrlCredential : encodeCredential;
   const usesApiKey = config.db_type === "elasticsearch" && elasticsearchAuthTypeFromConfig(config.external_config) === "apiKey";
-  const userInfo = usesApiKey ? "" : buildUserInfo(config, options.includePassword, encode, scheme === "oceanbase" ? encodeOceanBaseUrlUsername : encode);
+  const userInfo = usesApiKey ? "" : buildUserInfo(config, scheme === "oceanbase" ? encodeOceanBaseUrlUsername : encode);
   const hostPart = formatHostForUrl(host);
   const portPart = shouldAppendPort(config) ? `:${config.port}` : "";
   const path = database ? `/${encodeURIComponent(database)}` : "";
@@ -324,64 +313,17 @@ function jdbcPrefixFor(config: ConnectionUrlCopyConfig): string | null {
   }
 }
 
-function jdbcCredentialParams(config: ConnectionUrlCopyConfig, withCredentials: boolean, encode: (value: string) => string = encodeURIComponent): string[] {
-  if (!withCredentials) return [];
-  const params: string[] = [];
-  const user = effectiveUsername(config);
-  if (user) params.push(`user=${encode(user)}`);
-  if (config.password) params.push(`password=${encode(config.password)}`);
-  return params;
-}
-
-/**
- * Oracle Easy Connect Plus properties are not URI query parameters. The
- * Oracle driver keeps percent escapes literal, so `^` must stay `^` rather
- * than becoming `%5E`. Values containing property delimiters cannot be
- * represented safely in the generated URL and are rejected by the caller.
- */
-function oracleJdbcCredentialValue(value: string): string {
-  return value;
-}
-
-function oracleJdbcCredentialCanBeEmbedded(value: string): boolean {
-  return !/[&=@\s\\"]/.test(value);
-}
-
-/**
- * Dialects whose JDBC URL is not `prefix://host:port/db?query`.
- * Returns `undefined` when the type is not a special dialect, `null` when the
- * dialect is special but cannot be built from this config.
- */
-/**
- * Oracle Easy Connect Plus property values are not URI-decoded by the driver,
- * so percent-encoding credentials produces a URL that silently changes the
- * password. Only values that can be embedded verbatim without breaking the
- * `?key=value&key=value` grammar are safe to offer as a with-credentials URL.
- */
-const ORACLE_SAFE_PROPERTY_VALUE = /^[A-Za-z0-9^%#_\-+!*'()]+$/;
-
-function isOracleSafePropertyValue(value: string): boolean {
-  return ORACLE_SAFE_PROPERTY_VALUE.test(value);
-}
-
-function buildSpecialJdbcUrl(config: ConnectionUrlCopyConfig, database: string, withCredentials: boolean): string | null | undefined {
+/** Special dialects with JDBC URL shapes other than prefix://host:port/db. */
+function buildSpecialJdbcUrl(config: ConnectionUrlCopyConfig, database: string): string | null | undefined {
   const host = config.host?.trim() ?? "";
   const rawParams = (config.url_params ?? "").trim();
-  const propertyStyle = config.db_type === "sqlserver" || config.db_type === "teradata" ? config.db_type : null;
-  if (config.db_type === "oracle" && withCredentials && [effectiveUsername(config), config.password ?? ""].some((value) => value && !oracleJdbcCredentialCanBeEmbedded(value))) return null;
-  const credentials = jdbcCredentialParams(config, withCredentials, propertyStyle ? (value) => quoteJdbcProperty(value, propertyStyle) : config.db_type === "oracle" ? oracleJdbcCredentialValue : encodeURIComponent);
 
   switch (config.db_type) {
     case "sqlserver": {
       const portPart = shouldAppendPort(config) ? `:${config.port}` : "";
       const params = normalizeJdbcProperties(rawParams, "sqlserver");
       if (!params) return null;
-      const props = joinNonEmpty(";", [
-        database && `databaseName=${quoteJdbcProperty(database, "sqlserver")}`,
-        ...credentials,
-        ...params.map(({ key, value }) => `${key}=${quoteJdbcProperty(value, "sqlserver")}`),
-        config.ssl && !params.some(({ key }) => key.toLowerCase() === "encrypt") && "encrypt=true",
-      ]);
+      const props = joinNonEmpty(";", [database && `databaseName=${quoteJdbcProperty(database, "sqlserver")}`, ...params.map(({ key, value }) => `${key}=${quoteJdbcProperty(value, "sqlserver")}`), config.ssl && !params.some(({ key }) => key.toLowerCase() === "encrypt") && "encrypt=true"]);
       return `jdbc:sqlserver://${formatHostForUrl(host)}${portPart}${props ? `;${props}` : ""}`;
     }
     case "oracle": {
@@ -391,18 +333,7 @@ function buildSpecialJdbcUrl(config: ConnectionUrlCopyConfig, database: string, 
         return explicit ? explicit : null;
       }
       const portPart = shouldAppendPort(config) ? `:${config.port}` : "";
-      // Oracle Easy Connect Plus does not URI-decode credentials. Offer the
-      // with-credentials item only when the stored values can be embedded
-      // verbatim; otherwise the copied URL would silently change the password.
-      let oracleCredentials: string[] = [];
-      if (withCredentials) {
-        const user = effectiveUsername(config);
-        const password = config.password ?? "";
-        if (user && !isOracleSafePropertyValue(user)) return null;
-        if (password && !isOracleSafePropertyValue(password)) return null;
-        oracleCredentials = jdbcCredentialParams(config, true, (value) => value);
-      }
-      const query = joinNonEmpty("&", [...oracleCredentials, rawParams.replace(/^[?&]+/, "")]);
+      const query = rawParams.replace(/^[?&]+/, "");
       if (connectionType === "sid") {
         return `jdbc:oracle:thin:@${formatHostForUrl(host)}${portPart}:${database}${query ? `?${query}` : ""}`;
       }
@@ -410,7 +341,7 @@ function buildSpecialJdbcUrl(config: ConnectionUrlCopyConfig, database: string, 
     }
     case "saphana": {
       const portPart = shouldAppendPort(config) ? `:${config.port}` : "";
-      const query = joinNonEmpty("&", [database && `databaseName=${database}`, ...credentials, rawParams.replace(/^[?&]+/, "")]);
+      const query = joinNonEmpty("&", [database && `databaseName=${database}`, rawParams.replace(/^[?&]+/, "")]);
       return `jdbc:sap://${formatHostForUrl(host)}${portPart}/${query ? `?${query}` : ""}`;
     }
     case "teradata": {
@@ -418,19 +349,19 @@ function buildSpecialJdbcUrl(config: ConnectionUrlCopyConfig, database: string, 
       if (!params) return null;
       // Teradata 20.00.00.56 unescapes before stripping boundary quotes.
       // Do not offer generated URLs that silently change a property value.
-      const values = [database, ...params.map(({ value }) => value), ...(withCredentials ? [effectiveUsername(config), config.password ?? ""] : [])];
+      const values = [database, ...params.map(({ value }) => value)];
       if (values.some((value) => value.startsWith("'") || value.endsWith("'"))) return null;
-      const props = joinNonEmpty(",", [Number(config.port) > 0 && `DBS_PORT=${config.port}`, database && `DATABASE=${quoteJdbcProperty(database, "teradata")}`, ...credentials, ...params.map(({ key, value }) => `${key}=${quoteJdbcProperty(value, "teradata")}`)]);
+      const props = joinNonEmpty(",", [Number(config.port) > 0 && `DBS_PORT=${config.port}`, database && `DATABASE=${quoteJdbcProperty(database, "teradata")}`, ...params.map(({ key, value }) => `${key}=${quoteJdbcProperty(value, "teradata")}`)]);
       return `jdbc:teradata://${formatHostForUrl(host)}${props ? `/${props}` : ""}`;
     }
     case "exasol": {
       const portPart = shouldAppendPort(config) ? `:${config.port}` : "";
-      const props = joinNonEmpty(";", [database && `schema=${database}`, ...credentials, rawParams.replace(/^[?&]+/, "").replace(/&/g, ";")]);
+      const props = joinNonEmpty(";", [database && `schema=${database}`, rawParams.replace(/^[?&]+/, "").replace(/&/g, ";")]);
       return `jdbc:exa:${formatHostForUrl(host)}${portPart}${props ? `;${props}` : ""}`;
     }
     case "snowflake": {
       if (!host) return null;
-      const query = joinNonEmpty("&", [database && `db=${database}`, ...credentials, rawParams.replace(/^[?&]+/, "")]);
+      const query = joinNonEmpty("&", [database && `db=${database}`, rawParams.replace(/^[?&]+/, "")]);
       return `jdbc:snowflake://${formatHostForUrl(host)}/${query ? `?${query}` : ""}`;
     }
     case "transwarp": {
@@ -446,7 +377,7 @@ function buildSpecialJdbcUrl(config: ConnectionUrlCopyConfig, database: string, 
       if (!prefix) return config.db_type === "gbase" ? null : undefined;
       const portPart = shouldAppendPort(config) ? `:${config.port}` : "";
       // Informix-style URLs append properties after a second colon: /db:INFORMIXSERVER=x;user=y
-      const props = joinNonEmpty(";", [rawParams.replace(/^[?:&]+/, ""), ...credentials.map((param) => decodeURIComponent(param))]);
+      const props = joinNonEmpty(";", [rawParams.replace(/^[?:&]+/, "")]);
       return `${prefix}://${formatHostForUrl(host)}${portPart}/${database}${props ? `:${props}` : ""}`;
     }
     default:
@@ -454,11 +385,9 @@ function buildSpecialJdbcUrl(config: ConnectionUrlCopyConfig, database: string, 
   }
 }
 
-function jdbcQuery(config: ConnectionUrlCopyConfig, prefix: string, withCredentials: boolean): string {
+function jdbcQuery(config: ConnectionUrlCopyConfig, prefix: string): string {
   const raw = (config.url_params ?? "").trim().replace(/^[?&]+/, "");
-  // OceanBase uses literal property values; other verified query-style drivers use percent encoding.
-  const encode = prefix === "jdbc:oceanbase" ? (value: string) => value : MYSQL_QUERY_JDBC_PREFIXES.has(prefix) || prefix === "jdbc:postgresql" ? encodeCredential : encodeURIComponent;
-  const parts = [...jdbcCredentialParams(config, withCredentials, encode)];
+  const parts: string[] = [];
   if (raw) parts.push(raw);
   if (config.ssl) {
     if (PG_JDBC_PREFIXES.has(prefix) && !queryHasParam(raw, ["ssl", "sslmode"])) {
@@ -472,23 +401,21 @@ function jdbcQuery(config: ConnectionUrlCopyConfig, prefix: string, withCredenti
   return joinNonEmpty("&", parts);
 }
 
-function buildJdbcUrl(config: ConnectionUrlCopyConfig, options: ConnectionUrlCopyOptions & { withCredentials: boolean }): string | null {
+function buildJdbcUrl(config: ConnectionUrlCopyConfig, options: ConnectionUrlCopyOptions): string | null {
   const explicit = explicitConnectionString(config);
-  if (explicit && /^jdbc:/i.test(explicit)) return options.withCredentials ? explicit : redactConnectionStringSecrets(explicit);
+  if (explicit && /^jdbc:/i.test(explicit)) return redactConnectionStringSecrets(explicit);
   const host = config.host?.trim() ?? "";
   if (!host) return null;
 
   const database = effectiveDatabase(config, options);
-  const special = buildSpecialJdbcUrl(config, database, options.withCredentials);
+  const special = buildSpecialJdbcUrl(config, database);
   if (special !== undefined) return special;
 
   const prefix = jdbcPrefixFor(config);
   if (!prefix) return null;
-  // The driver uses literal properties; these characters cannot also round-trip through the URL importer.
-  if (prefix === "jdbc:oceanbase" && options.withCredentials && [effectiveUsername(config), config.password ?? ""].some((value) => /[&;'"#%\s]/.test(value))) return null;
   const portPart = shouldAppendPort(config) ? `:${config.port}` : "";
   const path = database ? `/${encodeURIComponent(database)}` : "";
-  const query = jdbcQuery(config, prefix, options.withCredentials);
+  const query = jdbcQuery(config, prefix);
   return `${prefix}://${formatHostForUrl(host)}${portPart}${path}${query ? `?${query}` : ""}`;
 }
 
@@ -512,15 +439,14 @@ function isPostgresWireFamily(config: ConnectionUrlCopyConfig): boolean {
   return !(explicit && /^jdbc:/i.test(explicit));
 }
 
-/** libpq-style `host=... port=... user=... [password=...] dbname=...` DSN. */
-function buildKeyvalueDsn(config: ConnectionUrlCopyConfig, options: ConnectionUrlCopyOptions & { includePassword: boolean }): string | null {
+/** Password-free libpq-style `host=... port=... user=... dbname=...` DSN. */
+function buildKeyvalueDsn(config: ConnectionUrlCopyConfig, options: ConnectionUrlCopyOptions): string | null {
   const host = config.host?.trim() ?? "";
   if (!host) return null;
   const parts = [`host=${quoteDsnValue(host)}`];
   if (shouldAppendPort(config)) parts.push(`port=${config.port}`);
   const user = effectiveUsername(config);
   if (user) parts.push(`user=${quoteDsnValue(user)}`);
-  if (options.includePassword && config.password) parts.push(`password=${quoteDsnValue(config.password)}`);
   const database = effectiveDatabase(config, options);
   if (database) parts.push(`dbname=${quoteDsnValue(database)}`);
   const raw = (config.url_params ?? "").trim().replace(/^[?&]+/, "");
@@ -528,7 +454,7 @@ function buildKeyvalueDsn(config: ConnectionUrlCopyConfig, options: ConnectionUr
     const [key, ...rest] = param.split("=");
     if (!key.trim()) continue;
     // Raw URL parameters can carry a password even when config.password is empty.
-    const value = !options.includePassword && isSecretConnectionProperty(key) ? "***" : decodeURIComponent(rest.join("="));
+    const value = isSecretConnectionProperty(key) ? "***" : decodeURIComponent(rest.join("="));
     parts.push(`${key.trim()}=${quoteDsnValue(value)}`);
   }
   if (config.ssl && !queryHasParam(raw, ["sslmode"])) parts.push("sslmode=require");
@@ -549,67 +475,40 @@ function buildPsqlCommand(config: ConnectionUrlCopyConfig, options: ConnectionUr
 
 /**
  * Lists the copy formats available for a connection, deduplicating entries
- * that would produce identical text (e.g. no stored password, or an explicit
- * connection string that already is the JDBC URL). Password-inclusive formats
- * are only offered when a secret is actually available, so the plain items
- * are always safe to paste.
+ * that would produce identical text (e.g. an explicit connection string that
+ * already is the JDBC URL). Only password-free or redacted formats are offered.
  */
 export function connectionUrlCopyFormats(config: ConnectionUrlCopyConfig | undefined): ConnectionUrlCopyFormat[] {
   if (!connectionSupportsUrlCopy(config)) return [];
   const candidate = config as ConnectionUrlCopyConfig;
   const formats: ConnectionUrlCopyFormat[] = [];
-  const url = redactCopy(buildStandardUrl(candidate, { includePassword: false }));
-  const urlWithPassword = buildStandardUrl(candidate, { includePassword: true });
-  const jdbcUrl = redactCopy(buildJdbcUrl(candidate, { withCredentials: false }));
-  const jdbcUrlWithCredentials = buildJdbcUrl(candidate, { withCredentials: true });
-  // Judge the same strings offered by the menu; a secret may live only in URL parameters.
-  const hasSecret = !!candidate.password || [urlWithPassword, jdbcUrlWithCredentials].some((value) => value !== null && redactCopy(value) !== value);
+  const url = redactCopy(buildStandardUrl(candidate, {}));
+  const jdbcUrl = redactCopy(buildJdbcUrl(candidate, {}));
   if (url) formats.push("url");
-  if (urlWithPassword && hasSecret && urlWithPassword !== url) formats.push("urlWithPassword");
   if (jdbcUrl && jdbcUrl !== url) formats.push("jdbcUrl");
-  // Without a secret the "with credentials" URL would only add `user=` (or
-  // nothing), which is misleading next to its label — hide it in that case.
-  if (jdbcUrlWithCredentials && hasSecret && jdbcUrlWithCredentials !== jdbcUrl && jdbcUrlWithCredentials !== urlWithPassword && jdbcUrlWithCredentials !== url) formats.push("jdbcUrlWithCredentials");
   if (buildHostPort(candidate)) formats.push("hostPort");
   if (isPostgresWireFamily(candidate)) {
-    const dsn = buildKeyvalueDsn(candidate, { includePassword: false });
-    const dsnWithPassword = buildKeyvalueDsn(candidate, { includePassword: true });
+    const dsn = buildKeyvalueDsn(candidate, {});
     if (dsn) formats.push("dsn");
-    if (dsnWithPassword && hasSecret && dsnWithPassword !== dsn) formats.push("dsnWithPassword");
     if (buildPsqlCommand(candidate, {})) formats.push("psqlCommand");
   }
-  // The URL variants must percent-encode credentials to keep the URL parseable
-  // (`@` in a password becomes `%40`), so clients that never percent-decode —
-  // or simply pasting into another app's password field — need this verbatim
-  // escape hatch (issue #13388). Skipped for Elasticsearch API-key connections,
-  // where the stored secret is not a password.
-  const usesApiKey = candidate.db_type === "elasticsearch" && elasticsearchAuthTypeFromConfig(candidate.external_config) === "apiKey";
-  if (candidate.password && !usesApiKey) formats.push("password");
   return formats;
 }
 
-export function buildConnectionUrlCopy(config: ConnectionUrlCopyConfig | undefined, format: ConnectionUrlCopyFormat, options?: ConnectionUrlCopyOptions): string | null {
+export function buildConnectionUrlCopy(config: ConnectionUrlCopyConfig | undefined, format: ConnectionUrlCopyFormat | RemovedPasswordCopyFormat, options?: ConnectionUrlCopyOptions): string | null {
   if (!connectionSupportsUrlCopy(config)) return null;
   const candidate = config as ConnectionUrlCopyConfig;
   switch (format) {
     case "url":
-      return redactCopy(buildStandardUrl(candidate, { ...options, includePassword: false }));
-    case "urlWithPassword":
-      return buildStandardUrl(candidate, { ...options, includePassword: true });
+      return redactCopy(buildStandardUrl(candidate, options ?? {}));
     case "jdbcUrl":
-      return redactCopy(buildJdbcUrl(candidate, { ...options, withCredentials: false }));
-    case "jdbcUrlWithCredentials":
-      return buildJdbcUrl(candidate, { ...options, withCredentials: true });
+      return redactCopy(buildJdbcUrl(candidate, options ?? {}));
     case "hostPort":
-      return buildHostPort(candidate);
+      return redactCopy(buildHostPort(candidate));
     case "dsn":
-      return isPostgresWireFamily(candidate) ? buildKeyvalueDsn(candidate, { ...options, includePassword: false }) : null;
-    case "dsnWithPassword":
-      return isPostgresWireFamily(candidate) ? buildKeyvalueDsn(candidate, { ...options, includePassword: true }) : null;
+      return isPostgresWireFamily(candidate) ? redactCopy(buildKeyvalueDsn(candidate, options ?? {})) : null;
     case "psqlCommand":
-      return isPostgresWireFamily(candidate) ? buildPsqlCommand(candidate, options ?? {}) : null;
-    case "password":
-      return candidate.password || null;
+      return isPostgresWireFamily(candidate) ? redactCopy(buildPsqlCommand(candidate, options ?? {})) : null;
     default:
       return null;
   }

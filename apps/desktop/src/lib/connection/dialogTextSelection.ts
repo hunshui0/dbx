@@ -17,25 +17,9 @@ function isPasswordFieldTarget(target: EventTarget | null): target is HTMLInputE
   return target.type === "password" || target.hasAttribute("data-password-input");
 }
 
-/**
- * Copy the whole password value when a copy shortcut runs without a selection.
- *
- * A password input only copies its selection, so pressing Ctrl/Cmd+C with just
- * a caret writes nothing and leaves the previous clipboard content in place.
- * Users who reveal a stored password and copy it that way would then paste
- * whatever they copied earlier - typically the percent-encoded connection URL -
- * which looks like the password itself was escaped. Writing the field value
- * keeps the clipboard identical to what the field shows; an explicit selection
- * still copies the native substring.
- */
-export function copyDialogPasswordFieldValue(event: ClipboardEvent): boolean {
-  const input = event.target;
-  if (!isPasswordFieldTarget(input)) return false;
-  if ((input.selectionStart ?? 0) !== (input.selectionEnd ?? 0)) return false;
-  if (!input.value) return false;
-  const clipboard = event.clipboardData;
-  if (!clipboard) return false;
+/** Prevent password fields from writing secrets through copy or cut. */
+export function preventDialogPasswordCopy(event: ClipboardEvent): boolean {
+  if (!isPasswordFieldTarget(event.target)) return false;
   event.preventDefault();
-  clipboard.setData("text/plain", input.value);
   return true;
 }
