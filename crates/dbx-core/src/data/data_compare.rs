@@ -21,6 +21,7 @@ use crate::transfer::{
     wrap_dameng_identity_insert_sql_for_table,
 };
 
+use super::data_compare_filter::{combine_compare_filters, normalize_where_condition};
 use super::sample_pairing::retain_shared_sample_rows_by_key;
 
 const DATA_SYNC_INSERT_BATCH_SIZE: usize = 500;
@@ -70,6 +71,8 @@ pub struct DataComparePreparationOptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataCompareFromTablesOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub where_condition: Option<String>,
     pub source_connection_id: String,
     pub source_database: String,
     pub source_schema: String,
@@ -101,6 +104,8 @@ pub struct DataCompareFromTablesOptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataCompareMissingTargetOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub where_condition: Option<String>,
     pub source_connection_id: String,
     pub source_database: String,
     pub source_schema: String,
@@ -170,6 +175,8 @@ pub struct DataComparePreparation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataCompareSyncPlanTableOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub where_condition: Option<String>,
     pub table_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
@@ -340,6 +347,13 @@ pub struct VerifyDataResult {
 }
 
 pub fn prepare_data_compare(options: DataComparePreparationOptions) -> Result<DataComparePreparation, String> {
+    prepare_data_compare_where(options, "")
+}
+
+fn prepare_data_compare_where(
+    options: DataComparePreparationOptions,
+    where_condition: &str,
+) -> Result<DataComparePreparation, String> {
     let DataComparePreparationOptions {
         table_name,
         schema,
@@ -365,6 +379,7 @@ pub fn prepare_data_compare(options: DataComparePreparationOptions) -> Result<Da
         diff: &result,
         database_type,
         pre_sync_statements: &[],
+        where_condition,
     }]);
     Ok(DataComparePreparation { result, sync_statements: sync_plan.sync_statements, sync_sql: sync_plan.sync_sql })
 }
@@ -373,6 +388,7 @@ pub async fn prepare_data_compare_from_tables(
     state: &AppState,
     options: DataCompareFromTablesOptions,
 ) -> Result<DataCompareFromTablesPreparation, String> {
+    let where_condition = normalize_where_condition(options.where_condition.as_deref())?;
     let source_database_type = connection_database_type(state, &options.source_connection_id).await?;
     let target_database_type = connection_database_type(state, &options.target_connection_id).await?;
     ensure_data_compare_supported(source_database_type, "source")?;
@@ -400,20 +416,26 @@ pub async fn prepare_data_compare_from_tables(
         &aligned_source_column_names(&options.columns, options.source_columns.as_ref()),
         &options.key_columns,
     );
-    let source_filter = build_key_exclusion_filter(
-        source_database_type,
-        &options.key_columns,
-        &source_filter_keys,
-        &source_column_info.iter().cloned().map(data_grid_column_info).collect::<Vec<_>>(),
-        &options.key_exclusions,
-    )?;
-    let target_filter = build_key_exclusion_filter(
-        target_database_type,
-        &options.key_columns,
-        &options.key_columns,
-        &target_column_info.iter().cloned().map(data_grid_column_info).collect::<Vec<_>>(),
-        &options.key_exclusions,
-    )?;
+    let source_filter = combine_compare_filters(
+        &build_key_exclusion_filter(
+            source_database_type,
+            &options.key_columns,
+            &source_filter_keys,
+            &source_column_info.iter().cloned().map(data_grid_column_info).collect::<Vec<_>>(),
+            &options.key_exclusions,
+        )?,
+        &where_condition,
+    );
+    let target_filter = combine_compare_filters(
+        &build_key_exclusion_filter(
+            target_database_type,
+            &options.key_columns,
+            &options.key_columns,
+            &target_column_info.iter().cloned().map(data_grid_column_info).collect::<Vec<_>>(),
+            &options.key_exclusions,
+        )?,
+        &where_condition,
+    );
     let source_count_sql = build_filtered_compare_count_sql(
         source_database_type,
         &options.source_schema,
@@ -619,20 +641,23 @@ pub async fn prepare_data_compare_from_tables(
     let confidence_score =
         compute_confidence(sampling_rate, &degradation_level, row_count_match, source_row_count, target_row_count);
 
-    let preparation = prepare_data_compare(DataComparePreparationOptions {
-        table_name: options.target_table,
-        schema: Some(options.target_schema),
-        columns: columns.clone(),
-        key_columns: options.key_columns,
-        column_info: target_column_info
-            .into_iter()
-            .filter(|column| columns.iter().any(|name| name.eq_ignore_ascii_case(&column.name)))
-            .map(data_grid_column_info)
-            .collect(),
-        source_rows,
-        target_rows,
-        database_type: Some(target_database_type),
-    })?;
+    let preparation = prepare_data_compare_where(
+        DataComparePreparationOptions {
+            table_name: options.target_table,
+            schema: Some(options.target_schema),
+            columns: columns.clone(),
+            key_columns: options.key_columns,
+            column_info: target_column_info
+                .into_iter()
+                .filter(|column| columns.iter().any(|name| name.eq_ignore_ascii_case(&column.name)))
+                .map(data_grid_column_info)
+                .collect(),
+            source_rows,
+            target_rows,
+            database_type: Some(target_database_type),
+        },
+        &where_condition,
+    )?;
 
     let (sync_statements, sync_sql) =
         if sync_eligible { (preparation.sync_statements, preparation.sync_sql) } else { (Vec::new(), String::new()) };
@@ -661,6 +686,7 @@ pub async fn prepare_data_compare_missing_target(
     state: &AppState,
     options: DataCompareMissingTargetOptions,
 ) -> Result<DataCompareFromTablesPreparation, String> {
+    let where_condition = normalize_where_condition(options.where_condition.as_deref())?;
     let source_database_type = connection_database_type(state, &options.source_connection_id).await?;
     let target_database_type = connection_database_type(state, &options.target_connection_id).await?;
     ensure_data_compare_supported(source_database_type, "source")?;
@@ -693,13 +719,16 @@ pub async fn prepare_data_compare_missing_target(
         return Err("Binary columns cannot be used as data comparison keys".to_string());
     }
 
-    let source_filter = build_key_exclusion_filter(
-        source_database_type,
-        &options.key_columns,
-        &options.key_columns,
-        &source_columns.iter().cloned().map(data_grid_column_info).collect::<Vec<_>>(),
-        &options.key_exclusions,
-    )?;
+    let source_filter = combine_compare_filters(
+        &build_key_exclusion_filter(
+            source_database_type,
+            &options.key_columns,
+            &options.key_columns,
+            &source_columns.iter().cloned().map(data_grid_column_info).collect::<Vec<_>>(),
+            &options.key_exclusions,
+        )?,
+        &where_condition,
+    );
     let source_count_sql = build_filtered_compare_count_sql(
         source_database_type,
         &options.source_schema,
@@ -828,6 +857,7 @@ pub async fn prepare_data_compare_missing_target(
         diff: &result,
         database_type: Some(target_database_type),
         pre_sync_statements: &pre_sync_statements,
+        where_condition: &where_condition,
     }]);
 
     Ok(DataCompareFromTablesPreparation {
@@ -868,6 +898,7 @@ pub fn build_data_compare_sync_plan(options: DataCompareSyncPlanOptions) -> Data
             diff: &table.diff,
             database_type: table.database_type,
             pre_sync_statements: &table.pre_sync_statements,
+            where_condition: table.where_condition.as_deref().unwrap_or_default(),
         })
         .collect::<Vec<_>>();
     build_data_compare_sync_plan_from_refs(&tables)
@@ -875,6 +906,7 @@ pub fn build_data_compare_sync_plan(options: DataCompareSyncPlanOptions) -> Data
 
 #[derive(Debug, Clone, Copy)]
 struct DataCompareSyncPlanTableRef<'a> {
+    where_condition: &'a str,
     table_name: &'a str,
     schema: Option<&'a str>,
     columns: &'a [String],
@@ -892,6 +924,11 @@ fn build_data_compare_sync_plan_from_refs(tables: &[DataCompareSyncPlanTableRef<
     let mut delete_count = 0;
 
     for table in tables {
+        let Ok(where_condition) = normalize_where_condition(Some(table.where_condition)) else {
+            // Conditions are validated by comparison first. A malformed direct
+            // sync-plan request must not produce executable statements.
+            continue;
+        };
         insert_count += table.diff.added.len();
         update_count += table.diff.modified.iter().filter(|row| has_writable_changes(row, table.column_info)).count();
         delete_count += table.diff.removed.len();
@@ -904,6 +941,7 @@ fn build_data_compare_sync_plan_from_refs(tables: &[DataCompareSyncPlanTableRef<
             column_info: table.column_info,
             diff: table.diff,
             database_type: table.database_type,
+            where_condition: &where_condition,
         }));
     }
 
@@ -1050,6 +1088,7 @@ fn duplicate_key_error(label: &str, key_columns: &[String], key: &str) -> String
 
 #[derive(Debug, Clone, Copy)]
 struct GenerateDataSyncSqlOptions<'a> {
+    where_condition: &'a str,
     table_name: &'a str,
     schema: Option<&'a str>,
     columns: &'a [String],
@@ -1268,6 +1307,17 @@ fn is_postgres_sequence_backed_column(column_info: Option<&DataGridColumnInfo>) 
     extra.contains("identity") || extra.ends_with("serial") || default.starts_with("nextval(")
 }
 
+fn sync_where_by_key(
+    options: &GenerateDataSyncSqlOptions<'_>,
+    column_info: &[DataGridColumnInfo],
+    key_values: &HashMap<String, Value>,
+) -> String {
+    combine_compare_filters(
+        &where_by_key(key_values, options.key_columns, options.database_type, column_info),
+        options.where_condition,
+    )
+}
+
 fn generate_update_sync_statements(
     options: &GenerateDataSyncSqlOptions<'_>,
     table: &str,
@@ -1300,7 +1350,7 @@ fn generate_update_sync_statements(
                             let change = row.changes.iter().find(|change| change.column == **column)?;
                             Some(format!(
                                 "WHEN {} THEN {}",
-                                where_by_key(&row.key_values, options.key_columns, options.database_type, column_info),
+                                sync_where_by_key(options, column_info, &row.key_values),
                                 format_grid_sql_literal(
                                     &change.source,
                                     options.database_type,
@@ -1316,12 +1366,7 @@ fn generate_update_sync_statements(
                 .join(", ");
             let where_clause = chunk
                 .iter()
-                .map(|row| {
-                    format!(
-                        "({})",
-                        where_by_key(&row.key_values, options.key_columns, options.database_type, column_info)
-                    )
-                })
+                .map(|row| format!("({})", sync_where_by_key(options, column_info, &row.key_values)))
                 .collect::<Vec<_>>()
                 .join(" OR ");
             vec![format!("UPDATE {table} SET {assignments} WHERE {where_clause};")]
@@ -1352,10 +1397,7 @@ fn generate_single_update_statement(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
-        "UPDATE {table} SET {assignments} WHERE {};",
-        where_by_key(&row.key_values, options.key_columns, options.database_type, column_info)
-    )
+    format!("UPDATE {table} SET {assignments} WHERE {};", sync_where_by_key(options, column_info, &row.key_values))
 }
 
 fn generate_delete_sync_statements(
@@ -1371,17 +1413,12 @@ fn generate_delete_sync_statements(
             if chunk.len() == 1 {
                 return format!(
                     "DELETE FROM {table} WHERE {};",
-                    where_by_key(&chunk[0].key_values, options.key_columns, options.database_type, column_info)
+                    sync_where_by_key(options, column_info, &chunk[0].key_values)
                 );
             }
             let where_clause = chunk
                 .iter()
-                .map(|row| {
-                    format!(
-                        "({})",
-                        where_by_key(&row.key_values, options.key_columns, options.database_type, column_info)
-                    )
-                })
+                .map(|row| format!("({})", sync_where_by_key(options, column_info, &row.key_values)))
                 .collect::<Vec<_>>()
                 .join(" OR ");
             format!("DELETE FROM {table} WHERE {where_clause};")
@@ -2698,6 +2735,7 @@ pub async fn verify_data(state: &AppState, options: VerifyDataOptions) -> Result
     let enable_checksum = options.enable_checksum.unwrap_or(true);
 
     let from_tables_options = DataCompareFromTablesOptions {
+        where_condition: None,
         source_connection_id: options.source_connection_id,
         source_database: options.source_database,
         source_schema: options.source_schema,
@@ -3345,6 +3383,7 @@ mod tests {
     fn inserts_default_values_when_all_compared_columns_are_generated() {
         let plan = build_data_compare_sync_plan(DataCompareSyncPlanOptions {
             tables: vec![DataCompareSyncPlanTableOptions {
+                where_condition: None,
                 table_name: "generated_only_projection".to_string(),
                 schema: Some("public".to_string()),
                 columns: vec!["computed_value".to_string()],
@@ -3391,6 +3430,7 @@ mod tests {
     fn generated_only_changes_do_not_create_updates_or_increment_counts() {
         let plan = build_data_compare_sync_plan(DataCompareSyncPlanOptions {
             tables: vec![DataCompareSyncPlanTableOptions {
+                where_condition: None,
                 table_name: "generated_column_sync_test".to_string(),
                 schema: Some("public".to_string()),
                 columns: vec!["id".to_string(), "total_price".to_string()],
@@ -3457,6 +3497,7 @@ mod tests {
         });
         let plan = build_data_compare_sync_plan(DataCompareSyncPlanOptions {
             tables: vec![DataCompareSyncPlanTableOptions {
+                where_condition: None,
                 table_name: "generated_column_sync_test".to_string(),
                 schema: Some("public".to_string()),
                 columns: vec!["id".to_string(), "quantity".to_string(), "total_price".to_string()],
@@ -3526,6 +3567,7 @@ mod tests {
     fn builds_batch_sync_plan_from_selected_diffs() {
         let plan = build_data_compare_sync_plan(DataCompareSyncPlanOptions {
             tables: vec![DataCompareSyncPlanTableOptions {
+                where_condition: None,
                 table_name: "users".to_string(),
                 schema: Some("public".to_string()),
                 columns: vec!["id".to_string(), "name".to_string()],
@@ -3572,6 +3614,7 @@ mod tests {
     fn incomplete_comparisons_cannot_build_sync_statements() {
         let plan = build_data_compare_sync_plan(DataCompareSyncPlanOptions {
             tables: vec![DataCompareSyncPlanTableOptions {
+                where_condition: None,
                 table_name: "users".to_string(),
                 schema: Some("public".to_string()),
                 columns: vec!["id".to_string()],
@@ -3601,6 +3644,7 @@ mod tests {
     fn batches_added_rows_into_multi_value_insert_statements() {
         let plan = build_data_compare_sync_plan(DataCompareSyncPlanOptions {
             tables: vec![DataCompareSyncPlanTableOptions {
+                where_condition: None,
                 table_name: "users".to_string(),
                 schema: Some("public".to_string()),
                 columns: vec!["id".to_string(), "name".to_string()],
@@ -3643,6 +3687,7 @@ mod tests {
     fn batches_modified_rows_into_case_update_statements() {
         let plan = build_data_compare_sync_plan(DataCompareSyncPlanOptions {
             tables: vec![DataCompareSyncPlanTableOptions {
+                where_condition: None,
                 table_name: "users".to_string(),
                 schema: None,
                 columns: vec!["id".to_string(), "name".to_string(), "active".to_string()],
@@ -3701,6 +3746,7 @@ mod tests {
     fn batches_removed_rows_into_or_delete_statements() {
         let plan = build_data_compare_sync_plan(DataCompareSyncPlanOptions {
             tables: vec![DataCompareSyncPlanTableOptions {
+                where_condition: None,
                 table_name: "users".to_string(),
                 schema: Some("public".to_string()),
                 columns: vec!["id".to_string(), "name".to_string()],
@@ -3765,6 +3811,7 @@ mod tests {
 
         let owned_plan = build_data_compare_sync_plan(DataCompareSyncPlanOptions {
             tables: vec![DataCompareSyncPlanTableOptions {
+                where_condition: None,
                 table_name: "users".to_string(),
                 schema: Some("public".to_string()),
                 columns: columns.clone(),
@@ -3777,6 +3824,7 @@ mod tests {
             }],
         });
         let borrowed_plan = build_data_compare_sync_plan_from_refs(&[DataCompareSyncPlanTableRef {
+            where_condition: "",
             table_name: "users",
             schema: Some("public"),
             columns: &columns,
@@ -3799,6 +3847,7 @@ mod tests {
     fn build_sync_plan_keeps_missing_target_create_table_statement() {
         let plan = build_data_compare_sync_plan(DataCompareSyncPlanOptions {
             tables: vec![DataCompareSyncPlanTableOptions {
+                where_condition: None,
                 table_name: "users".to_string(),
                 schema: Some("public".to_string()),
                 columns: vec!["id".to_string(), "name".to_string()],
@@ -3829,6 +3878,7 @@ mod tests {
     fn missing_target_plan_omits_generated_columns_from_followup_insert() {
         let plan = build_data_compare_sync_plan(DataCompareSyncPlanOptions {
             tables: vec![DataCompareSyncPlanTableOptions {
+                where_condition: None,
                 table_name: "generated_column_sync_test".to_string(),
                 schema: Some("public".to_string()),
                 columns: vec!["id".to_string(), "quantity".to_string(), "total_price".to_string()],
@@ -4790,5 +4840,93 @@ mod tests {
 
         let unknown = aligned_source_key_columns(&columns, &source_columns, &["missing".to_string()]);
         assert_eq!(unknown, vec!["missing".to_string()]);
+    }
+
+    #[test]
+    fn where_condition_reaches_count_pages_and_all_sampling_strategies() {
+        let condition = normalize_where_condition(Some("STATUS = 'A' OR STATUS = 'B'")).unwrap();
+        let columns = vec!["ID".to_string(), "STATUS".to_string()];
+        let keys = vec!["ID".to_string()];
+        for database in [DatabaseType::Db2, DatabaseType::Mysql] {
+            let filter = combine_compare_filters("ID IS NOT NULL", &condition);
+            let count = build_filtered_compare_count_sql(database, "APP", "USERS", &filter);
+            assert!(count.contains(&format!("WHERE {filter}")));
+            for offset in [0, 1000, 2000] {
+                let sql = build_filtered_data_compare_select_sql(
+                    database, "APP", "USERS", &columns, &keys, 1000, offset, &filter,
+                );
+                assert!(sql.contains("ID IS NOT NULL"), "{sql}");
+                assert!(sql.contains("STATUS = 'A' OR STATUS = 'B'"), "{sql}");
+                if database == DatabaseType::Db2 {
+                    assert!(!sql.contains("LIMIT ") && !sql.contains("OFFSET "), "{sql}");
+                }
+            }
+            for strategy in [SamplingStrategy::Random, SamplingStrategy::ExtremeValues, SamplingStrategy::Hybrid] {
+                let sql = build_filtered_sampling_select_sql(
+                    database, "APP", "USERS", &columns, &keys, &strategy, 10, &filter,
+                );
+                assert!(sql.contains(&format!("WHERE {filter}")), "{sql}");
+                if database == DatabaseType::Db2 {
+                    assert!(!sql.contains("LIMIT ") && !sql.contains("OFFSET "), "{sql}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn where_condition_bounds_single_and_batched_sync_updates_and_deletes() {
+        for count in [1, 2] {
+            let source = (1..=count).map(|id| vec![json!(id), json!("new")]).collect();
+            let target = (1..=count * 2).map(|id| vec![json!(id), json!("old")]).collect();
+            let result = compare_data_rows(CompareDataRowsOptions {
+                columns: vec!["ID".into(), "STATUS".into()],
+                key_columns: vec!["ID".into()],
+                source_rows: source,
+                target_rows: target,
+            })
+            .unwrap();
+            let mut table = DataCompareSyncPlanTableOptions {
+                where_condition: Some("STATUS = 'old' OR STATUS IS NULL".into()),
+                table_name: "USERS".into(),
+                schema: Some("APP".into()),
+                columns: vec!["ID".into(), "STATUS".into()],
+                key_columns: vec!["ID".into()],
+                column_info: vec![data_compare_column("ID", "INT"), data_compare_column("STATUS", "VARCHAR")],
+                diff: result,
+                database_type: Some(DatabaseType::Mysql),
+                pre_sync_statements: vec![],
+                sync_eligible: true,
+            };
+            let plan = build_data_compare_sync_plan(DataCompareSyncPlanOptions { tables: vec![table.clone()] });
+            assert_eq!(plan.update_count, count);
+            assert_eq!(plan.delete_count, count);
+            assert!(!plan.sync_statements.is_empty());
+            for sql in &plan.sync_statements {
+                assert!(sql.contains("AND (STATUS = 'old' OR STATUS IS NULL)"), "{sql}");
+            }
+            table.where_condition = Some("ID > 0; DELETE FROM APP.USERS".into());
+            let invalid = build_data_compare_sync_plan(DataCompareSyncPlanOptions { tables: vec![table] });
+            assert!(invalid.sync_statements.is_empty());
+            assert_eq!(invalid.statement_count, 0);
+        }
+    }
+
+    #[test]
+    fn where_condition_is_optional_for_existing_compare_requests() {
+        let mut request = json!({
+            "sourceConnectionId": "source", "sourceDatabase": "APP", "sourceSchema": "APP", "sourceTable": "USERS",
+            "targetConnectionId": "target", "targetDatabase": "APP", "targetSchema": "APP", "targetTable": "USERS",
+            "columns": ["ID"], "keyColumns": ["ID"]
+        });
+        let legacy: DataCompareFromTablesOptions = serde_json::from_value(request.clone()).unwrap();
+        let missing: DataCompareMissingTargetOptions = serde_json::from_value(request.clone()).unwrap();
+        assert!(legacy.where_condition.is_none());
+        assert!(missing.where_condition.is_none());
+        assert!(serde_json::to_value(&legacy).unwrap().get("whereCondition").is_none());
+        request["whereCondition"] = json!("ID > 10");
+        let filtered: DataCompareFromTablesOptions = serde_json::from_value(request.clone()).unwrap();
+        let missing: DataCompareMissingTargetOptions = serde_json::from_value(request).unwrap();
+        assert_eq!(filtered.where_condition.as_deref(), Some("ID > 10"));
+        assert_eq!(missing.where_condition.as_deref(), Some("ID > 10"));
     }
 }

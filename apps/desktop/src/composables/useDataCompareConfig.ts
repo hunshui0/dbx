@@ -1,6 +1,6 @@
 import { computed, ref, watch } from "vue";
 import { uuid } from "@/lib/common/utils";
-import { DEFAULT_DATA_COMPARE_SAMPLE_SIZE, normalizeDataCompareSampleSize, normalizeDataCompareKeyExclusionsByTable, type DataCompareKeyExclusion, type DataCompareMode } from "@/lib/dataGrid/dataCompare";
+import { DEFAULT_DATA_COMPARE_SAMPLE_SIZE, normalizeDataCompareSampleSize, normalizeDataCompareKeyExclusionsByTable, normalizeDataCompareWhereConditions, type DataCompareKeyExclusion, type DataCompareMode } from "@/lib/dataGrid/dataCompare";
 
 /**
  * Persisted "Compare Data" task configuration.
@@ -32,6 +32,7 @@ export interface DataCompareConfig {
   keyColumnsByTable: Record<string, string[]>;
   ignoredColumnsByTable?: Record<string, string[]>;
   keyExclusionsByTable?: Record<string, DataCompareKeyExclusion[]>;
+  whereConditionsByTable?: Record<string, string>;
 }
 
 export interface DataCompareConfigSnapshot {
@@ -49,6 +50,7 @@ export interface DataCompareConfigSnapshot {
   keyColumnsByTable: Record<string, string[]>;
   ignoredColumnsByTable?: Record<string, string[]>;
   keyExclusionsByTable?: Record<string, DataCompareKeyExclusion[]>;
+  whereConditionsByTable?: Record<string, string>;
 }
 
 const STORAGE_KEY = "dbx-data-compare-configs";
@@ -100,6 +102,7 @@ function sanitizeConfig(raw: unknown): DataCompareConfig | undefined {
     keyColumnsByTable: sanitizeKeyColumns(item.keyColumnsByTable),
     ignoredColumnsByTable: sanitizeKeyColumns(item.ignoredColumnsByTable),
     keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(item.keyExclusionsByTable),
+    whereConditionsByTable: normalizeDataCompareWhereConditions(item.whereConditionsByTable),
   };
 }
 
@@ -148,6 +151,7 @@ export function useDataCompareConfig() {
       keyColumnsByTable: sanitizeKeyColumns(snapshot.keyColumnsByTable),
       ignoredColumnsByTable: sanitizeKeyColumns(snapshot.ignoredColumnsByTable),
       keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(snapshot.keyExclusionsByTable),
+      whereConditionsByTable: normalizeDataCompareWhereConditions(snapshot.whereConditionsByTable),
       id: uuid(),
       name: uniqueName(name),
       createdAt: now,
@@ -170,6 +174,7 @@ export function useDataCompareConfig() {
       ...(patch.keyColumnsByTable ? { keyColumnsByTable: sanitizeKeyColumns(patch.keyColumnsByTable) } : {}),
       ...(patch.ignoredColumnsByTable ? { ignoredColumnsByTable: sanitizeKeyColumns(patch.ignoredColumnsByTable) } : {}),
       ...(patch.keyExclusionsByTable ? { keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(patch.keyExclusionsByTable) } : {}),
+      ...(patch.whereConditionsByTable !== undefined ? { whereConditionsByTable: normalizeDataCompareWhereConditions(patch.whereConditionsByTable) } : {}),
       updatedAt: Date.now(),
     };
     configs.value = configs.value.map((config, position) => (position === index ? next : config));
@@ -205,6 +210,7 @@ export function useDataCompareConfig() {
       keyColumnsByTable: sanitizeKeyColumns(source.keyColumnsByTable),
       ignoredColumnsByTable: sanitizeKeyColumns(source.ignoredColumnsByTable),
       keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(source.keyExclusionsByTable),
+      whereConditionsByTable: normalizeDataCompareWhereConditions(source.whereConditionsByTable),
     };
     configs.value = [copy, ...configs.value].slice(0, MAX_CONFIGS);
     activeConfigId.value = copy.id;

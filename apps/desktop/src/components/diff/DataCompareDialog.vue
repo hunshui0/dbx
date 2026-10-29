@@ -25,6 +25,7 @@ import {
   normalizeDataCompareSampleSize,
   normalizeKeyColumns,
   normalizeDataCompareKeyExclusionsByTable,
+  normalizeDataCompareWhereConditions,
   sameKeyColumns,
   type CompareKeyColumnOption,
   type DataCompareCellValue,
@@ -47,6 +48,7 @@ import {
   type DiffKind,
 } from "@/composables/useDataCompareSession";
 import CompareKeyColumnsSelect from "@/components/diff/CompareKeyColumnsSelect.vue";
+import CompareTableCondition from "@/components/diff/CompareTableCondition.vue";
 import CompareKeyExclusions from "@/components/diff/CompareKeyExclusions.vue";
 import DataCompareConfigSelector from "@/components/diff/DataCompareConfigSelector.vue";
 import { useDataCompareConfig, type DataCompareConfig, type DataCompareConfigSnapshot } from "@/composables/useDataCompareConfig";
@@ -144,6 +146,7 @@ const showModified = ref(true);
 const keyColumnOverrides = ref<Record<string, string[]>>({});
 const ignoredColumnOverrides = ref<Record<string, string[]>>({});
 const keyExclusionOverrides = ref<Record<string, DataCompareKeyExclusion[]>>({});
+const whereConditionOverrides = ref<Record<string, string>>({});
 /** Column metadata per source table, keyed by table name; cleared with the source endpoint. */
 const tableColumns = ref<Record<string, CompareKeyColumnOption[]>>({});
 const tableColumnErrors = ref<Record<string, string>>({});
@@ -440,6 +443,7 @@ function pruneKeyColumnState(tables: string[]) {
   const keep = new Set(tables);
   ignoredColumnOverrides.value = Object.fromEntries(Object.entries(ignoredColumnOverrides.value).filter(([table]) => keep.has(table)));
   keyExclusionOverrides.value = Object.fromEntries(Object.entries(keyExclusionOverrides.value).filter(([table]) => keep.has(table)));
+  whereConditionOverrides.value = Object.fromEntries(Object.entries(whereConditionOverrides.value).filter(([table]) => keep.has(table)));
   const nextOverrides: Record<string, string[]> = {};
   let overridesChanged = false;
   for (const [table, columns] of Object.entries(keyColumnOverrides.value)) {
@@ -546,6 +550,7 @@ async function restoreDataCompareSession(session: DataCompareSession): Promise<v
     keyColumnOverrides.value = normalizeKeyColumnOverrides(config.keyColumnsByTable);
     ignoredColumnOverrides.value = normalizeKeyColumnOverrides(config.ignoredColumnsByTable);
     keyExclusionOverrides.value = normalizeDataCompareKeyExclusionsByTable(config.keyExclusionsByTable);
+    whereConditionOverrides.value = normalizeDataCompareWhereConditions(config.whereConditionsByTable);
     resetTableColumnMetadata();
     batchResults.value = session.batchResults;
     syncPlan.value = session.syncPlan;
@@ -578,6 +583,7 @@ function dataCompareConfigSnapshot(): DataCompareConfigSnapshot {
     keyColumnsByTable: buildSessionKeyColumnsByTable(),
     ignoredColumnsByTable: { ...ignoredColumnOverrides.value },
     keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(keyExclusionOverrides.value),
+    whereConditionsByTable: normalizeDataCompareWhereConditions(whereConditionOverrides.value),
   };
 }
 
@@ -636,6 +642,7 @@ async function applyDataCompareConfig(config: DataCompareConfig): Promise<void> 
     keyColumnOverrides.value = normalizeKeyColumnOverrides(config.keyColumnsByTable);
     ignoredColumnOverrides.value = normalizeKeyColumnOverrides(config.ignoredColumnsByTable);
     keyExclusionOverrides.value = normalizeDataCompareKeyExclusionsByTable(config.keyExclusionsByTable);
+    whereConditionOverrides.value = normalizeDataCompareWhereConditions(config.whereConditionsByTable);
     resetTableColumnMetadata();
     if (config.detailPreviewLimit) detailPreviewLimit.value = config.detailPreviewLimit;
     void prefetchSelectedTableColumns(selectedSourceTableNames.value);
@@ -731,6 +738,7 @@ function swapSourceTarget() {
   keyColumnOverrides.value = {};
   ignoredColumnOverrides.value = {};
   keyExclusionOverrides.value = {};
+  whereConditionOverrides.value = {};
   resetTableColumnMetadata();
   clearResult();
   void nextTick(() => {
@@ -1092,6 +1100,7 @@ function startCompare(): void {
       keyColumnsByTable: buildSessionKeyColumnsByTable(),
       ignoredColumnsByTable: { ...ignoredColumnOverrides.value },
       keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(keyExclusionOverrides.value),
+      whereConditionsByTable: normalizeDataCompareWhereConditions(whereConditionOverrides.value),
       compareMode: compareMode.value,
       sampleSize: normalizedSampleSize(),
       label: `${comparisonEndpointLabel(sourceConnectionId.value, sourceDatabase.value, sourceSchema.value)} → ${comparisonEndpointLabel(targetConnectionId.value, targetDatabase.value, targetSchema.value)}`,
@@ -1423,6 +1432,7 @@ watch(
     JSON.stringify(keyColumnOverrides.value),
     JSON.stringify(ignoredColumnOverrides.value),
     JSON.stringify(keyExclusionOverrides.value),
+    JSON.stringify(whereConditionOverrides.value),
   ],
   () => {
     if (suppressConfigSave || initializingPrefill || !dataCompareConfigId.value) return;
@@ -1677,6 +1687,7 @@ onBeforeUnmount(() => {
               <div class="text-[11px]" data-key-column-hint :class="singleKeyColumnRow.error || singleKeyColumnRow.status === 'missing' ? 'text-destructive' : 'text-muted-foreground'">
                 {{ singleKeyColumnRow.hint }}
               </div>
+              <CompareTableCondition v-model="whereConditionOverrides[singleKeyColumnRow.table]" :table="singleKeyColumnRow.table" :disabled="comparing || executionLocked" />
               <CompareKeyExclusions
                 :model-value="keyExclusionOverrides[singleKeyColumnRow.table] ?? []"
                 :columns="singleKeyColumnRow.columns"
@@ -1698,6 +1709,7 @@ onBeforeUnmount(() => {
                       <ChevronDown v-if="expandedKeyColumnTable === row.table" class="h-3.5 w-3.5 shrink-0" />
                       <ChevronRight v-else class="h-3.5 w-3.5 shrink-0" />
                       <span class="min-w-0 flex-1 truncate font-mono">{{ row.table }}</span>
+                      <span v-if="whereConditionOverrides[row.table]?.trim()" class="shrink-0 text-[10px] text-primary" :title="whereConditionOverrides[row.table]">{{ t("dataCompare.whereConditionActive") }}</span>
                       <span class="min-w-0 max-w-[45%] shrink-0 truncate font-mono" :class="row.columns.length > 0 ? (row.manual ? 'text-foreground' : 'text-muted-foreground') : 'text-destructive'">
                         {{ row.loading ? t("dataCompare.keyColumnsLoading") : row.columns.length > 0 ? row.columns.join(", ") : t("dataCompare.keyColumnsNeedsSelection") }}
                       </span>
@@ -1707,6 +1719,7 @@ onBeforeUnmount(() => {
                     </button>
                     <div v-if="expandedKeyColumnTable === row.table" class="space-y-1 border-t bg-muted/10 px-2 py-2">
                       <CompareKeyColumnsSelect :model-value="row.columns" :columns="columnsForTable(row.table)" :loading="row.loading" :disabled="comparing || executionLocked" @update:model-value="(columns) => setTableKeyColumns(row.table, columns)" />
+                      <CompareTableCondition v-model="whereConditionOverrides[row.table]" :table="row.table" :disabled="comparing || executionLocked" />
                       <CompareKeyExclusions :model-value="keyExclusionOverrides[row.table] ?? []" :columns="row.columns" :column-info="columnsForTable(row.table)" :disabled="comparing || executionLocked" @update:model-value="(rules) => setKeyExclusions(row.table, rules)" />
                       <div class="space-y-1" :data-ignored-columns-table="row.table">
                         <Label class="text-xs font-medium">{{ t("dataCompare.ignoredColumns") }}</Label>
@@ -1906,6 +1919,7 @@ onBeforeUnmount(() => {
                             {{ t("dataCompare.keyColumnsInline", { columns: item.keyColumns.join(", ") }) }}
                           </div>
                           <div v-if="item.ignoredColumns?.length" class="mt-1">{{ t("dataCompare.ignoredColumns") }}: {{ item.ignoredColumns.join(", ") }}</div>
+                          <div v-if="item.whereCondition" class="mt-1 break-all font-mono">WHERE {{ item.whereCondition }}</div>
                           <div v-if="item.keyExclusions?.length" class="mt-1 break-all">{{ t("dataCompare.filteredRowsHint") }} {{ keyExclusionsSummary(item.keyExclusions) }}</div>
                           <div v-if="item.status === 'different'" class="mt-1">
                             {{

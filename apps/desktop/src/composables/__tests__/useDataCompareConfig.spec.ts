@@ -162,3 +162,33 @@ describe("useDataCompareConfig", () => {
     expect(state.activeConfig.value).toBeNull();
   });
 });
+
+describe("per-table comparison search conditions", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.resetModules();
+  });
+
+  it("saves, restores, duplicates and clears independent per-table expressions", async () => {
+    const { useDataCompareConfig } = await import("../useDataCompareConfig");
+    const state = useDataCompareConfig();
+    const conditions = { users: " ID > 10 ", orders: "STATE = 'A'", logs: "  " };
+    const created = state.createConfig("Filtered", snapshot({ whereConditionsByTable: conditions }));
+    const copy = state.duplicateConfig(created.id)!;
+    conditions.users = "ID > 999";
+    copy.whereConditionsByTable!.users = "ID < 0";
+    expect(created.whereConditionsByTable).toEqual({ users: "ID > 10", orders: "STATE = 'A'" });
+    vi.resetModules();
+    const { useDataCompareConfig: restore } = await import("../useDataCompareConfig");
+    const restored = restore();
+    expect(restored.configs.value.find((item) => item.id === created.id)?.whereConditionsByTable).toEqual({ users: "ID > 10", orders: "STATE = 'A'" });
+    restored.updateConfig(created.id, { whereConditionsByTable: {} });
+    expect(restored.configs.value.find((item) => item.id === created.id)?.whereConditionsByTable).toEqual({});
+  });
+
+  it("loads old configurations without adding a filter", async () => {
+    localStorage.setItem(CONFIG_KEY, JSON.stringify([{ ...snapshot(), id: "old", name: "Old" }]));
+    const { useDataCompareConfig } = await import("../useDataCompareConfig");
+    expect(useDataCompareConfig().configs.value[0]?.whereConditionsByTable).toEqual({});
+  });
+});

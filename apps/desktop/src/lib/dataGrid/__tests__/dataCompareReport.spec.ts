@@ -45,6 +45,22 @@ const table: DataCompareReportTable = {
 };
 
 describe("buildDataCompareReportMarkdown", () => {
+  it("records the SQL predicate and marks otherwise unfiltered rows as filtered", () => {
+    const report = buildDataCompareReportMarkdown({
+      source: "DB2",
+      target: "TiDB",
+      compareMode: "full",
+      compareModeLabel: "Full",
+      sampleSize: 100,
+      generatedAt: new Date("2026-10-29T00:00:00Z"),
+      tables: [{ ...table, keyExclusions: [], whereCondition: "STATUS = 'A'" }],
+      syncSql: "",
+      labels,
+    });
+    expect(report).toContain('"whereCondition": "STATUS = \'A\'"');
+    expect(report).toContain('"rowScope": "filtered"');
+  });
+
   it("includes comparison metadata, every diff category, and partial-result details", () => {
     const report = buildDataCompareReportMarkdown({
       source: "DB2 / SALES",

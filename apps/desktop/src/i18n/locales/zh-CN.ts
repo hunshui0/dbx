@@ -9726,6 +9726,11 @@ export default withEnglishFallback({
     noTables: "没有可用表",
   },
   dataCompare: {
+    whereCondition: "搜索条件",
+    whereConditionPlaceholder: "例如：STATUS = 'A' AND CREATE_DATE >= '2026-01-01'",
+    whereConditionHint: "只填写 WHERE 后的条件，同时用于源表和目标表；留空比较全部数据。条件须适用于两侧数据库。",
+    whereConditionActive: "已筛选",
+
     configSelect: "选择或保存配置",
     configNew: "保存为新配置",
     configRename: "重命名配置",

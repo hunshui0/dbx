@@ -33,6 +33,12 @@ export function normalizeDataCompareKeyExclusionsByTable(value: unknown): Record
   );
 }
 
+/** Keep only non-empty per-table WHERE expressions from saved configurations. */
+export function normalizeDataCompareWhereConditions(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).flatMap(([table, condition]) => (table && typeof condition === "string" && condition.trim() ? [[table, condition.trim()]] : [])));
+}
+
 export const DEFAULT_DATA_COMPARE_SAMPLE_SIZE = 10_000;
 export const MAX_DATA_COMPARE_SAMPLE_SIZE = 10_000_000;
 
@@ -92,6 +98,7 @@ export interface DataCompareReportTable {
   keyColumns: string[];
   ignoredColumns?: string[];
   keyExclusions?: DataCompareKeyExclusion[];
+  whereCondition?: string;
   sourceRowCount: number;
   targetRowCount: number;
   sourceTruncated: boolean;
@@ -181,7 +188,8 @@ export function buildDataCompareReportMarkdown(options: DataCompareReportOptions
       keyColumns: table.keyColumns,
       ignoredColumns: table.ignoredColumns ?? [],
       keyExclusions: table.keyExclusions ?? [],
-      rowScope: table.keyExclusions?.length ? "filtered" : "unfiltered",
+      whereCondition: table.whereCondition ?? "",
+      rowScope: table.keyExclusions?.length || table.whereCondition?.trim() ? "filtered" : "unfiltered",
       addedCount: table.diff.added.length,
       removedCount: table.diff.removed.length,
       modifiedCount: table.diff.modified.length,
@@ -241,6 +249,7 @@ export interface DataCompareFromTablesOptions {
   keyColumns: string[];
   ignoredColumns?: string[];
   keyExclusions?: DataCompareKeyExclusion[];
+  whereCondition?: string;
   /** Source-side column names aligned positionally with `columns`; needed when the two databases store identifier case differently (e.g. SQL Server vs Oracle). */
   sourceColumns?: string[];
   fetchBatchSize?: number;
@@ -262,6 +271,7 @@ export interface DataCompareMissingTargetOptions {
   keyColumns: string[];
   ignoredColumns?: string[];
   keyExclusions?: DataCompareKeyExclusion[];
+  whereCondition?: string;
   fetchBatchSize?: number;
   degradationThreshold?: DegradationThreshold;
   compareMode?: DataCompareMode;
@@ -281,6 +291,7 @@ export interface DataCompareFromTablesPreparation extends DataComparePreparation
 }
 
 export interface DataCompareSyncPlanTableOptions {
+  whereCondition?: string;
   tableName: string;
   schema?: string;
   columns: string[];

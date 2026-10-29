@@ -9759,6 +9759,11 @@ export default {
     noTables: "No tables available",
   },
   dataCompare: {
+    whereCondition: "Search condition",
+    whereConditionPlaceholder: "e.g. STATUS = 'A' AND CREATE_DATE >= '2026-01-01'",
+    whereConditionHint: "Enter only the expression after WHERE. Applied to both tables; leave blank for all rows. Use syntax and column names valid on both sides.",
+    whereConditionActive: "Filtered",
+
     configSelect: "Select or save a config",
     configNew: "Save as new config",
     configRename: "Rename config",

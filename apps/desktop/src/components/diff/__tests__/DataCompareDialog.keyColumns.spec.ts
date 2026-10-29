@@ -256,6 +256,20 @@ function setupMocks() {
 }
 
 describe("DataCompareDialog match columns", () => {
+  it("accepts the expression after WHERE and passes it to this table's comparison", async () => {
+    setupMocks();
+    await openWithPrefilledSource("USERS");
+    const input = document.querySelector<HTMLTextAreaElement>('[data-where-condition-table="USERS"] textarea')!;
+    expect(input).not.toBeNull();
+    expect(input.labels?.[0]?.textContent).toBe(i18n.global.t("dataCompare.whereCondition"));
+    input.value = "USER_ID >= 10 AND NAME IS NOT NULL";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await flushAsyncSetup();
+    compareButton()?.click();
+    await flushAsyncSetup();
+    expect(mocks.prepareDataCompareFromTables.mock.calls[0]?.[0].whereCondition).toBe("USER_ID >= 10 AND NAME IS NOT NULL");
+  });
+
   it("configures excluded values for a match column before comparing", async () => {
     setupMocks();
     await openWithPrefilledSource("USERS");
@@ -373,6 +387,33 @@ describe("DataCompareDialog match columns", () => {
     await flushAsyncSetup();
 
     expect(keyColumnTrigger()?.textContent?.trim()).toBe("TENANT_ID, ORDER_ID");
+  });
+
+  it("keeps independent search conditions when switching between single and batch table settings", async () => {
+    setupMocks();
+    await openWithPrefilledSource("USERS");
+    const users = document.querySelector<HTMLTextAreaElement>('[data-where-condition-table="USERS"] textarea')!;
+    users.value = "USER_ID > 10";
+    users.dispatchEvent(new Event("input", { bubbles: true }));
+    await flushAsyncSetup();
+    tableSelectionRow("ORDERS")?.click();
+    await flushAsyncSetup();
+    keyColumnRow("ORDERS")?.click();
+    await flushAsyncSetup();
+    const orders = document.querySelector<HTMLTextAreaElement>('[data-where-condition-table="ORDERS"] textarea')!;
+    orders.value = "AMOUNT >= 100";
+    orders.dispatchEvent(new Event("input", { bubbles: true }));
+    await flushAsyncSetup();
+    expect(keyColumnRow("ORDERS")?.textContent).toContain(i18n.global.t("dataCompare.whereConditionActive"));
+    keyColumnRow("USERS")?.click();
+    await flushAsyncSetup();
+    expect(document.querySelector<HTMLTextAreaElement>('[data-where-condition-table="USERS"] textarea')?.value).toBe("USER_ID > 10");
+    compareButton()?.click();
+    await flushAsyncSetup();
+    expect(mocks.prepareDataCompareFromTables.mock.calls.map(([options]) => [options.sourceTable, options.whereCondition])).toEqual([
+      ["USERS", "USER_ID > 10"],
+      ["ORDERS", "AMOUNT >= 100"],
+    ]);
   });
 
   it("configures match columns per table in a batch compare", async () => {

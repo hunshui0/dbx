@@ -400,3 +400,32 @@ test("keeps selection counts and generated plans consistent without changing dif
   assert.equal(table.diff.added, rows);
   assert.deepEqual(rows[0], { key: "1", keyValues: { id: 1 }, values: { id: 1 } });
 });
+
+test("snapshots a separate WHERE expression for each table and retains it in sync plans", async () => {
+  const conditions = { users: " user_id > 10 ", orders: "amount > 0" };
+  const pending = runSession(baseConfig({ selectedSourceTables: ["users", "orders"], whereConditionsByTable: conditions }), [
+    { sourceTable: "users", targetTable: "users" },
+    { sourceTable: "orders", targetTable: "orders" },
+  ]);
+  conditions.users = "user_id > 999";
+  const session = await pending;
+  assert.equal(session.status, "completed");
+  assert.equal(apiMock.prepareDataCompareFromTables.mock.calls[0]?.[0].whereCondition, "user_id > 10");
+  assert.equal(apiMock.prepareDataCompareFromTables.mock.calls[1]?.[0].whereCondition, "amount > 0");
+  assert.deepEqual(
+    session.batchResults.map((table) => table.whereCondition),
+    ["user_id > 10", "amount > 0"],
+  );
+  assert.deepEqual(
+    buildDataCompareSyncPlanTables(session.batchResults, "public").map((table) => table.whereCondition),
+    ["user_id > 10", "amount > 0"],
+  );
+});
+
+test("passes the search expression when the target table is missing", async () => {
+  apiMock.prepareDataCompareMissingTarget.mockResolvedValue(preparationFor("users"));
+  const session = await runSession(baseConfig({ targetTables: [], whereConditionsByTable: { users: "user_id IN (1, 2)" } }), [{ sourceTable: "users", targetTable: "users" }]);
+  assert.equal(session.status, "completed");
+  assert.equal(apiMock.prepareDataCompareMissingTarget.mock.calls[0]?.[0].whereCondition, "user_id IN (1, 2)");
+  assert.equal(session.batchResults[0]?.whereCondition, "user_id IN (1, 2)");
+});

@@ -3,6 +3,7 @@ pub mod correction;
 pub mod csv_export;
 pub mod dameng_dump;
 pub mod data_compare;
+mod data_compare_filter;
 pub mod database_export;
 pub mod docs;
 mod duckdb_export;
