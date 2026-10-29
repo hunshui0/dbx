@@ -29,6 +29,7 @@ export interface DataCompareConfig {
   compareMode: DataCompareMode;
   sampleSize: number;
   amountToleranceEnabled?: boolean;
+  nullEqualsEmpty?: boolean;
   /** Explicit match columns per source table; absent entry means "use the primary key". */
   keyColumnsByTable: Record<string, string[]>;
   ignoredColumnsByTable?: Record<string, string[]>;
@@ -49,6 +50,7 @@ export interface DataCompareConfigSnapshot {
   compareMode: DataCompareMode;
   sampleSize: number;
   amountToleranceEnabled?: boolean;
+  nullEqualsEmpty?: boolean;
   keyColumnsByTable: Record<string, string[]>;
   ignoredColumnsByTable?: Record<string, string[]>;
   keyExclusionsByTable?: Record<string, DataCompareKeyExclusion[]>;
@@ -102,6 +104,7 @@ function sanitizeConfig(raw: unknown): DataCompareConfig | undefined {
     compareMode: item.compareMode === "sample" ? "sample" : "full",
     sampleSize: normalizeDataCompareSampleSize(item.sampleSize ?? DEFAULT_DATA_COMPARE_SAMPLE_SIZE),
     amountToleranceEnabled: item.amountToleranceEnabled === true,
+    nullEqualsEmpty: item.nullEqualsEmpty === true,
     keyColumnsByTable: sanitizeKeyColumns(item.keyColumnsByTable),
     ignoredColumnsByTable: sanitizeKeyColumns(item.ignoredColumnsByTable),
     keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(item.keyExclusionsByTable),
@@ -152,6 +155,7 @@ export function useDataCompareConfig() {
       selectedSourceTables: [...snapshot.selectedSourceTables],
       sampleSize: normalizeDataCompareSampleSize(snapshot.sampleSize),
       amountToleranceEnabled: snapshot.amountToleranceEnabled === true,
+      nullEqualsEmpty: snapshot.nullEqualsEmpty === true,
       keyColumnsByTable: sanitizeKeyColumns(snapshot.keyColumnsByTable),
       ignoredColumnsByTable: sanitizeKeyColumns(snapshot.ignoredColumnsByTable),
       keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(snapshot.keyExclusionsByTable),
@@ -176,6 +180,7 @@ export function useDataCompareConfig() {
       ...(patch.selectedSourceTables ? { selectedSourceTables: [...patch.selectedSourceTables] } : {}),
       ...(patch.sampleSize !== undefined ? { sampleSize: normalizeDataCompareSampleSize(patch.sampleSize) } : {}),
       ...(patch.amountToleranceEnabled !== undefined ? { amountToleranceEnabled: patch.amountToleranceEnabled === true } : {}),
+      ...(patch.nullEqualsEmpty !== undefined ? { nullEqualsEmpty: patch.nullEqualsEmpty === true } : {}),
       ...(patch.keyColumnsByTable ? { keyColumnsByTable: sanitizeKeyColumns(patch.keyColumnsByTable) } : {}),
       ...(patch.ignoredColumnsByTable ? { ignoredColumnsByTable: sanitizeKeyColumns(patch.ignoredColumnsByTable) } : {}),
       ...(patch.keyExclusionsByTable ? { keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(patch.keyExclusionsByTable) } : {}),

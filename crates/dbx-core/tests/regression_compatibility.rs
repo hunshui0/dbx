@@ -238,7 +238,13 @@ fn sql_risk_multi_statement_invariant() {
 #[test]
 fn data_compare_from_tables_preparation_optional_fields_default() {
     let prep = DataCompareFromTablesPreparation {
-        result: DataCompareResult { tolerance_matches: Vec::new(), added: vec![], removed: vec![], modified: vec![] },
+        result: DataCompareResult {
+            tolerance_matches: Vec::new(),
+            null_empty_matches: Vec::new(),
+            added: vec![],
+            removed: vec![],
+            modified: vec![],
+        },
         sync_statements: vec![],
         sync_sql: String::new(),
         pre_sync_statements: vec![],
@@ -311,6 +317,7 @@ fn incomplete_data_compare_cannot_generate_sync_sql() {
             column_info: Vec::new(),
             diff: DataCompareResult {
                 tolerance_matches: Vec::new(),
+                null_empty_matches: Vec::new(),
                 added: vec![DataCompareRow {
                     key: "1".to_string(),
                     key_values: HashMap::from([(String::from("id"), serde_json::json!(1))]),
@@ -334,7 +341,13 @@ fn incomplete_data_compare_cannot_generate_sync_sql() {
 #[test]
 fn data_compare_preparation_format_stable() {
     let prep = DataComparePreparation {
-        result: DataCompareResult { tolerance_matches: Vec::new(), added: vec![], removed: vec![], modified: vec![] },
+        result: DataCompareResult {
+            tolerance_matches: Vec::new(),
+            null_empty_matches: Vec::new(),
+            added: vec![],
+            removed: vec![],
+            modified: vec![],
+        },
         sync_statements: vec!["INSERT INTO t VALUES (1)".to_string()],
         sync_sql: "INSERT INTO t VALUES (1)".to_string(),
     };

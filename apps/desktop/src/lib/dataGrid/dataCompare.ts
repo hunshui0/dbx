@@ -86,6 +86,7 @@ export interface DataCompareModifiedRow {
 }
 
 export interface DataCompareResult {
+  nullEmptyMatches?: DataCompareNullEmptyMatch[];
   toleranceMatches?: DataCompareToleranceMatch[];
   added: DataCompareRow[];
   removed: DataCompareRow[];
@@ -98,6 +99,67 @@ export interface DataCompareToleranceMatch {
   sourceValues: Record<string, DataCompareCellValue>;
   targetValues: Record<string, DataCompareCellValue>;
   changes: Array<DataCompareChangedCell & { absoluteDifference: string }>;
+}
+
+export interface DataCompareNullEmptyMatch {
+  key: string;
+  keyValues: Record<string, DataCompareCellValue>;
+  changes: DataCompareChangedCell[];
+}
+
+type DifferenceTable = Pick<DataCompareReportTable, "sourceTable" | "keyColumns" | "columns"> & { diff: Pick<DataCompareResult, "added" | "removed" | "modified"> };
+
+/** Project export records without modifying the full rows used by synchronization. */
+export function dataCompareDifferenceEntries(table: DifferenceTable) {
+  const keyColumns = new Set(table.keyColumns.map((column) => column.toLowerCase()));
+  return {
+    added: table.diff.added.map((row) => ({
+      keyValues: row.keyValues,
+      ...("selected" in row ? { selected: row.selected } : {}),
+      targetRowMissing: true,
+      changes: table.columns.filter((column) => !keyColumns.has(column.toLowerCase())).map((column) => ({ column, source: row.values[column] ?? null, target: null })),
+    })),
+    removed: table.diff.removed.map((row) => ({
+      keyValues: row.keyValues,
+      ...("selected" in row ? { selected: row.selected } : {}),
+      sourceRowMissing: true,
+      changes: table.columns.filter((column) => !keyColumns.has(column.toLowerCase())).map((column) => ({ column, source: null, target: row.values[column] ?? null })),
+    })),
+    modified: table.diff.modified.map((row) => ({ keyValues: row.keyValues, ...("selected" in row ? { selected: row.selected } : {}), changes: row.changes })),
+  };
+}
+
+export function dataCompareReportCell(value: DataCompareCellValue): DataCompareCellValue {
+  return value === null ? "NULL" : value === "" || value === "NULL" ? JSON.stringify(value) : value;
+}
+
+export function buildDataCompareDifferenceWorksheets(tables: ReadonlyArray<DifferenceTable>, labels: { kind: string; field: string; source: string; target: string; added: string; removed: string; modified: string; rowPresence: string; present: string; absent: string }) {
+  return tables.map((table) => {
+    const entries = dataCompareDifferenceEntries(table);
+    return {
+      sheetName: table.sourceTable,
+      columns: [labels.kind, ...table.keyColumns, labels.field, labels.source, labels.target],
+      rows: (["added", "removed", "modified"] as const).flatMap((kind) =>
+        entries[kind].flatMap((row) => {
+          const keys = table.keyColumns.map((key) => dataCompareReportCell(row.keyValues[key] ?? null));
+          if (row.changes.length === 0) return [[labels[kind], ...keys, labels.rowPresence, kind === "removed" ? labels.absent : labels.present, kind === "added" ? labels.absent : labels.present]];
+          return row.changes.map((change) => [labels[kind], ...keys, change.column, kind === "removed" ? labels.absent : dataCompareReportCell(change.source), kind === "added" ? labels.absent : dataCompareReportCell(change.target)]);
+        }),
+      ),
+      autoFilter: false,
+    };
+  });
+}
+
+export function buildDataCompareNullEmptyWorksheets(tables: ReadonlyArray<{ sourceTable: string; keyColumns: string[]; diff: Pick<DataCompareResult, "nullEmptyMatches"> }>, labels: { suffix: string; field: string; source: string; target: string; rule: string; ruleValue: string }) {
+  return tables
+    .filter((table) => table.diff.nullEmptyMatches?.length)
+    .map((table) => ({
+      sheetName: `${table.sourceTable}-${labels.suffix}`,
+      columns: [...table.keyColumns, labels.field, labels.source, labels.target, labels.rule],
+      rows: table.diff.nullEmptyMatches!.flatMap((row) => row.changes.map((change) => [...table.keyColumns.map((key) => dataCompareReportCell(row.keyValues[key] ?? null)), change.column, dataCompareReportCell(change.source), dataCompareReportCell(change.target), labels.ruleValue])),
+      autoFilter: false,
+    }));
 }
 
 /** One audit row per tolerated cell, preserving keyed source/target values as supplied. */
@@ -113,6 +175,7 @@ export function buildDataCompareToleranceWorksheets(tables: ReadonlyArray<{ sour
 }
 
 export interface DataCompareReportTable {
+  nullEqualsEmpty?: boolean;
   amountToleranceEnabled?: boolean;
   sourceTable: string;
   targetTable: string;
@@ -129,6 +192,7 @@ export interface DataCompareReportTable {
   rowBudget: number;
   syncEligible: boolean;
   diff: {
+    nullEmptyMatches?: DataCompareNullEmptyMatch[];
     toleranceMatches?: DataCompareToleranceMatch[];
     added: Array<DataCompareRow & { selected: boolean }>;
     removed: Array<DataCompareRow & { selected: boolean }>;
@@ -138,6 +202,7 @@ export interface DataCompareReportTable {
 }
 
 export interface DataCompareReportLabels {
+  nullEmptyMatches?: string;
   toleranceMatches?: string;
   title: string;
   overview: string;
@@ -200,53 +265,62 @@ export function buildDataCompareReportMarkdown(options: DataCompareReportOptions
     tableCount: tables.length,
     totals,
   };
-  const tableSections = tables.map((table, index) => {
-    const summary = {
-      sourceTable: table.sourceTable,
-      targetTable: table.targetTable,
-      status: table.status,
-      sourceRowCount: table.sourceRowCount,
-      targetRowCount: table.targetRowCount,
-      rowBudget: table.rowBudget,
-      sourceTruncated: table.sourceTruncated,
-      targetTruncated: table.targetTruncated,
-      syncEligible: table.syncEligible,
-      columns: table.columns,
-      keyColumns: table.keyColumns,
-      ignoredColumns: table.ignoredColumns ?? [],
-      keyExclusions: table.keyExclusions ?? [],
-      whereCondition: table.whereCondition ?? "",
-      rowScope: table.keyExclusions?.length || table.whereCondition?.trim() ? "filtered" : "unfiltered",
-      addedCount: table.diff.added.length,
-      removedCount: table.diff.removed.length,
-      modifiedCount: table.diff.modified.length,
-      amountTolerance: table.amountToleranceEnabled ? DATA_COMPARE_AMOUNT_TOLERANCE : null,
-      toleranceMatchedRows: table.diff.toleranceMatches?.length ?? 0,
-      ...(table.error ? { error: table.error } : {}),
-    };
-    return [
-      `### ${labels.table} ${index + 1}`,
-      "",
-      jsonBlock(summary),
-      table.sourceTruncated || table.targetTruncated ? `\n\n${labels.partialResult}` : "",
-      "",
-      `#### ${labels.sourceOnlyRows} (${table.diff.added.length})`,
-      "",
-      jsonBlock(table.diff.added),
-      "",
-      `#### ${labels.targetOnlyRows} (${table.diff.removed.length})`,
-      "",
-      jsonBlock(table.diff.removed),
-      "",
-      `#### ${labels.modifiedRows} (${table.diff.modified.length})`,
-      "",
-      jsonBlock(table.diff.modified),
-      "",
-      `#### ${labels.toleranceMatches ?? "Tolerance matches"} (${table.diff.toleranceMatches?.length ?? 0})`,
-      "",
-      jsonBlock(table.diff.toleranceMatches ?? []),
-    ].join("\n");
-  });
+  const tableSections = tables
+    .filter((table) => table.status !== "same" || table.sourceRowCount !== table.targetRowCount || table.diff.added.length || table.diff.removed.length || table.diff.modified.length || table.diff.toleranceMatches?.length || table.diff.nullEmptyMatches?.length)
+    .map((table, index) => {
+      const differences = dataCompareDifferenceEntries(table);
+      const summary = {
+        sourceTable: table.sourceTable,
+        targetTable: table.targetTable,
+        status: table.status,
+        sourceRowCount: table.sourceRowCount,
+        targetRowCount: table.targetRowCount,
+        rowBudget: table.rowBudget,
+        sourceTruncated: table.sourceTruncated,
+        targetTruncated: table.targetTruncated,
+        syncEligible: table.syncEligible,
+        comparedColumnCount: table.columns.length,
+        keyColumns: table.keyColumns,
+        ignoredColumns: table.ignoredColumns ?? [],
+        keyExclusions: table.keyExclusions ?? [],
+        whereCondition: table.whereCondition ?? "",
+        rowScope: table.keyExclusions?.length || table.whereCondition?.trim() ? "filtered" : "unfiltered",
+        addedCount: table.diff.added.length,
+        removedCount: table.diff.removed.length,
+        modifiedCount: table.diff.modified.length,
+        amountTolerance: table.amountToleranceEnabled ? DATA_COMPARE_AMOUNT_TOLERANCE : null,
+        nullEqualsEmpty: table.nullEqualsEmpty === true,
+        nullEmptyMatchedRows: table.diff.nullEmptyMatches?.length ?? 0,
+        toleranceMatchedRows: table.diff.toleranceMatches?.length ?? 0,
+        ...(table.error ? { error: table.error } : {}),
+      };
+      return [
+        `### ${labels.table} ${index + 1}`,
+        "",
+        jsonBlock(summary),
+        table.sourceTruncated || table.targetTruncated ? `\n\n${labels.partialResult}` : "",
+        "",
+        `#### ${labels.sourceOnlyRows} (${table.diff.added.length})`,
+        "",
+        jsonBlock(differences.added),
+        "",
+        `#### ${labels.targetOnlyRows} (${table.diff.removed.length})`,
+        "",
+        jsonBlock(differences.removed),
+        "",
+        `#### ${labels.modifiedRows} (${table.diff.modified.length})`,
+        "",
+        jsonBlock(differences.modified),
+        "",
+        `#### ${labels.toleranceMatches ?? "Tolerance matches"} (${table.diff.toleranceMatches?.length ?? 0})`,
+        "",
+        jsonBlock((table.diff.toleranceMatches ?? []).map((row) => ({ keyValues: row.keyValues, changes: row.changes }))),
+        "",
+        `#### ${labels.nullEmptyMatches ?? "NULL / empty string matches"} (${table.diff.nullEmptyMatches?.length ?? 0})`,
+        "",
+        jsonBlock((table.diff.nullEmptyMatches ?? []).map((row) => ({ keyValues: row.keyValues, changes: row.changes }))),
+      ].join("\n");
+    });
   const sqlSection = options.syncSql.trim() ? `${labels.syncSqlSelectionNote}\n\n${fencedBlock("sql", options.syncSql.trim())}` : labels.noSyncSql;
 
   return [`# ${labels.title}`, "", `## ${labels.overview}`, "", jsonBlock(overview), "", `## ${labels.details}`, "", ...(tableSections.length ? tableSections : ["_"]), "", `## ${labels.syncSql}`, "", sqlSection, ""].join("\n");
@@ -270,6 +344,7 @@ export interface DataComparePreparation {
 }
 
 export interface DataCompareFromTablesOptions {
+  nullEqualsEmpty?: boolean;
   amountToleranceEnabled?: boolean;
   sourceConnectionId: string;
   sourceDatabase: string;

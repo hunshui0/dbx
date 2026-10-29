@@ -1233,6 +1233,8 @@ pub struct QueryExecutionOptions {
     pub max_result_bytes: Option<usize>,
     /// Result columns that must stay exact because clients use them as stable
     /// row identifiers when fetching full large-cell values on demand.
+    /// Agent reads also use these explicit keys for bounded current-row
+    /// character-conversion diagnostics; ordinary query fields are not captured.
     pub result_key_columns: Vec<String>,
     /// Enables extraction of hidden server-side preview metadata. This must be
     /// set only for generated table-data preview SQL, never arbitrary queries.
@@ -1317,6 +1319,9 @@ pub fn agent_execute_query_params(
         "maxRows": agent_protocol_row_count(options.max_rows.unwrap_or(MAX_ROWS)),
         "deferLobs": options.table_data_preview,
     });
+    if !options.result_key_columns.is_empty() {
+        params["resultKeyColumns"] = serde_json::json!(options.result_key_columns);
+    }
     if let Some(database) = database.map(str::trim).filter(|database| !database.is_empty()) {
         params["database"] = serde_json::json!(database);
     }

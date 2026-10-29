@@ -365,7 +365,7 @@ public final class JdbcExecutor {
                     truncated = true;
                     break;
                 }
-                rows.add(rowValues(rs, valueReader, sqlTypeByIndex, typeNameByIndex));
+                rows.add(rowValues(rs, valueReader, sqlTypeByIndex, typeNameByIndex, columns, rows.size() + 1L));
             }
 
             QueryTiming.record("fetch", phaseStarted);
@@ -977,7 +977,7 @@ public final class JdbcExecutor {
                     appendStatementReaderMessages(page, closeSessionMessages(targetSessions, session.id));
                     return page;
                 }
-                rows.add(rowValues(session.resultSet, session.valueReader, session.sqlTypeByIndex, session.typeNameByIndex));
+                rows.add(rowValues(session.resultSet, session.valueReader, session.sqlTypeByIndex, session.typeNameByIndex, session.columns, session.rowsRead + 1L));
                 session.rowsRead += 1;
             }
 
@@ -995,7 +995,7 @@ public final class JdbcExecutor {
                 return page;
             }
 
-            session.pendingRow = rowValues(session.resultSet, session.valueReader, session.sqlTypeByIndex, session.typeNameByIndex);
+            session.pendingRow = rowValues(session.resultSet, session.valueReader, session.sqlTypeByIndex, session.typeNameByIndex, session.columns, session.rowsRead + 1L);
             session.rowsRead += 1;
             return sessionPageResult(session, rows, executionTimeMs, false, session.id, true);
         });
@@ -1073,24 +1073,51 @@ public final class JdbcExecutor {
         ResultSet rs,
         ResultValueReader valueReader,
         int[] sqlTypeByIndex,
-        String[] typeNameByIndex
+        String[] typeNameByIndex,
+        List<String> columns,
+        long rowIndex
     ) throws SQLException {
         int colCount = sqlTypeByIndex.length;
-        List<Object> row = new ArrayList<>(colCount);
-        for (int i = 1; i <= colCount; i++) {
-            int sqlType = sqlTypeByIndex[i - 1];
-            Object value;
-            if (valueReader instanceof ColumnAwareResultValueReader) {
-                String typeName = typeNameByIndex != null && i - 1 < typeNameByIndex.length
-                    ? typeNameByIndex[i - 1]
-                    : "";
-                value = ((ColumnAwareResultValueReader) valueReader).read(rs, i, sqlType, typeName);
-            } else {
-                value = valueReader.read(rs, i, sqlType);
+        ResultRowReadContext context = ResultRowReadContext.current();
+        Object[] values = new Object[colCount];
+        boolean[] read = new boolean[colCount];
+        java.util.Map<String, Object> keys = new java.util.LinkedHashMap<>();
+        int current = 1;
+        try {
+            if (context != null) {
+                int[] indexes = context.indexes(columns);
+                for (int k = 0; k < indexes.length; k++) {
+                    int index = indexes[k];
+                    if (index < 0) continue;
+                    current = index + 1;
+                    if (!read[index]) {
+                        values[index] = readColumn(rs, valueReader, sqlTypeByIndex, typeNameByIndex, current);
+                        read[index] = true;
+                    }
+                    keys.put(context.keys().get(k), values[index]);
+                }
             }
-            row.add(value);
+            for (int i = 0; i < colCount; i++) {
+                current = i + 1;
+                if (!read[i]) values[i] = readColumn(rs, valueReader, sqlTypeByIndex, typeNameByIndex, current);
+            }
+        } catch (SQLException | RuntimeException error) {
+            if (error instanceof ResultColumnReadException column) throw column.withRowContext(rowIndex, context, keys);
+            if (context != null && !context.keys().isEmpty()) {
+                throw new ResultColumnReadException(rs, current, sqlTypeByIndex[current - 1], error).withRowContext(rowIndex, context, keys);
+            }
+            throw error;
         }
-        return row;
+        return new ArrayList<>(java.util.Arrays.asList(values));
+    }
+
+    private Object readColumn(ResultSet rs, ResultValueReader valueReader, int[] sqlTypeByIndex, String[] typeNameByIndex, int i) throws SQLException {
+        int sqlType = sqlTypeByIndex[i - 1];
+        if (valueReader instanceof ColumnAwareResultValueReader reader) {
+            String typeName = typeNameByIndex != null && i - 1 < typeNameByIndex.length ? typeNameByIndex[i - 1] : "";
+            return reader.read(rs, i, sqlType, typeName);
+        }
+        return valueReader.read(rs, i, sqlType);
     }
 
     private static int initialRowCapacity(int requestedRows) {

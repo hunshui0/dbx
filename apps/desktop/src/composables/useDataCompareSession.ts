@@ -40,6 +40,7 @@ export type DiffKind = "added" | "removed" | "modified";
 
 export interface DataCompareTableResult {
   amountToleranceEnabled?: boolean;
+  nullEqualsEmpty?: boolean;
   sourceTable: string;
   targetTable: string;
   keyColumns: string[];
@@ -98,6 +99,7 @@ export interface DataCompareSessionConfig {
   compareMode: DataCompareMode;
   sampleSize: number;
   amountToleranceEnabled?: boolean;
+  nullEqualsEmpty?: boolean;
   label: string;
 }
 
@@ -146,6 +148,7 @@ function cloneConfig(config: DataCompareSessionConfig): DataCompareSessionConfig
   return {
     ...config,
     amountToleranceEnabled: config.amountToleranceEnabled === true,
+    nullEqualsEmpty: config.nullEqualsEmpty === true,
     sourceDatabases: [...config.sourceDatabases],
     sourceSchemas: [...config.sourceSchemas],
     sourceTables: [...config.sourceTables],
@@ -421,10 +424,11 @@ async function runDataCompareSession(session: DataCompareSession, tasks: DataCom
             sourceColumns: matched.sourceColumns,
             degradationThreshold: dataCompareThreshold(input.sampleSize),
             compareMode: input.compareMode,
+            nullEqualsEmpty: input.nullEqualsEmpty === true,
             amountToleranceEnabled: input.amountToleranceEnabled === true,
           });
           keyColumns = canonicalKeyColumns;
-          results.push({ ...buildTableResult(task, preparation, canonicalKeyColumns, columns, columnInfo, databaseType, ignoredColumns), keyExclusions, whereCondition, amountToleranceEnabled: input.amountToleranceEnabled === true });
+          results.push({ ...buildTableResult(task, preparation, canonicalKeyColumns, columns, columnInfo, databaseType, ignoredColumns), keyExclusions, whereCondition, nullEqualsEmpty: input.nullEqualsEmpty === true, amountToleranceEnabled: input.amountToleranceEnabled === true });
         } else {
           const sourceColumns = await loadColumnsWithCache(sourceColumnCache, input.sourceConnectionId, input.sourceDatabase, input.sourceSchema, task.sourceTable);
           const resolvedKeys = configuredTaskKeyColumns(input, task) ?? [];
@@ -449,7 +453,7 @@ async function runDataCompareSession(session: DataCompareSession, tasks: DataCom
             compareMode: input.compareMode,
           });
           const comparedSourceColumns = sourceColumns.filter((column) => !ignoredColumns.some((ignored) => ignored.toLowerCase() === column.name.toLowerCase()));
-          results.push({ ...buildMissingTargetResult(task, preparation, comparedSourceColumns, keyColumns, databaseType, ignoredColumns), keyExclusions, whereCondition, amountToleranceEnabled: input.amountToleranceEnabled === true });
+          results.push({ ...buildMissingTargetResult(task, preparation, comparedSourceColumns, keyColumns, databaseType, ignoredColumns), keyExclusions, whereCondition, nullEqualsEmpty: input.nullEqualsEmpty === true, amountToleranceEnabled: input.amountToleranceEnabled === true });
         }
       } catch (error: unknown) {
         results.push({ ...buildErrorResult(task, keyColumns, databaseType, error), ignoredColumns, keyExclusions, whereCondition });

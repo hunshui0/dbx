@@ -259,6 +259,58 @@ function setupMocks() {
 }
 
 describe("DataCompareDialog match columns", () => {
+  it("defaults NULL-empty matching off and passes the checkbox choice", async () => {
+    setupMocks();
+    await openWithPrefilledSource("USERS");
+    const checkbox = document.querySelector<HTMLInputElement>("#data-compare-null-empty")!;
+    expect(checkbox.checked).toBe(false);
+    checkbox.click();
+    await flushAsyncSetup();
+    compareButton()?.click();
+    await flushAsyncSetup();
+    expect(mocks.prepareDataCompareFromTables.mock.calls[0]?.[0].nullEqualsEmpty).toBe(true);
+    expect(mocks.prepareDataCompareFromTables.mock.calls[0]?.[0].amountToleranceEnabled).toBe(false);
+  });
+
+  it("restores and exports NULL-empty matches with an explicit rule and visible NULL distinction", async () => {
+    setupMocks();
+    mocks.exportQueryResultsXlsx.mockResolvedValue(undefined);
+    const session = configuredSession();
+    session.config.nullEqualsEmpty = true;
+    session.batchResults = [
+      {
+        sourceTable: "USERS",
+        targetTable: "USERS",
+        keyColumns: ["USER_ID"],
+        columns: ["USER_ID", "NAME"],
+        columnInfo: [],
+        nullEqualsEmpty: true,
+        status: "same",
+        added: 0,
+        removed: 0,
+        modified: 0,
+        sourceRowCount: 1,
+        targetRowCount: 1,
+        sourceTruncated: false,
+        targetTruncated: false,
+        rowBudget: 10000,
+        syncEligible: true,
+        diff: { added: [], removed: [], modified: [], nullEmptyMatches: [{ key: "1", keyValues: { USER_ID: 1 }, changes: [{ column: "NAME", source: null, target: "" }] }] },
+        selection: { added: createDataCompareSelection(true), removed: createDataCompareSelection(true), modified: createDataCompareSelection(true) },
+        expanded: false,
+        showAll: { added: false, removed: false, modified: false },
+      },
+    ];
+    sessionMocks.session = session;
+    mountDialog({ sessionId: session.id });
+    await flushAsyncSetup();
+    expect(document.querySelector<HTMLInputElement>("#data-compare-null-empty")!.checked).toBe(true);
+    expect(document.body.textContent).toContain(i18n.global.t("dataCompare.statusSameWithTolerance"));
+    expect(document.querySelector('[data-testid="data-compare-null-empty-details"]')!.textContent).toContain('""');
+    buttonWithText(i18n.global.t("dataCompare.exportDetailsWithTolerance"))!.click();
+    await flushAsyncSetup();
+    expect(mocks.exportQueryResultsXlsx.mock.calls[0]![1][0].rows[0]).toEqual([1, "NAME", "NULL", '""', i18n.global.t("dataCompare.nullEmptyRule")]);
+  });
   it("starts with tolerance disabled and sends the checked choice", async () => {
     setupMocks();
     await openWithPrefilledSource("USERS");

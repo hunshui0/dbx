@@ -184,6 +184,7 @@ async fn run_live_mysql_data_compare_two_databases_with_differences() {
         &state,
         DataCompareFromTablesOptions {
             amount_tolerance_enabled: false,
+            null_equals_empty: false,
             where_condition: None,
             source_connection_id: connection_id.clone(),
             source_database: source_database.clone(),

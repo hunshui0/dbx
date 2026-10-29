@@ -23,6 +23,18 @@ function snapshot(overrides: Record<string, unknown> = {}) {
 }
 
 describe("useDataCompareConfig", () => {
+  it("persists NULL-empty equivalence separately from amount tolerance and defaults it off", async () => {
+    const { useDataCompareConfig } = await import("../useDataCompareConfig");
+    const state = useDataCompareConfig();
+    expect(state.createConfig("Strict nulls", snapshot()).nullEqualsEmpty).toBe(false);
+    const created = state.createConfig("Null equivalence", snapshot({ nullEqualsEmpty: true, amountToleranceEnabled: false }));
+    expect(state.duplicateConfig(created.id)?.nullEqualsEmpty).toBe(true);
+    vi.resetModules();
+    const { useDataCompareConfig: restore } = await import("../useDataCompareConfig");
+    expect(restore().configs.value.find((config) => config.id === created.id)?.nullEqualsEmpty).toBe(true);
+    restore().updateConfig(created.id, { nullEqualsEmpty: false });
+    expect(restore().configs.value.find((config) => config.id === created.id)?.nullEqualsEmpty).toBe(false);
+  });
   it("defaults tolerance off and preserves an enabled choice through save, reload and disable", async () => {
     localStorage.clear();
     vi.resetModules();

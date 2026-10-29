@@ -483,6 +483,7 @@ mod tests {
         DataCompareFromTablesPreparation {
             result: DataCompareResult {
                 tolerance_matches: Vec::new(),
+                null_empty_matches: Vec::new(),
                 added: vec![DataCompareRow {
                     key: "1".to_string(),
                     key_values: HashMap::from([("id".to_string(), json!(1))]),

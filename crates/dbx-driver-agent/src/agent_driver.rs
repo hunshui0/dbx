@@ -688,6 +688,12 @@ pub struct AgentErrorContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentConversionDiagnostics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_values: Option<std::collections::HashMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys_complete: Option<bool>,
     pub cause_classes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub column_index: Option<u32>,
@@ -705,6 +711,23 @@ impl AgentConversionDiagnostics {
             && self.cause_classes.len() <= 16
             && self.cause_classes.iter().all(|name| valid_ascii_diagnostic(Some(name), 160))
             && self.column_name.as_ref().is_none_or(|name| name.chars().count() <= 128)
+            && self.row_index.is_none_or(|row| row > 0)
+            && self.key_values.as_ref().is_none_or(|keys| {
+                keys.len() <= 32
+                    && keys.iter().all(|(name, value)| {
+                        !name.is_empty()
+                            && name.chars().count() <= 128
+                            && match value {
+                                serde_json::Value::String(text) => text.chars().count() <= 256,
+                                serde_json::Value::Null | serde_json::Value::Number(_) | serde_json::Value::Bool(_) => {
+                                    true
+                                }
+                                _ => false,
+                            }
+                    })
+                    && serde_json::to_vec(keys).is_ok_and(|json| json.len() <= 8192)
+            })
+            && (self.keys_complete != Some(true) || self.key_values.as_ref().is_some_and(|keys| !keys.is_empty()))
     }
 }
 
@@ -4650,7 +4673,8 @@ for line in sys.stdin:
             "sessionDisposition": "keep", "stage": "execute", "operationOutcome": "unknown",
             "vendorCode": -4220, "exceptionClass": "java.sql.SQLException",
             "conversion": {"causeClasses": ["java.sql.SQLException", "java.nio.charset.MalformedInputException"],
-                "columnIndex": 2, "columnName": "客户姓名", "jdbcType": 12, "inputLength": 1}
+                "columnIndex": 2, "columnName": "客户姓名", "jdbcType": 12, "inputLength": 1,
+                "rowIndex": 42, "keyValues": {"TRN_DATE": "20261015", "JRNL_NO": "0000123"}, "keysComplete": true}
         }}});
         let error = decode_agent_response::<serde_json::Value>(response, true, None).unwrap_err();
         let legacy = error.into_legacy_string();
@@ -4662,6 +4686,28 @@ for line in sys.stdin:
         assert_eq!(diagnostic["vendorCode"], -4220);
         assert_eq!(diagnostic["conversion"]["inputLength"], 1);
         assert_eq!(diagnostic["conversion"]["columnName"], "客户姓名");
+        assert_eq!(diagnostic["conversion"]["rowIndex"], 42);
+        assert_eq!(diagnostic["conversion"]["keyValues"]["JRNL_NO"], "0000123");
+        assert_eq!(diagnostic["conversion"]["keysComplete"], true);
+    }
+
+    #[test]
+    fn conversion_row_keys_are_optional_bounded_scalars_and_never_fake_complete() {
+        let legacy =
+            serde_json::json!({"causeClasses": ["java.sql.SQLException"], "columnIndex": 14, "columnName": "ADDR"});
+        let old: super::AgentConversionDiagnostics = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(old.is_valid());
+        for invalid in [
+            serde_json::json!({"rowIndex": 0}),
+            serde_json::json!({"keyValues": {"ACCT_NO": "x".repeat(257)}}),
+            serde_json::json!({"keyValues": {"ACCT_NO": {"nested": "not a scalar"}}}),
+            serde_json::json!({"keysComplete": true, "keyValues": {}}),
+        ] {
+            let mut input = legacy.clone();
+            input.as_object_mut().unwrap().extend(invalid.as_object().unwrap().clone());
+            let data: super::AgentConversionDiagnostics = serde_json::from_value(input).unwrap();
+            assert!(!data.is_valid());
+        }
     }
 
     #[test]

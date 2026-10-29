@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildDataCompareReportMarkdown, buildDataCompareToleranceWorksheets, type DataCompareReportLabels, type DataCompareReportTable } from "../dataCompare";
+import { buildDataCompareReportMarkdown, buildDataCompareToleranceWorksheets, buildDataCompareDifferenceWorksheets, buildDataCompareNullEmptyWorksheets, type DataCompareReportLabels, type DataCompareReportTable } from "../dataCompare";
 
 const labels: DataCompareReportLabels = {
   title: "Report",
@@ -45,6 +45,35 @@ const table: DataCompareReportTable = {
 };
 
 describe("buildDataCompareReportMarkdown", () => {
+  it("omits completely identical tables from detail sections while keeping overview totals", () => {
+    const same = { ...table, sourceTable: "UNCHANGED_TABLE", targetTable: "UNCHANGED_TABLE", status: "same" as const, sourceRowCount: 2, targetRowCount: 2, sourceTruncated: false, targetTruncated: false, diff: { added: [], removed: [], modified: [] } };
+    const report = buildDataCompareReportMarkdown({ source: "DB2", target: "TiDB", compareMode: "full", compareModeLabel: "Full", sampleSize: 100, generatedAt: new Date(), tables: [same, table], syncSql: "", labels });
+    expect(report).not.toContain("UNCHANGED_TABLE");
+    expect(report).toContain('"tableCount": 2');
+    expect(report).toContain('"sameTables": 1');
+  });
+  it("exports only changed fields and composite unique values, never equal cell snapshots", () => {
+    const row = { key: "composite", keyValues: { id: "0001", trn_date: "20261015" }, sourceValues: { note: "UNCHANGED_SENTINEL", amount: "100" }, targetValues: { note: "UNCHANGED_SENTINEL", amount: "101" }, changes: [{ column: "amount", source: "100", target: "101" }], selected: true };
+    const current = { ...table, keyColumns: ["id", "trn_date"], columns: ["id", "trn_date", "note", "amount"], diff: { added: [], removed: [], modified: [row] } };
+    const sheets = buildDataCompareDifferenceWorksheets([current], { kind: "Kind", field: "Field", source: "Source", target: "Target", added: "Added", removed: "Removed", modified: "Modified", rowPresence: "Row", present: "Present", absent: "Absent" });
+    expect(sheets[0]!.columns).toEqual(["Kind", "id", "trn_date", "Field", "Source", "Target"]);
+    expect(sheets[0]!.rows).toEqual([["Modified", "0001", "20261015", "amount", "100", "101"]]);
+    const report = buildDataCompareReportMarkdown({ source: "DB2", target: "TiDB", compareMode: "full", compareModeLabel: "Full", sampleSize: 100, generatedAt: new Date(), tables: [current], syncSql: "", labels });
+    expect(report).not.toContain("UNCHANGED_SENTINEL");
+    expect(report).not.toContain('"sourceValues"');
+    expect(report).toContain('"id": "0001"');
+    expect(report).toContain('"column": "amount"');
+    expect(report).toContain('"target": "101"');
+  });
+
+  it("distinguishes NULL, empty strings and a whole missing row in exports", () => {
+    const current = { ...table, columns: ["id", "note"], nullEqualsEmpty: true, diff: { added: [], removed: [], modified: [], nullEmptyMatches: [{ key: "1", keyValues: { id: 1 }, changes: [{ column: "note", source: null, target: "" }] }] } };
+    const sheets = buildDataCompareNullEmptyWorksheets([current], { suffix: "NullEmpty", field: "Field", source: "Source", target: "Target", rule: "Rule", ruleValue: "NULL=empty" });
+    expect(sheets[0]!.rows).toEqual([[1, "note", "NULL", '""', "NULL=empty"]]);
+    const keyOnly = { ...table, columns: ["id"], diff: { added: [{ key: "1", keyValues: { id: 1 }, values: { id: 1 } }], removed: [], modified: [] } };
+    const absent = buildDataCompareDifferenceWorksheets([keyOnly], { kind: "Kind", field: "Field", source: "Source", target: "Target", added: "Added", removed: "Removed", modified: "Modified", rowPresence: "Row", present: "Present", absent: "Absent" });
+    expect(absent[0]!.rows).toEqual([["Added", 1, "Row", "Present", "Absent"]]);
+  });
   it("exports all tolerance cases, including otherwise identical tables and mixed rows", () => {
     const matches = [
       { key: "acct", keyValues: { id: "0001" }, sourceValues: { amount: "99999999999999999999.99" }, targetValues: { amount: "99999999999999999999.98" }, changes: [{ column: "amount", source: "99999999999999999999.99", target: "99999999999999999999.98", absoluteDifference: "0.01" }] },
@@ -117,8 +146,9 @@ describe("buildDataCompareReportMarkdown", () => {
     expect(report).toContain('"excludeNull": true');
     expect(report).toContain('"rowBudget": 10');
     expect(report).toContain("Only inspected rows are represented.");
-    expect(report).toContain('"note": "new|row"');
-    expect(report).toContain('"targetValues": {');
+    expect(report).toContain('"source": "new|row"');
+    expect(report).not.toContain('"targetValues": {');
+    expect(report).not.toContain('"sourceValues": {');
     expect(report).toContain('"selected": false');
     expect(report).toContain("No SQL generated.");
   });

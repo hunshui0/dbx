@@ -129,6 +129,17 @@ test("full compare sends an explicit mode that bypasses default row-count thresh
   assert.equal(options?.degradationThreshold.sampleSize, 10_000);
 });
 
+test.each([false, true])("sends and retains NULL-empty equivalence when enabled=%s", async (enabled) => {
+  const matches = enabled ? [{ key: "1", keyValues: { user_id: 1 }, changes: [{ column: "name", source: null, target: "" }] }] : [];
+  apiMock.prepareDataCompareFromTables.mockResolvedValue({ ...preparationFor("users"), sourceRowCount: 1, targetRowCount: 1, result: { added: [], removed: [], modified: [], nullEmptyMatches: matches } });
+  const session = await runSession(baseConfig({ nullEqualsEmpty: enabled }), [{ sourceTable: "users", targetTable: "users" }]);
+  assert.equal(apiMock.prepareDataCompareFromTables.mock.calls[0]?.[0].nullEqualsEmpty, enabled);
+  assert.equal(session.config.nullEqualsEmpty, enabled);
+  assert.equal(session.batchResults[0]?.nullEqualsEmpty, enabled);
+  assert.deepEqual(session.batchResults[0]?.diff.nullEmptyMatches, matches);
+  assert.deepEqual(buildDataCompareSyncPlanTables(session.batchResults, "public"), []);
+});
+
 test.each([false, true])("retains numeric tolerance choice and keyed audit rows when enabled=%s", async (enabled) => {
   const matches = enabled ? [{ key: "1", keyValues: { user_id: 1 }, sourceValues: { amount: "100" }, targetValues: { amount: "100.01" }, changes: [{ column: "amount", source: "100", target: "100.01", absoluteDifference: "0.01" }] }] : [];
   apiMock.prepareDataCompareFromTables.mockResolvedValue({ ...preparationFor("users"), sourceRowCount: 1, targetRowCount: 1, result: { added: [], removed: [], modified: [], toleranceMatches: matches } });

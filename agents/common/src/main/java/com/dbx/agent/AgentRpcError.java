@@ -299,6 +299,11 @@ public final class AgentRpcError extends RuntimeException {
                 if (column.columnName != null && !column.columnName.isBlank()) {
                     data.addProperty("columnName", column.columnName.substring(0, Math.min(128, column.columnName.length())));
                 }
+                if (column.rowIndex != null) data.addProperty("rowIndex", column.rowIndex);
+                if (column.keyValues != null) {
+                    data.add("keyValues", column.keyValues.deepCopy());
+                    data.addProperty("keysComplete", column.keysComplete);
+                }
             }
             if (current.getCause() != null) pending.addLast(current.getCause());
             if (current instanceof SQLException sql && sql.getNextException() != null) {
@@ -318,6 +323,13 @@ public final class AgentRpcError extends RuntimeException {
         if (data.has("columnName")) summary.append(" (").append(data.get("columnName").getAsString()).append(')');
         if (data.has("jdbcType")) summary.append("; JDBC type ").append(data.get("jdbcType").getAsInt());
         if (data.has("inputLength")) summary.append("; input length ").append(data.get("inputLength").getAsInt());
+        if (data.has("rowIndex")) summary.append("; result row ").append(data.get("rowIndex").getAsLong());
+        if (data.has("keyValues") && data.getAsJsonObject("keyValues").size() > 0) {
+            summary.append("; match keys ").append(data.get("keyValues"));
+        }
+        if (!data.has("keysComplete") || !data.get("keysComplete").getAsBoolean()) {
+            summary.append("; complete match keys unavailable (failure before readable keys, missing key metadata, or bounded key values)");
+        }
         summary.append("; causes: ");
         JsonArray classes = data.getAsJsonArray("causeClasses");
         for (int i = 0; i < classes.size(); i++) {
