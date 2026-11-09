@@ -711,6 +711,8 @@ pub struct SqlStatementSplitter {
     pending_mysql_line_comment_dashes: bool,
     /// Open Oracle `q'...'` literal, if any.
     oracle_q_quote: OracleQQuoteState,
+    /// PL/SQL block state of the buffered statement, advanced at each `;`.
+    oracle_block: OraclePlSqlBlockTracker,
     custom_delimiter: Option<String>,
     stop_on_error: bool,
     pending_psql_command: Option<String>,
@@ -967,10 +969,10 @@ impl SqlStatementSplitter {
                             self.buffer.push(ch);
                         }
                     } else if !self.postgres_dollar_quoted_routine
-                        && keeps_oracle_style_block_together(self.options, &self.buffer)
+                        && self.oracle_block.keeps_block_together(self.options, &self.buffer)
                     {
                         self.buffer.push(ch);
-                        if oracle_plsql_block_is_complete(&self.buffer) {
+                        if self.oracle_block.is_complete(&self.buffer) {
                             self.push_current_statement(&mut statements);
                         }
                     } else if self.options.profile.supports_hana_script_blocks
@@ -1062,6 +1064,7 @@ impl SqlStatementSplitter {
                             });
                         }
                         self.buffer.clear();
+                        self.oracle_block.reset();
                         self.postgres_dollar_quoted_routine = false;
                         self.previous = None;
                         i += 1;
@@ -1089,6 +1092,7 @@ impl SqlStatementSplitter {
                             }
                         }
                         self.buffer.clear();
+                        self.oracle_block.reset();
                         self.postgres_dollar_quoted_routine = false;
                         self.previous = None;
                         i += 1;
@@ -1178,6 +1182,7 @@ impl SqlStatementSplitter {
             statements.push(SqlStatementWithControl { sql: statement.to_string(), stop_on_error: self.stop_on_error });
         }
         self.buffer.clear();
+        self.oracle_block.reset();
         self.postgres_dollar_quoted_routine = false;
         self.previous = None;
         self.pending_mysql_line_comment_dashes = false;
@@ -1201,6 +1206,42 @@ impl SqlStatementSplitter {
         line.len() >= 9
             && line[..9].eq_ignore_ascii_case(b"delimiter")
             && !has_executable_sql_with_options(self.buffer[..start].trim(), self.options)
+    }
+
+    /// Why the buffered trailing statement cannot be complete at end of input.
+    ///
+    /// A file can be truncated while it is being copied, or an upload can be
+    /// cut off. In that case the splitter still holds the fragment of the last
+    /// statement, but no amount of further parsing can make it valid: the
+    /// string literal, quoted identifier, or block comment never closes. The
+    /// importer must report this instead of sending the fragment to the
+    /// database, where it only surfaces as a confusing server syntax error
+    /// (#14455).
+    pub fn incomplete_tail_reason(&self) -> Option<&'static str> {
+        if self.dollar_quote_tag.is_some() {
+            return Some("unterminated dollar-quoted string");
+        }
+        if self.block_comment_depth > 0 {
+            return Some("unclosed block comment");
+        }
+        if self.oracle_q_quote.is_open() {
+            return Some("unterminated q-quoted literal");
+        }
+        if self.in_single_quote {
+            return Some("unterminated string literal");
+        }
+        if self.in_double_quote {
+            return Some("unterminated quoted string");
+        }
+        if self.in_backtick {
+            return Some("unterminated quoted identifier");
+        }
+        None
+    }
+
+    /// Byte length of the trailing statement text still held by the splitter.
+    pub fn pending_tail_len(&self) -> usize {
+        self.buffer.len()
     }
 }
 
@@ -1553,6 +1594,8 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
     let mut custom_delimiter: Option<String> = None;
     let mut single_quote_escape_string = false;
     let mut postgres_dollar_quoted_routine = false;
+    let mut oracle_block = OraclePlSqlBlockTracker::default();
+    let mut oracle_block_start = 0;
 
     while i < sql.len() {
         if let Some(tag) = &dollar_quote_tag {
@@ -1706,10 +1749,14 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
                     }
                     push_statement_range(&mut ranges, sql, start, i, options);
                 } else {
+                    if oracle_block_start != start {
+                        oracle_block.reset();
+                        oracle_block_start = start;
+                    }
                     let is_oracle_plsql =
-                        !postgres_dollar_quoted_routine && keeps_oracle_style_block_together(options, &sql[start..i]);
+                        !postgres_dollar_quoted_routine && oracle_block.keeps_block_together(options, &sql[start..i]);
                     if is_oracle_plsql {
-                        if !oracle_plsql_block_is_complete(&sql[start..i + ch.len_utf8()]) {
+                        if !oracle_block.is_complete(&sql[start..i + ch.len_utf8()]) {
                             i += ch.len_utf8();
                             continue;
                         }
@@ -2710,7 +2757,11 @@ pub fn prepare_sql_file_statement(
         if is_mysql_compatible_target && is_mysql_session_restore_statement(statement) {
             return SqlFileStatementAction::Skip;
         }
-        return SqlFileStatementAction::Execute(statement.to_string());
+        return SqlFileStatementAction::Execute(if is_mysql_compatible_target {
+            normalize_mysql_sql_file_charset(statement)
+        } else {
+            statement.to_string()
+        });
     };
 
     if !is_mysql_compatible_target {
@@ -2722,7 +2773,64 @@ pub fn prepare_sql_file_statement(
         return SqlFileStatementAction::Skip;
     }
 
-    SqlFileStatementAction::Execute(body.to_string())
+    SqlFileStatementAction::Execute(normalize_mysql_sql_file_charset(body))
+}
+
+/// MySQL's `utf8` charset is the legacy 3-byte `utf8mb3` charset.  SQL files
+/// are decoded as Unicode before they reach the driver, so executing a file
+/// that changes the connection to `utf8` makes otherwise valid 4-byte text
+/// (for example emoji) fail or be replaced on MySQL 5.7.  Keep the session
+/// charset semantics for other explicit choices, but use the Unicode-capable
+/// spelling for this legacy alias during SQL-file imports.
+fn normalize_mysql_sql_file_charset(statement: &str) -> String {
+    let executable = leading_executable_sql_with_options(statement, SqlParsingOptions::mysql_compatible());
+    let prefix_len = statement.len() - executable.len();
+    let bytes = executable.as_bytes();
+    if bytes.len() < 3 || !bytes[..3].eq_ignore_ascii_case(b"SET") {
+        return statement.to_string();
+    }
+    let mut index = 3;
+    if bytes.get(index).is_none_or(|byte| !byte.is_ascii_whitespace()) {
+        return statement.to_string();
+    }
+    while bytes.get(index).is_some_and(|byte| byte.is_ascii_whitespace()) {
+        index += 1;
+    }
+    if bytes.len() < index + 5 || !bytes[index..index + 5].eq_ignore_ascii_case(b"NAMES") {
+        return statement.to_string();
+    }
+    index += 5;
+    if bytes.get(index).is_none_or(|byte| !byte.is_ascii_whitespace()) {
+        return statement.to_string();
+    }
+    while bytes.get(index).is_some_and(|byte| byte.is_ascii_whitespace()) {
+        index += 1;
+    }
+    let charset_start = index;
+    while bytes.get(index).is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b';') {
+        index += 1;
+    }
+    let name = &executable[charset_start..index];
+    if !name.eq_ignore_ascii_case("utf8") && !name.eq_ignore_ascii_case("utf8mb3") {
+        return statement.to_string();
+    }
+    // An explicit `COLLATE` clause may name a collation that is not valid for
+    // utf8mb4 (for example `utf8_general_ci`); rewriting only the charset name
+    // would leave the statement failing with ERROR 1273, which is worse than
+    // the legacy charset it started with. Keep such statements verbatim.
+    let mut after_name = index;
+    while bytes.get(after_name).is_some_and(|byte| byte.is_ascii_whitespace()) {
+        after_name += 1;
+    }
+    if bytes.len() >= after_name + 7 && bytes[after_name..after_name + 7].eq_ignore_ascii_case(b"COLLATE") {
+        return statement.to_string();
+    }
+
+    let mut normalized = String::with_capacity(statement.len() + 2);
+    normalized.push_str(&statement[..prefix_len + charset_start]);
+    normalized.push_str("utf8mb4");
+    normalized.push_str(&statement[prefix_len + index..]);
+    normalized
 }
 
 fn strip_postgres_pg_dump_guard_command(statement: &str) -> Option<String> {
@@ -2798,6 +2906,24 @@ pub fn optimize_sql_file_import_statements_with_max_insert_batch_statements(
                 });
             }
             SqlFileStatementAction::Execute(sql) => {
+                // A single extended INSERT (mysqldump emits one per table) can be
+                // far larger than the failure-log capture limit and, on a small
+                // `max_allowed_packet`, than one protocol packet. Split it at
+                // top-level tuple boundaries so the database never receives an
+                // oversized statement whose failure detail the log would then
+                // have to truncate.
+                if let Some(parts) =
+                    split_oversized_insert_statement(&sql, db_type, driver_profile, SQL_FILE_INSERT_STATEMENT_MAX_BYTES)
+                {
+                    flush_pending_insert(&mut optimized, &mut pending_insert);
+                    optimized.extend(parts.into_iter().map(|part| SqlFileImportStatement {
+                        kind: SqlFileImportStatementKind::Execute,
+                        source_sqls: vec![part.clone()],
+                        sql: part,
+                        source_statement_count: 1,
+                    }));
+                    continue;
+                }
                 // Combining separate MySQL INSERT statements changes session
                 // semantics such as LAST_INSERT_ID(), so execute them with the
                 // same statement boundaries as the source file.
@@ -2848,6 +2974,14 @@ fn flush_pending_insert(optimized: &mut Vec<SqlFileImportStatement>, pending_ins
 
 const SQL_FILE_INSERT_BATCH_MAX_STATEMENTS: usize = 500;
 const SQL_FILE_INSERT_BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Largest single statement DBX plans for an SQL file import.
+///
+/// 256 KiB keeps one statement small enough for a conservative MySQL packet
+/// budget and for a failing statement to be captured in full by the failure
+/// log, which only ever records the statement text up to a cap. Anything larger
+/// that is a plain multi-row `INSERT ... VALUES (...), (...)` is split at tuple
+/// boundaries; other oversized statements are left untouched.
+pub const SQL_FILE_INSERT_STATEMENT_MAX_BYTES: usize = 256 * 1024;
 
 /// How a merged insert batch must be spelled for its target dialect.
 ///
@@ -3057,6 +3191,117 @@ fn parse_insert_values_tail(tail: &str) -> Option<String> {
     }
 }
 
+/// Splits a plain multi-row `INSERT ... VALUES (...), (...)` that is larger than
+/// `max_statement_bytes` into several statements that each fit the cap.
+///
+/// Splitting happens only at top-level tuple boundaries and only for
+/// MySQL-compatible import targets, where a single extended INSERT is the
+/// common shape of a dump and can otherwise exceed a small
+/// `max_allowed_packet` (or fill the whole failure-log capture budget). Every
+/// returned statement repeats the original `INSERT INTO ...` prefix, so the
+/// inserted rows and their order are unchanged.
+///
+/// Returns `None` when the statement does not need splitting or cannot be split
+/// safely (not a plain multi-row INSERT, already within the cap, a suffix such
+/// as `ON DUPLICATE KEY UPDATE`, or a single tuple larger than the cap). In
+/// those cases the caller keeps the statement exactly as written.
+pub fn split_oversized_insert_statement(
+    sql: &str,
+    db_type: Option<DatabaseType>,
+    driver_profile: Option<&str>,
+    max_statement_bytes: usize,
+) -> Option<Vec<String>> {
+    let db_type = db_type?;
+    if !is_mysql_compatible_import_target(&db_type, driver_profile) {
+        return None;
+    }
+    let options = SqlParsingOptions::for_database_type(db_type);
+    let insert = parse_mergeable_insert(sql, options)?;
+    split_insert_value_tuples(insert, options, max_statement_bytes)
+}
+
+fn split_insert_value_tuples(
+    insert: MergeableInsert,
+    options: SqlParsingOptions,
+    max_statement_bytes: usize,
+) -> Option<Vec<String>> {
+    const VALUES_PREFIX: &str = " VALUES ";
+    let overhead = insert.prefix.len() + VALUES_PREFIX.len() + 1;
+    if overhead + insert.values.len() <= max_statement_bytes {
+        return None;
+    }
+    let budget = max_statement_bytes.checked_sub(overhead)?;
+    let ranges = insert_value_tuple_ranges(&insert.values, options)?;
+    if ranges.len() < 2 {
+        return None;
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for (start, end) in ranges {
+        let tuple = &insert.values[start..end];
+        if tuple.len() > budget {
+            // A single tuple alone cannot fit: splitting further would not make
+            // the statement safe, so leave the original untouched and let the
+            // database report its own size error.
+            return None;
+        }
+        let separator = if current.is_empty() { 0 } else { ",\n".len() };
+        if !current.is_empty() && current.len() + separator + tuple.len() > budget {
+            parts.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push_str(",\n");
+        }
+        current.push_str(tuple);
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    if parts.len() < 2 {
+        return None;
+    }
+
+    Some(parts.into_iter().map(|values| format!("{}{VALUES_PREFIX}{values};", insert.prefix)).collect())
+}
+
+/// Byte ranges of the top-level `(...)` tuples in an INSERT values tail.
+fn insert_value_tuple_ranges(values: &str, options: SqlParsingOptions) -> Option<Vec<(usize, usize)>> {
+    let mut scanner = SqlScanner::with_profile(options.profile);
+    let mut depth = 0usize;
+    let mut ranges = Vec::new();
+    let mut tuple_start = 0usize;
+
+    for (idx, ch) in values.char_indices() {
+        scanner.step(values, idx, ch);
+        if scanner.is_masked() {
+            continue;
+        }
+        match ch {
+            '(' => {
+                if depth == 0 {
+                    tuple_start = idx;
+                }
+                depth += 1;
+            }
+            ')' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    ranges.push((tuple_start, idx + ch.len_utf8()));
+                }
+            }
+            ',' if depth == 0 => {}
+            _ if depth == 0 && !ch.is_whitespace() => return None,
+            _ => {}
+        }
+    }
+
+    (depth == 0 && !ranges.is_empty()).then_some(ranges)
+}
+
 #[derive(Default)]
 struct SqlScanner {
     profile: SqlDialectProfile,
@@ -3222,6 +3467,29 @@ fn normalize_insert_prefix_key(prefix: &str) -> String {
 
 pub fn starts_with_executable_sql_keyword(sql: &str, keywords: &[&str]) -> bool {
     starts_with_executable_sql_keyword_with_options(sql, keywords, SqlParsingOptions::default())
+}
+
+/// Like [`starts_with_executable_sql_keyword`], but requires the leading
+/// executable words to match a whole sequence. Needed for statements such as
+/// GaussDB's `EXECUTE DIRECT`, where the first word alone does not decide
+/// whether the statement returns rows. Comments and whitespace between the
+/// words are skipped.
+pub fn starts_with_executable_sql_keyword_sequence(sql: &str, keywords: &[&str]) -> bool {
+    if keywords.is_empty() {
+        return false;
+    }
+    let options = SqlParsingOptions::default();
+    let mut offset = 0;
+    for keyword in keywords {
+        let Some((token, next)) = next_executable_sql_token_with_options(sql, offset, options) else {
+            return false;
+        };
+        if !executable_sql_keyword_matches(token, keyword) {
+            return false;
+        }
+        offset = next;
+    }
+    true
 }
 
 pub fn starts_with_executable_sql_keyword_for_database(sql: &str, keywords: &[&str], db_type: DatabaseType) -> bool {
@@ -3461,9 +3729,12 @@ fn leading_executable_sql_with_options(sql: &str, options: SqlParsingOptions) ->
     &sql[i..]
 }
 
-fn first_executable_sql_token_with_options(sql: &str, options: SqlParsingOptions) -> Option<&str> {
+fn next_executable_sql_token_with_options(
+    sql: &str,
+    mut i: usize,
+    options: SqlParsingOptions,
+) -> Option<(&str, usize)> {
     let bytes = sql.as_bytes();
-    let mut i = 0;
 
     while i < bytes.len() {
         while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'(') {
@@ -3515,7 +3786,11 @@ fn first_executable_sql_token_with_options(sql: &str, options: SqlParsingOptions
         i += 1;
     }
 
-    (i > start).then_some(&sql[start..i])
+    (i > start).then_some((&sql[start..i], i))
+}
+
+fn first_executable_sql_token_with_options(sql: &str, options: SqlParsingOptions) -> Option<&str> {
+    next_executable_sql_token_with_options(sql, 0, options).map(|(token, _)| token)
 }
 
 fn starts_with_oracle_plsql_block(sql: &str) -> bool {
@@ -3907,6 +4182,168 @@ impl FirebirdRoutineBlock {
     }
 }
 
+/// The BEGIN/END scope walk behind [`OraclePlSqlBlock::is_complete`], kept resumable so
+/// [`OraclePlSqlBlockTracker`] only walks the tokens added since its previous check.
+#[derive(Debug, Clone)]
+struct OraclePlSqlBlockWalk {
+    object_kind: Option<OraclePlSqlCreateObjectKind>,
+    scopes: Vec<OraclePlSqlScope>,
+    awaiting_routine_declarations: bool,
+    saw_begin: bool,
+    complete: bool,
+    next_index: usize,
+}
+
+impl OraclePlSqlBlockWalk {
+    fn new(block: &OraclePlSqlBlock) -> Self {
+        // Package/type specifications have declarations and an outer END with
+        // no BEGIN. Bodies also own an outer END beyond nested routine END
+        // pairs so an inner END cannot finish the object.
+        let object_kind = block.create_object_kind();
+        let scopes = match object_kind {
+            Some(OraclePlSqlCreateObjectKind::Body | OraclePlSqlCreateObjectKind::Spec) => {
+                vec![OraclePlSqlScope::Object]
+            }
+            None => Vec::new(),
+        };
+        Self {
+            object_kind,
+            scopes,
+            // A stored PROCEDURE/FUNCTION has no DECLARE keyword: its declare section
+            // starts right after its own IS/AS. Opening it there lets a local subprogram
+            // own its BEGIN ... END instead of ending the routine.
+            awaiting_routine_declarations: block.is_create_routine(),
+            saw_begin: false,
+            complete: false,
+            next_index: 0,
+        }
+    }
+
+    fn advance(&mut self, tokens: &[OraclePlSqlToken]) {
+        while self.next_index < tokens.len() {
+            self.step(tokens, self.next_index);
+            self.next_index += 1;
+        }
+    }
+
+    fn step(&mut self, tokens: &[OraclePlSqlToken], index: usize) {
+        let token = &tokens[index];
+        let scopes = &mut self.scopes;
+        if token.is_semicolon() {
+            if matches!(scopes.last(), Some(OraclePlSqlScope::RoutineHeader)) {
+                scopes.pop();
+            }
+            return;
+        }
+
+        if self.awaiting_routine_declarations && token.is_any_word(&["IS", "AS"]) {
+            self.awaiting_routine_declarations = false;
+            scopes.push(OraclePlSqlScope::Declaration);
+        } else if token.is_word("DECLARE") {
+            if !matches!(scopes.last(), Some(OraclePlSqlScope::Declaration)) {
+                scopes.push(OraclePlSqlScope::Declaration);
+            }
+        } else if token.is_any_word(&["PROCEDURE", "FUNCTION"])
+            && matches!(scopes.last(), Some(OraclePlSqlScope::Declaration | OraclePlSqlScope::Routine))
+        {
+            scopes.push(OraclePlSqlScope::RoutineHeader);
+        } else if token.is_any_word(&["IS", "AS"]) && matches!(scopes.last(), Some(OraclePlSqlScope::RoutineHeader)) {
+            *scopes.last_mut().unwrap() = OraclePlSqlScope::Routine;
+        } else if token.is_word("BEGIN") {
+            // A local routine's BEGIN belongs to that routine, not to the outer block.
+            if matches!(scopes.last(), Some(OraclePlSqlScope::Declaration | OraclePlSqlScope::Routine)) {
+                *scopes.last_mut().unwrap() = OraclePlSqlScope::Block;
+            } else {
+                scopes.push(OraclePlSqlScope::Block);
+            }
+            self.saw_begin = true;
+            self.complete = false;
+        } else if token.is_word("CASE") {
+            // Both CASE expressions and CASE statements own an END.
+            // The CASE token that follows END CASE is a suffix, not a scope start.
+            // Require source adjacency: `end ), (case` must open a new CASE scope.
+            if previous_adjacent_word(tokens, index) != Some("END") {
+                scopes.push(OraclePlSqlScope::Case);
+            }
+        } else if token.is_word("END") {
+            let next = next_adjacent_word(tokens, index);
+            if matches!(next, Some("IF" | "LOOP")) {
+                return;
+            }
+            if matches!(next, Some("CASE")) && !matches!(scopes.last(), Some(OraclePlSqlScope::Case)) {
+                return;
+            }
+            if scopes.pop().is_some() {
+                self.complete = scopes.is_empty();
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        match self.object_kind {
+            // Package/type objects complete on their outer END [name]; a package
+            // body may omit an initialization BEGIN when it has no executable
+            // initialization section.
+            Some(OraclePlSqlCreateObjectKind::Body | OraclePlSqlCreateObjectKind::Spec) => self.complete,
+            _ => self.saw_begin && self.complete,
+        }
+    }
+}
+
+/// Incremental [`keeps_oracle_style_block_together`] and [`oracle_plsql_block_is_complete`]
+/// for a statement that the splitters grow one statement-level `;` at a time. Re-tokenizing
+/// the whole statement at every inner `;` made splitting a large package body quadratic: a
+/// 370 KB DM8 package body spent minutes in the splitter before reaching the server (#13450).
+///
+/// The splitters only consult it at a `;` outside quotes and comments, so tokenizing the
+/// statement in slices that start or end at those semicolons yields the same tokens as
+/// tokenizing it whole.
+#[derive(Debug, Default)]
+struct OraclePlSqlBlockTracker {
+    block: OraclePlSqlBlock,
+    scanned_len: usize,
+    walk: Option<OraclePlSqlBlockWalk>,
+}
+
+impl OraclePlSqlBlockTracker {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn scan(&mut self, statement: &str) {
+        if statement.len() < self.scanned_len {
+            self.reset();
+        }
+        self.block.tokens.extend(oracle_plsql_tokens(&statement[self.scanned_len..]));
+        self.scanned_len = statement.len();
+    }
+
+    /// [`keeps_oracle_style_block_together`] for `statement_head`, the statement before the `;`.
+    fn keeps_block_together(&mut self, options: SqlParsingOptions, statement_head: &str) -> bool {
+        if !options.profile.supports_oracle_plsql_blocks && !options.profile.supports_oracle_style_routine_bodies {
+            return false;
+        }
+        self.scan(statement_head);
+        if options.profile.supports_oracle_plsql_blocks {
+            return self.block.starts_block();
+        }
+        self.block.starts_oracle_style_routine_body()
+    }
+
+    /// [`oracle_plsql_block_is_complete`] for `statement`, which ends with the `;`.
+    fn is_complete(&mut self, statement: &str) -> bool {
+        self.scan(statement);
+        if let Some(complete) = self.block.completion_without_block_walk() {
+            return complete;
+        }
+        let block = &self.block;
+        let walk = self.walk.get_or_insert_with(|| OraclePlSqlBlockWalk::new(block));
+        walk.advance(&block.tokens);
+        walk.is_complete()
+    }
+}
+
+#[derive(Debug, Default)]
 struct OraclePlSqlBlock {
     tokens: Vec<OraclePlSqlToken>,
 }
@@ -3989,15 +4426,26 @@ impl OraclePlSqlBlock {
     }
 
     fn is_complete(&self) -> bool {
+        if let Some(complete) = self.completion_without_block_walk() {
+            return complete;
+        }
+        let mut walk = OraclePlSqlBlockWalk::new(self);
+        walk.advance(&self.tokens);
+        walk.is_complete()
+    }
+
+    /// The completion rules decided by the statement header alone; `None` means the
+    /// BEGIN/END walk in [`OraclePlSqlBlockWalk`] decides.
+    fn completion_without_block_walk(&self) -> Option<bool> {
         if !self.starts_block() {
-            return false;
+            return Some(false);
         }
 
         // `WITH [FUNCTION|PROCEDURE ... END;] <main query>;` follows its own completion
-        // rule (see with_function_is_complete); the classic block walk below would fire
-        // at the declaration's `END;` and cut the main query off the statement.
+        // rule (see with_function_is_complete); the classic block walk would fire at the
+        // declaration's `END;` and cut the main query off the statement.
         if self.starts_with_function_declaration() {
-            return self.with_function_is_complete();
+            return Some(self.with_function_is_complete());
         }
 
         if self.tokens.first().is_some_and(|token| token.is_word("CREATE")) {
@@ -4008,86 +4456,10 @@ impl OraclePlSqlBlock {
                     .find(|token| token.is_any_word(&["BEGIN", "DECLARE", "COMPOUND", "CALL"]))
                     .is_some_and(|token| token.is_word("CALL"))
             {
-                return self.tokens.last().is_some_and(OraclePlSqlToken::is_semicolon);
+                return Some(self.tokens.last().is_some_and(OraclePlSqlToken::is_semicolon));
             }
         }
-
-        // Package/type specifications have declarations and an outer END with
-        // no BEGIN. Bodies also own an outer END beyond nested routine END
-        // pairs so an inner END cannot finish the object.
-        let object_kind = self.create_object_kind();
-        let mut scopes = match object_kind {
-            Some(OraclePlSqlCreateObjectKind::Body | OraclePlSqlCreateObjectKind::Spec) => {
-                vec![OraclePlSqlScope::Object]
-            }
-            None => Vec::new(),
-        };
-        // A stored PROCEDURE/FUNCTION has no DECLARE keyword: its declare section
-        // starts right after its own IS/AS. Opening it there lets a local subprogram
-        // own its BEGIN ... END instead of ending the routine.
-        let mut awaiting_routine_declarations = self.is_create_routine();
-        let mut saw_begin = false;
-        let mut complete = false;
-
-        for (index, token) in self.tokens.iter().enumerate() {
-            if token.is_semicolon() {
-                if matches!(scopes.last(), Some(OraclePlSqlScope::RoutineHeader)) {
-                    scopes.pop();
-                }
-                continue;
-            }
-
-            if awaiting_routine_declarations && token.is_any_word(&["IS", "AS"]) {
-                awaiting_routine_declarations = false;
-                scopes.push(OraclePlSqlScope::Declaration);
-            } else if token.is_word("DECLARE") {
-                if !matches!(scopes.last(), Some(OraclePlSqlScope::Declaration)) {
-                    scopes.push(OraclePlSqlScope::Declaration);
-                }
-            } else if token.is_any_word(&["PROCEDURE", "FUNCTION"])
-                && matches!(scopes.last(), Some(OraclePlSqlScope::Declaration | OraclePlSqlScope::Routine))
-            {
-                scopes.push(OraclePlSqlScope::RoutineHeader);
-            } else if token.is_any_word(&["IS", "AS"]) && matches!(scopes.last(), Some(OraclePlSqlScope::RoutineHeader))
-            {
-                *scopes.last_mut().unwrap() = OraclePlSqlScope::Routine;
-            } else if token.is_word("BEGIN") {
-                // A local routine's BEGIN belongs to that routine, not to the outer block.
-                if matches!(scopes.last(), Some(OraclePlSqlScope::Declaration | OraclePlSqlScope::Routine)) {
-                    *scopes.last_mut().unwrap() = OraclePlSqlScope::Block;
-                } else {
-                    scopes.push(OraclePlSqlScope::Block);
-                }
-                saw_begin = true;
-                complete = false;
-            } else if token.is_word("CASE") {
-                // Both CASE expressions and CASE statements own an END.
-                // The CASE token that follows END CASE is a suffix, not a scope start.
-                // Require source adjacency: `end ), (case` must open a new CASE scope.
-                if previous_adjacent_word(&self.tokens, index) != Some("END") {
-                    scopes.push(OraclePlSqlScope::Case);
-                }
-            } else if token.is_word("END") {
-                let next = next_adjacent_word(&self.tokens, index);
-                if matches!(next, Some("IF" | "LOOP")) {
-                    continue;
-                }
-                if matches!(next, Some("CASE")) && !matches!(scopes.last(), Some(OraclePlSqlScope::Case)) {
-                    continue;
-                }
-                if scopes.pop().is_some() {
-                    complete = scopes.is_empty();
-                }
-            }
-        }
-
-        match object_kind {
-            // Package/type objects complete on their outer END [name]; a package
-            // body may omit an initialization BEGIN when it has no executable
-            // initialization section.
-            Some(OraclePlSqlCreateObjectKind::Body | OraclePlSqlCreateObjectKind::Spec) => complete,
-            _ => saw_begin && complete,
-        }
+        None
     }
 
     fn starts_with_function_declaration(&self) -> bool {
@@ -4543,10 +4915,12 @@ mod tests {
     use super::{
         contains_or_fuzzy_match, dash_dash_starts_line_comment, decode_sql_file_bytes,
         find_statement_at_cursor_for_database, fuzzy_filter_enabled, fuzzy_like_pattern_with_escape,
-        fuzzy_subsequence_match, optimize_sql_file_import_statements, prepare_sql_file_statement, split_sql_script,
-        split_sql_statement_ranges_with_options, split_sql_statements_for_database, starts_with_executable_sql_keyword,
-        starts_with_executable_sql_keyword_for_database, starts_with_oracle_style_routine_body, SqlDialectProfile,
-        SqlFileRequest, SqlFileStatementAction, SqlParsingOptions, SqlStatementSplitter,
+        fuzzy_subsequence_match, optimize_sql_file_import_statements, prepare_sql_file_statement,
+        split_oversized_insert_statement, split_sql_script, split_sql_statement_ranges_with_options,
+        split_sql_statements_for_database, starts_with_executable_sql_keyword,
+        starts_with_executable_sql_keyword_for_database, starts_with_executable_sql_keyword_sequence,
+        starts_with_oracle_style_routine_body, SqlDialectProfile, SqlFileRequest, SqlFileStatementAction,
+        SqlParsingOptions, SqlStatementSplitter, SQL_FILE_INSERT_STATEMENT_MAX_BYTES,
     };
 
     #[test]
@@ -5331,6 +5705,22 @@ mod tests {
     }
 
     #[test]
+    fn detects_multi_word_result_set_keyword_sequences() {
+        assert!(starts_with_executable_sql_keyword_sequence(
+            "-- distribute\nexecute direct on (dn_6001_6002) $$ SELECT 1 $$",
+            &["EXECUTE", "DIRECT"]
+        ));
+        assert!(starts_with_executable_sql_keyword_sequence(
+            "EXECUTE /* route to datanode */ DIRECT ON (dn_1) 'select 1'",
+            &["EXECUTE", "DIRECT"]
+        ));
+        assert!(!starts_with_executable_sql_keyword_sequence("EXECUTE prepared_statement", &["EXECUTE", "DIRECT"]));
+        assert!(!starts_with_executable_sql_keyword_sequence("EXECUTED DIRECT", &["EXECUTE", "DIRECT"]));
+        assert!(!starts_with_executable_sql_keyword_sequence("SELECT 1", &["EXECUTE", "DIRECT"]));
+        assert!(!starts_with_executable_sql_keyword_sequence("EXECUTE DIRECT", &[]));
+    }
+
+    #[test]
     fn detects_mysql_executable_comment_keyword() {
         assert!(starts_with_executable_sql_keyword("/*!40101 SELECT 1 */", &["SELECT"]));
         assert!(starts_with_executable_sql_keyword("/*M! SELECT 1 */", &["SELECT"]));
@@ -5366,6 +5756,61 @@ mod tests {
     fn prepares_mysql_executable_comments_for_mysql_compatible_imports() {
         assert_eq!(
             prepare_sql_file_statement("/*!40101 SET NAMES utf8mb4 */", &DatabaseType::Mysql, None),
+            SqlFileStatementAction::Execute("SET NAMES utf8mb4".to_string())
+        );
+    }
+
+    #[test]
+    fn normalizes_mysql_legacy_utf8_for_sql_file_imports() {
+        for (source, expected) in [
+            ("SET NAMES utf8", "SET NAMES utf8mb4"),
+            ("set names utf8mb3", "set names utf8mb4"),
+            ("  SET  NAMES  UTF8;", "SET  NAMES  utf8mb4;"),
+            ("-- dump session\nSET NAMES utf8", "-- dump session\nSET NAMES utf8mb4"),
+        ] {
+            assert_eq!(
+                prepare_sql_file_statement(source, &DatabaseType::Mysql, None),
+                SqlFileStatementAction::Execute(expected.to_string())
+            );
+        }
+        assert_eq!(
+            prepare_sql_file_statement("SET NAMES utf8mb4", &DatabaseType::Mysql, None),
+            SqlFileStatementAction::Execute("SET NAMES utf8mb4".to_string())
+        );
+        assert_eq!(
+            prepare_sql_file_statement("SET NAMES latin1", &DatabaseType::Mysql, None),
+            SqlFileStatementAction::Execute("SET NAMES latin1".to_string())
+        );
+        assert_eq!(
+            prepare_sql_file_statement("INSERT INTO t VALUES ('中文 😀')", &DatabaseType::Mysql, None),
+            SqlFileStatementAction::Execute("INSERT INTO t VALUES ('中文 😀')".to_string())
+        );
+        assert_eq!(
+            prepare_sql_file_statement("SET NAMES utf8", &DatabaseType::Postgres, None),
+            SqlFileStatementAction::Execute("SET NAMES utf8".to_string())
+        );
+    }
+
+    #[test]
+    fn keeps_collated_legacy_utf8_set_names_verbatim() {
+        // `utf8_general_ci` is not a valid collation for utf8mb4; rewriting the
+        // charset alone would turn the statement into ERROR 1273.
+        for source in [
+            "SET NAMES utf8 COLLATE utf8_general_ci",
+            "set names utf8mb3   collate utf8mb3_bin;",
+            "-- dump session\nSET NAMES utf8 COLLATE utf8_unicode_ci",
+        ] {
+            assert_eq!(
+                prepare_sql_file_statement(source, &DatabaseType::Mysql, None),
+                SqlFileStatementAction::Execute(source.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_utf8_in_mysql_executable_comments() {
+        assert_eq!(
+            prepare_sql_file_statement("/*!40101 SET NAMES utf8 */", &DatabaseType::Mysql, None),
             SqlFileStatementAction::Execute("SET NAMES utf8mb4".to_string())
         );
     }
@@ -5562,6 +6007,93 @@ mod tests {
         assert_eq!(optimized.len(), 1);
         assert_eq!(optimized[0].source_statement_count, 1);
         assert_eq!(optimized[0].sql, statements[0]);
+    }
+
+    fn oversized_mysql_insert(rows: usize) -> (String, Vec<String>) {
+        let tuples: Vec<String> = (0..rows).map(|row| format!("({row},'天沼小学校{row}','a;b--c#d')")).collect();
+        (format!("INSERT INTO `t` (`id`, `name`, `note`) VALUES {}", tuples.join(",")), tuples)
+    }
+
+    #[test]
+    fn splits_oversized_mysql_insert_at_tuple_boundaries() {
+        let (sql, tuples) = oversized_mysql_insert(600);
+        let max = 2048;
+        assert!(sql.len() > max);
+
+        let parts = split_oversized_insert_statement(&sql, Some(DatabaseType::Mysql), None, max).unwrap();
+
+        assert!(parts.len() > 1);
+        for part in &parts {
+            assert!(part.len() <= max, "part is {} bytes, cap is {max}", part.len());
+            assert!(part.starts_with("INSERT INTO `t` (`id`, `name`, `note`) VALUES "));
+            assert!(part.ends_with(';'));
+            assert_eq!(split_sql_statements_for_database(part, DatabaseType::Mysql).len(), 1);
+        }
+        let rejoined = parts
+            .iter()
+            .map(|part| part.trim_end_matches(';').split_once(" VALUES ").expect("VALUES keyword").1.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(rejoined.replace(",\n", ","), tuples.join(","));
+    }
+
+    #[test]
+    fn split_preserves_quotes_escapes_and_comments_inside_values() {
+        let sql = "INSERT INTO `t` VALUES (1,'a\\'b','x),(y'),(2,'c\\\\d','ef;gh'),(3,'-- no comment','/* nope */'),(4,'多字节','tail')";
+        let parts = split_oversized_insert_statement(sql, Some(DatabaseType::Mysql), None, 80).unwrap();
+
+        assert!(parts.len() > 1, "{parts:?}");
+        for part in &parts {
+            assert!(part.len() <= 80, "{} > 80", part.len());
+            assert_eq!(split_sql_statements_for_database(part, DatabaseType::Mysql).len(), 1);
+            // Every part must still be one balanced INSERT with a quoted tail.
+            assert!(part.starts_with("INSERT INTO `t` VALUES "));
+        }
+        let rejoined = parts
+            .iter()
+            .map(|part| part.trim_end_matches(';').split_once(" VALUES ").expect("VALUES keyword").1.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            rejoined.replace(",\n", ","),
+            "(1,'a\\'b','x),(y'),(2,'c\\\\d','ef;gh'),(3,'-- no comment','/* nope */'),(4,'多字节','tail')"
+        );
+    }
+
+    #[test]
+    fn does_not_split_inserts_that_are_small_or_unsupported() {
+        // Within the cap.
+        let small = "INSERT INTO `t` VALUES (1),(2)";
+        assert_eq!(split_oversized_insert_statement(small, Some(DatabaseType::Mysql), None, 4096), None);
+        // Not MySQL-compatible.
+        let (sql, _) = oversized_mysql_insert(600);
+        assert_eq!(split_oversized_insert_statement(&sql, Some(DatabaseType::Postgres), None, 2048), None);
+        // Non-INSERT statement.
+        let select = format!("SELECT * FROM `t` WHERE note IN ('{}')", "x".repeat(4096));
+        assert_eq!(split_oversized_insert_statement(&select, Some(DatabaseType::Mysql), None, 2048), None);
+        // ON DUPLICATE KEY UPDATE suffix would be lost by the VALUES parser.
+        let upsert = format!(
+            "INSERT INTO `t` VALUES {} ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)",
+            (0..600).map(|row| format!("({row},'n{row}')")).collect::<Vec<_>>().join(",")
+        );
+        assert_eq!(split_oversized_insert_statement(&upsert, Some(DatabaseType::Mysql), None, 2048), None);
+        // A single tuple larger than the cap cannot be split.
+        let huge_tuple = format!("INSERT INTO `t` VALUES (1,'{}'),(2,'b')", "x".repeat(4096));
+        assert_eq!(split_oversized_insert_statement(&huge_tuple, Some(DatabaseType::Mysql), None, 2048), None);
+    }
+
+    #[test]
+    fn optimizer_splits_oversized_mysql_insert_before_execution() {
+        let (sql, tuples) = oversized_mysql_insert(8000);
+        assert!(sql.len() > SQL_FILE_INSERT_STATEMENT_MAX_BYTES);
+
+        let optimized = optimize_sql_file_import_statements(&[sql], Some(DatabaseType::Mysql), None);
+
+        assert!(optimized.len() > 1);
+        assert!(optimized.iter().all(|statement| statement.source_statement_count == 1));
+        assert!(optimized.iter().all(|statement| statement.sql.len() <= SQL_FILE_INSERT_STATEMENT_MAX_BYTES));
+        let total_tuples: usize = optimized.iter().map(|statement| statement.sql.matches("天沼小学校").count()).sum();
+        assert_eq!(total_tuples, tuples.len());
     }
 
     #[test]
@@ -7490,6 +8022,30 @@ SELECT 1;";
     }
 
     #[test]
+    fn oracle_like_split_large_package_body_in_linear_time() {
+        // Every inner `;` used to re-tokenize the whole body so far, so a few hundred KB
+        // DM8 package body spent minutes in the splitter before reaching the server (#13450).
+        let routines = (0..300)
+            .map(|i| {
+                format!(
+                    "  PROCEDURE p{i}(p_id INT) IS\n    v_name VARCHAR2(100) := 'x;y';\n  BEGIN\n    IF p_id > 0 THEN\n      INSERT INTO orders VALUES (p_id);\n    END IF;\n    FOR r IN (SELECT id FROM orders WHERE id = p_id) LOOP\n      UPDATE orders SET name = v_name WHERE id = r.id;\n    END LOOP;\n  END p{i};\n"
+                )
+            })
+            .collect::<String>();
+        let package_body = format!("CREATE OR REPLACE PACKAGE BODY pkg_orders AS\n{routines}END pkg_orders;");
+        let sql = format!("{package_body}\nSELECT 1 FROM dual;");
+
+        let started = std::time::Instant::now();
+        let statements = split_sql_statements_for_database(&sql, DatabaseType::Dameng);
+        let cursor_statement = find_statement_at_cursor_for_database(&sql, 1, DatabaseType::Dameng);
+        let elapsed = started.elapsed();
+
+        assert_eq!(statements, vec![package_body.as_str(), "SELECT 1 FROM dual"]);
+        assert_eq!(cursor_statement, package_body);
+        assert!(elapsed < std::time::Duration::from_secs(2), "splitting took {elapsed:?}");
+    }
+
+    #[test]
     fn xugu_split_keeps_create_type_body_together() {
         let sql = "\
 CREATE OR REPLACE TYPE BODY obj_t AS
@@ -8101,6 +8657,27 @@ delimiter ;";
                 "CREATE PROCEDURE `fix_collation`()\nBEGIN\nDECLARE done INT DEFAULT FALSE;\nDECLARE tbl_name VARCHAR(255);\nDECLARE cur CURSOR FOR\nSELECT TABLE_NAME FROM information_schema.TABLES\nWHERE TABLE_SCHEMA = DATABASE() AND TABLE_COLLATION = 'utf8mb4_0900_ai_ci';\nDECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;\n\n    OPEN cur;\n    read_loop: LOOP\n        FETCH cur INTO tbl_name;\n        IF done THEN LEAVE read_loop; END IF;\n        SET @sql = CONCAT('ALTER TABLE `', tbl_name, '` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci');\n        PREPARE stmt FROM @sql;\n        EXECUTE stmt;\n        DEALLOCATE PREPARE stmt;\n    END LOOP;\n    CLOSE cur;\nEND",
             ]
         );
+    }
+
+    #[test]
+    fn incomplete_tail_reason_flags_unterminated_constructs() {
+        let options = SqlParsingOptions::for_database_type(DatabaseType::Mysql);
+        let mut complete = SqlStatementSplitter::with_options(options);
+        complete.push_chunk("INSERT INTO t VALUES (1, 'ok');\n-- trailing comment");
+        assert_eq!(complete.incomplete_tail_reason(), None);
+
+        let mut string = SqlStatementSplitter::with_options(options);
+        string.push_chunk("INSERT INTO t VALUES (1, 'ok');\nINSERT INTO t VALUES (2, 'cut");
+        assert_eq!(string.incomplete_tail_reason(), Some("unterminated string literal"));
+        assert!(string.pending_tail_len() > 0);
+
+        let mut comment = SqlStatementSplitter::with_options(options);
+        comment.push_chunk("INSERT INTO t VALUES (1);\n/* never closed");
+        assert_eq!(comment.incomplete_tail_reason(), Some("unclosed block comment"));
+
+        let mut identifier = SqlStatementSplitter::with_options(options);
+        identifier.push_chunk("SELECT `unfinished");
+        assert_eq!(identifier.incomplete_tail_reason(), Some("unterminated quoted identifier"));
     }
 
     #[test]

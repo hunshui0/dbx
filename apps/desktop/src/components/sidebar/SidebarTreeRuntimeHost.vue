@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useTableCopyTaskStore } from "@/stores/tableCopyTaskStore";
 import { uuid } from "@/lib/common/utils";
 import { computed, defineAsyncComponent, nextTick, watch, onBeforeUnmount, onScopeDispose, inject, reactive, ref, shallowRef } from "vue";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
@@ -11,8 +12,10 @@ import { useSidebarConnectionMutationRuntime } from "@/composables/useSidebarCon
 import { useSidebarDatabaseSpecificMutationRuntime } from "@/composables/useSidebarDatabaseSpecificMutationRuntime";
 import { useSidebarTableMutationRuntime } from "@/composables/useSidebarTableMutationRuntime";
 import { useSidebarTreeExportRuntime } from "@/composables/useSidebarTreeExportRuntime";
+import { mysqlDataCharsetEnabled } from "@/lib/connection/mysqlDataCharset";
 import { useSidebarTreeToolRuntime } from "@/composables/useSidebarTreeToolRuntime";
 import { canDropDatabaseNode, notifyDatabaseBrowserMutation } from "@/lib/database/databaseBrowserActions";
+import { dropDatabaseOtherSessionCount } from "@/lib/database/dropDatabaseError";
 import { canDropDatabaseTables, canEmptyDatabaseTables, useDatabaseTableEmpty } from "@/composables/useDatabaseTableEmpty";
 import { useI18n } from "vue-i18n";
 import { launchPlDebug, openPlDebugRecovery } from "@/components/debug/plDebugLaunch";
@@ -265,6 +268,8 @@ import { sidebarTreeArrowAction } from "@/lib/sidebar/sidebarTreeArrowNavigation
 import { batchTableEmptyFeedback, runBatchTableEmpty } from "@/lib/sidebar/batchTableEmpty";
 import { runBatchTableTruncate } from "@/lib/table/batchTableTruncate";
 import { runBatchTableDrop } from "@/lib/table/batchTableDrop";
+import { FOREIGN_KEY_CHECKS_MODES, foreignKeyChecksPreview, foreignKeyChecksTargetResults, isForeignKeyChecksOverride, runForeignKeyChecksBatch, supportsForeignKeyChecksOption, type ForeignKeyChecksMode } from "@/lib/table/foreignKeyChecks";
+import type { SidebarDangerDialogSelect } from "@/lib/sidebar/sidebarDangerDialog";
 import { buildSidebarDdlTemplateSql, formatSidebarDdlTemplateForDisplay } from "@/lib/sidebar/sidebarDdlTemplate";
 import { resolveSidebarDdlTargets } from "@/lib/sidebar/sidebarDdlTargets";
 import { sidebarTableDataExportTargets } from "@/lib/sidebar/sidebarExportRuntime";
@@ -455,7 +460,7 @@ const settingsStore = useSettingsStore();
 
 const savedSqlStore = useSavedSqlStore();
 
-const { toast } = useToast();
+const { toast, dismissToast } = useToast();
 const installedPlugins = ref<InstalledPlugin[]>([]);
 const sidebarPluginRegistry = computed(() => createFrontendPluginRegistry(installedPlugins.value, appLocale.value));
 const pluginDialog = shallowRef<{ plugin: InstalledPlugin; contribution: PluginWorkbenchContribution; context: PluginWorkbenchContext; title: string } | null>(null);
@@ -774,6 +779,64 @@ const {
 });
 
 const batchDropProgress = ref({ completed: 0, total: 0 });
+
+// Navicat-style "Foreign Key Checks: Default / Enable / Disable" for batch truncate / empty / drop.
+const batchForeignKeyChecks = ref<ForeignKeyChecksMode>("default");
+
+/** A non-default mode applies only when every target shares one MySQL connection + database (one session). */
+function batchForeignKeyChecksScope(targets: readonly TreeNode[]): { connectionId: string; database: string } | undefined {
+  const first = targets[0];
+  if (!first?.connectionId || !first.database) return undefined;
+  if (!supportsForeignKeyChecksOption(databaseTypeForNode(first))) return undefined;
+  if (!targets.every((node) => node.type === "table" && node.connectionId === first.connectionId && node.database === first.database)) return undefined;
+  return { connectionId: first.connectionId, database: first.database };
+}
+
+function batchForeignKeyChecksActive(targets: readonly TreeNode[]): boolean {
+  return !!batchForeignKeyChecksScope(targets) && isForeignKeyChecksOverride(batchForeignKeyChecks.value, "mysql");
+}
+
+function batchForeignKeyChecksDisplaySql(targets: readonly TreeNode[], previewSql: string): string {
+  return batchForeignKeyChecksScope(targets) ? foreignKeyChecksPreview(previewSql, batchForeignKeyChecks.value, "mysql") : previewSql;
+}
+
+function batchForeignKeyChecksSelect(targets: readonly TreeNode[]): SidebarDangerDialogSelect | undefined {
+  if (!batchForeignKeyChecksScope(targets)) return undefined;
+  const labels: Record<ForeignKeyChecksMode, string> = {
+    default: t("contextMenu.foreignKeyChecksDefault"),
+    enable: t("contextMenu.foreignKeyChecksEnable"),
+    disable: t("contextMenu.foreignKeyChecksDisable"),
+  };
+  return {
+    value: batchForeignKeyChecks.value,
+    label: t("contextMenu.foreignKeyChecks"),
+    hint: t("contextMenu.foreignKeyChecksHint"),
+    choices: FOREIGN_KEY_CHECKS_MODES.map((value) => ({ value, label: labels[value] })),
+    onChange: (value) => {
+      batchForeignKeyChecks.value = value as ForeignKeyChecksMode;
+    },
+  };
+}
+
+/** Run one statement per target with the chosen FOREIGN_KEY_CHECKS on one session. */
+async function runSidebarForeignKeyChecksBatch<T>(scope: { connectionId: string; database: string }, plan: readonly { target: T; sql: string }[], onProgress?: (completed: number) => void) {
+  const mode = batchForeignKeyChecks.value;
+  if (mode === "default") throw new Error("Foreign key checks override is not selected");
+  const clientSessionId = `foreign-key-checks:${uuid()}`;
+  const results = await runForeignKeyChecksBatch(
+    plan.map(({ sql }) => sql),
+    mode,
+    {
+      open: () => api.prewarmConnection(scope.connectionId, scope.database, undefined, clientSessionId),
+      execute: (sql, progress, options) => api.executeMultiWithProgress(scope.connectionId, scope.database, sql, progress, undefined, { continueOnError: options.continueOnError, clientSessionId }),
+      close: async () => {
+        await api.closeClientConnectionSession(scope.connectionId, scope.database, clientSessionId);
+      },
+    },
+    (progress) => onProgress?.(progress.completed),
+  );
+  return foreignKeyChecksTargetResults(plan, results);
+}
 
 const treeItemDialogOwner = Symbol("sidebar-tree-dialog-owner");
 
@@ -3189,7 +3252,7 @@ async function compileXuguObject() {
     toast(t("contextMenu.compileObjectSuccess", { name: node.label }), 3000);
     await connectionStore.refreshTreeNode(node);
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), { persistent: true });
   }
 }
 
@@ -3239,7 +3302,7 @@ async function executeXuguSchedulerJobAction(action: XuguSchedulerJobAction) {
     // after a destructive action without retaining a stale job node.
     await connectionStore.refreshTreeNode(node);
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), { persistent: true });
   }
 }
 
@@ -3293,7 +3356,7 @@ async function toggleTriggerState(node: TreeNode, enabled: boolean) {
     toast(t(enabled ? "contextMenu.enableTriggerSuccess" : "contextMenu.disableTriggerSuccess", { name: triggerName }), 3000);
     await connectionStore.refreshTreeNode(node);
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), { persistent: true });
   }
 }
 
@@ -3420,7 +3483,7 @@ async function runExactTriggerNodeAction(node: TreeNode, action: OracleTriggerAc
     if (action === "delete" && result.steps.some((step) => step.state === "committed" && step.verification === "deleted")) removeVerifiedTriggerNode(node, plan);
     reportExactTriggerResult(node, plan, result);
   } catch (error) {
-    if (triggerActionHostActive.value) toast(t("contextMenu.tableOperationFailed", { message: error instanceof Error ? error.message : String(error) }), 5000);
+    if (triggerActionHostActive.value) toast(t("contextMenu.tableOperationFailed", { message: error instanceof Error ? error.message : String(error) }), { persistent: true });
   } finally {
     triggerActionBusy.delete(node.id);
   }
@@ -3511,7 +3574,7 @@ async function manageTypeDropNode(node: TreeNode): Promise<boolean> {
     releaseActiveNodeReference(removed.map((item) => item.id));
     return true;
   } catch (error) {
-    toast(t("contextMenu.tableOperationFailed", { message: String(error) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: String(error) }), { persistent: true });
     return false;
   }
 }
@@ -3813,14 +3876,16 @@ function requestBatchDrop() {
       if (!remaining.length) return;
       batchDropTargets.value = remaining;
       batchDropCascade.value = false;
+      batchForeignKeyChecks.value = "default";
       batchDropProgress.value = { completed: 0, total: 0 };
       await refreshBatchDropPreviewSql();
       showBatchDropConfirm.value = true;
-    })().catch((error) => toast(t("contextMenu.tableOperationFailed", { message: String(error) }), 5000));
+    })().catch((error) => toast(t("contextMenu.tableOperationFailed", { message: String(error) }), { persistent: true }));
     return;
   }
   batchDropTargets.value = targets.slice();
   batchDropCascade.value = false;
+  batchForeignKeyChecks.value = "default";
   batchDropProgress.value = { completed: 0, total: 0 };
   void refreshBatchDropPreviewSql();
   showBatchDropConfirm.value = true;
@@ -3831,6 +3896,7 @@ function requestBatchTruncate() {
   if (!targets.length) return;
   batchTruncateTargets.value = targets.slice();
   batchTruncateCascade.value = false;
+  batchForeignKeyChecks.value = "default";
   void refreshBatchTruncatePreviewSql();
   showBatchTruncateConfirm.value = true;
 }
@@ -3840,6 +3906,7 @@ function requestBatchEmpty() {
   if (!targets.length) return;
   batchEmptyTargets.value = targets.slice();
   batchEmptyPreviewSql.value = "";
+  batchForeignKeyChecks.value = "default";
   void refreshBatchEmptyPreviewSql(batchEmptyTargets.value)
     .then(() => {
       if (!batchEmptyPreviewSql.value.trim()) throw new Error("Empty table SQL preview is unavailable");
@@ -3847,7 +3914,7 @@ function requestBatchEmpty() {
     })
     .catch((e: any) => {
       batchEmptyTargets.value = [];
-      toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+      toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), { persistent: true });
     });
 }
 
@@ -3922,11 +3989,11 @@ async function confirmBatchMysqlAutoIncrement() {
     await refreshMutatedTableDataTabsForNodes(succeeded);
   }
   if (failedCount > 0 && firstError) {
-    toast(t("contextMenu.batchMysqlAutoIncrementPartialFail", { success: succeeded.length, failed: failedCount }), 5000);
+    toast(t("contextMenu.batchMysqlAutoIncrementPartialFail", { success: succeeded.length, failed: failedCount }), { persistent: true });
   } else if (succeeded.length > 0) {
     toast(t("contextMenu.batchMysqlAutoIncrementSuccess", { count: succeeded.length, value: mysqlAutoIncrementValue.value }), 3000);
   } else if (firstError) {
-    toast(t("contextMenu.tableOperationFailed", { message: (firstError as any)?.message || String(firstError) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: (firstError as any)?.message || String(firstError) }), { persistent: true });
   }
   batchMysqlAutoIncrementTargets.value = [];
   showBatchMysqlAutoIncrementConfirm.value = false;
@@ -3987,12 +4054,16 @@ const canRenameObject = computed(() => {
   return !!objectType && (supportsObjectRename(currentDatabaseType(), objectType) || (databaseTypeForNode(node) === "oceanbase-oracle" && (objectType === "PROCEDURE" || objectType === "FUNCTION")) || supportsSourceBackedRoutineRename(currentDatabaseType(), objectType as any));
 });
 
+// Target whose name the rename dialog last showed. Kept apart from currentSidebarViewRenameTargetKey,
+// which follows the selected node even while the dialog is closed.
+let renameObjectDialogTargetKey = "";
 function openRenameObjectDialog() {
   claimTreeItemDialogOwnership();
   routeTreeItemDialogController();
   const node = sidebarFormTarget.value ?? activeNode.value;
   const targetKey = JSON.stringify([node.connectionId, node.database, node.schema || node.database, node.type, node.objectName || node.label, databaseTypeForNode(node)]);
-  if (targetKey !== currentSidebarViewRenameTargetKey) renameObjectName.value = node.objectName || node.label;
+  if (targetKey !== renameObjectDialogTargetKey) renameObjectName.value = node.objectName || node.label;
+  renameObjectDialogTargetKey = targetKey;
   renameObjectError.value = "";
   renameObjectPreviewSql.value = "";
   viewRenamePlan.value = undefined;
@@ -4025,6 +4096,7 @@ function openRenameDatabaseDialog() {
   claimTreeItemDialogOwnership();
   routeTreeItemDialogController();
   renameObjectName.value = activeNode.value.label;
+  renameObjectDialogTargetKey = "";
   renameObjectError.value = "";
   renameObjectPreviewSql.value = "";
   viewRenamePlan.value = undefined;
@@ -4650,11 +4722,11 @@ async function confirmDropObject() {
     } catch (error: any) {
       // DROP already succeeded; keep the sidebar consistent if metadata refresh fails.
       connectionStore.removeTreeNode(node.id);
-      toast(t("contextMenu.objectDropRefreshFailed", { message: error?.message || String(error) }), 5000);
+      toast(t("contextMenu.objectDropRefreshFailed", { message: error?.message || String(error) }), { persistent: true });
     }
     releaseActiveNodeReference([node.id]);
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), { persistent: true });
   }
 }
 
@@ -4671,7 +4743,7 @@ async function confirmDropTableChildObject() {
     connectionStore.removeTreeNode(node.id);
     releaseActiveNodeReference([node.id]);
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), { persistent: true });
   }
 }
 
@@ -4743,7 +4815,7 @@ async function confirmBatchDrop() {
       }
       if (droppedCount === 0 && firstGroupError && failedCount === mongoIndexTargets.length) throw firstGroupError;
       if (failedCount > 0) {
-        toast(t("contextMenu.dropIndexesPartialFailure", { success: droppedCount, failed: failedCount }), 5000);
+        toast(t("contextMenu.dropIndexesPartialFailure", { success: droppedCount, failed: failedCount }), { persistent: true });
       } else {
         toast(t("contextMenu.batchDropSuccess", { count: droppedCount }), 3000);
       }
@@ -4762,15 +4834,22 @@ async function confirmBatchDrop() {
           return { target, sql };
         }),
       );
-      const batchSql = plan.map(({ sql }) => sql).join(";\n");
+      const foreignKeyScope = batchForeignKeyChecksActive(targets) ? batchForeignKeyChecksScope(targets) : undefined;
+      const batchSql = foreignKeyScope ? batchForeignKeyChecksDisplaySql(targets, plan.map(({ sql }) => sql).join("\n")) : plan.map(({ sql }) => sql).join(";\n");
       const startTime = Date.now();
       const result = await executeWithProductionSqlGuard({
         connection: connectionStore.getConfig(first.connectionId!),
         database: first.database!,
         sql: batchSql,
         source: t("production.sourceSidebar"),
-        execute: () =>
-          runBatchTableDrop({
+        execute: async () => {
+          if (foreignKeyScope) {
+            const outcome = await runSidebarForeignKeyChecksBatch(foreignKeyScope, plan, (completed) => {
+              batchDropProgress.value = { completed, total: targets.length };
+            });
+            return { succeeded: outcome.succeeded, failed: outcome.failed[0]?.error };
+          }
+          return runBatchTableDrop({
             databaseType: databaseTypeForNode(first),
             plan,
             executeStatement: (sql) => api.executeQuery(first.connectionId!, first.database!, sql),
@@ -4778,7 +4857,8 @@ async function confirmBatchDrop() {
             onProgress: (progress) => {
               batchDropProgress.value = { completed: Math.min(progress.completed, targets.length), total: targets.length };
             },
-          }),
+          });
+        },
       });
       if (!result) return;
 
@@ -4836,10 +4916,10 @@ async function confirmBatchDrop() {
     const refreshResults = await Promise.allSettled([...refreshScopes.values()].map((target) => refreshTableList(target)));
     const refreshFailure = refreshResults.find((result): result is PromiseRejectedResult => result.status === "rejected");
     if (refreshFailure) {
-      toast(t("contextMenu.objectDropRefreshFailed", { message: refreshFailure.reason?.message || String(refreshFailure.reason) }), 5000);
+      toast(t("contextMenu.objectDropRefreshFailed", { message: refreshFailure.reason?.message || String(refreshFailure.reason) }), { persistent: true });
     }
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), { persistent: true });
   }
 }
 
@@ -4930,11 +5010,58 @@ async function confirmExactBatchTriggerDrop() {
   }
 }
 
+/**
+ * Truncate / empty several tables of one MySQL database as a single FOREIGN_KEY_CHECKS-wrapped
+ * batch behind one production confirmation. Returns `undefined` when the guard was declined.
+ */
+async function executeSidebarForeignKeyChecksTableBatch(targets: TreeNode[], buildSql: (target: TreeNode) => Promise<string | null | undefined>) {
+  const scope = batchForeignKeyChecksScope(targets)!;
+  await connectionStore.ensureConnected(scope.connectionId);
+  const plan = await Promise.all(
+    targets.map(async (target) => {
+      const sql = await buildSql(target);
+      if (!sql) throw new Error(`SQL is unavailable for ${target.label}`);
+      return { target, sql };
+    }),
+  );
+  const script = batchForeignKeyChecksDisplaySql(targets, plan.map(({ sql }) => sql).join("\n"));
+  const startTime = Date.now();
+  const outcome = await executeWithProductionSqlGuard({
+    connection: connectionStore.getConfig(scope.connectionId),
+    database: scope.database,
+    sql: script,
+    source: t("production.sourceSidebar"),
+    execute: () => runSidebarForeignKeyChecksBatch(scope, plan),
+  });
+  if (!outcome) return undefined;
+  await recordTableMutationHistory(getTableMutationHistoryStoreOrNull(), {
+    connectionId: scope.connectionId,
+    connectionName: connectionStore.getConfig(scope.connectionId)?.name,
+    database: scope.database,
+    sql: script,
+    elapsedMs: Date.now() - startTime,
+    success: outcome.failed.length === 0,
+    error: outcome.failed.length ? outcome.failed.map(({ target, error }) => `${target.label}: ${error.message}`).join("; ") : undefined,
+    target: targets.map((target) => target.label).join(", "),
+  }).catch((err) => console.warn("[DBX] failed to record foreign key checks batch history", err));
+  if (outcome.succeeded.length) await refreshMutatedTableDataTabsForNodes(outcome.succeeded);
+  return outcome;
+}
+
 async function confirmBatchTruncate() {
   const targets = batchTruncateTargets.value.slice();
   if (!targets.length) return;
   try {
     const useCascade = batchTruncateCascade.value && targets.every((node) => supportsTruncateTableCascade(databaseTypeForNode(node)));
+    if (batchForeignKeyChecksActive(targets)) {
+      const outcome = await executeSidebarForeignKeyChecksTableBatch(targets, (target) => truncateSqlForTreeNode(target, { cascade: useCascade }));
+      if (!outcome) return;
+      const failure = outcome.failed[0];
+      if (failure) throw new Error(`${failure.target.label}: ${failure.error.message}`);
+      toast(t("contextMenu.batchTruncateSuccess", { count: targets.length }), 3000);
+      showBatchTruncateConfirm.value = false;
+      return;
+    }
     await runBatchTableTruncate(
       targets,
       async (target) => {
@@ -4961,7 +5088,7 @@ async function confirmBatchTruncate() {
     toast(t("contextMenu.batchTruncateSuccess", { count: targets.length }), 3000);
     showBatchTruncateConfirm.value = false;
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), { persistent: true });
   }
 }
 
@@ -4969,6 +5096,20 @@ async function confirmBatchEmpty() {
   const targets = batchEmptyTargets.value.slice();
   if (!targets.length) return;
   const asynchronousMutation = targets.every((target) => databaseTypeForNode(target) === "clickhouse");
+  if (batchForeignKeyChecksActive(targets)) {
+    try {
+      const outcome = await executeSidebarForeignKeyChecksTableBatch(targets, emptySqlForTreeNode);
+      if (!outcome) return;
+      const feedback = batchTableEmptyFeedback(outcome, false);
+      if (feedback === "success") toast(t("contextMenu.batchEmptySuccess", { count: outcome.succeeded.length }), 3000);
+      else toast(t("contextMenu.batchEmptyPartialFail", { success: outcome.succeeded.length, failed: outcome.failed.length }), 5000);
+      batchEmptyTargets.value = [];
+      showBatchEmptyConfirm.value = false;
+    } catch (e: any) {
+      toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    }
+    return;
+  }
   const result = await runBatchTableEmpty(targets, async (target) => {
     if (!target.connectionId || !target.database) throw new Error("Missing table connection context");
     await connectionStore.ensureConnected(target.connectionId);
@@ -5000,9 +5141,9 @@ async function confirmBatchEmpty() {
   } else if (feedback === "submitted") {
     toast(t("contextMenu.batchEmptySubmitted", { count: result.succeeded.length }), 3000);
   } else if (feedback === "submitted-partial") {
-    toast(t("contextMenu.batchEmptySubmittedPartial", { success: result.succeeded.length, failed: result.failed.length }), 5000);
+    toast(t("contextMenu.batchEmptySubmittedPartial", { success: result.succeeded.length, failed: result.failed.length }), { persistent: true });
   } else {
-    toast(t("contextMenu.batchEmptyPartialFail", { success: result.succeeded.length, failed: result.failed.length }), 5000);
+    toast(t("contextMenu.batchEmptyPartialFail", { success: result.succeeded.length, failed: result.failed.length }), { persistent: true });
   }
   await refreshMutatedTableDataTabsForNodes(result.succeeded);
   batchEmptyTargets.value = [];
@@ -5266,7 +5407,7 @@ async function confirmEditDatabaseProperties() {
     showEditDatabasePropertiesDialog.value = false;
     await connectionStore.loadDatabases(node.connectionId, { force: true });
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: translateBackendError(t, e) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: translateBackendError(t, e) }), { persistent: true });
   } finally {
     editDatabasePropertiesLoading.value = false;
   }
@@ -5338,7 +5479,7 @@ async function confirmEditSchemaComment() {
     showEditSchemaCommentDialog.value = false;
     await connectionStore.loadSchemas(node.connectionId, node.database, { force: true });
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: translateBackendError(t, e) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: translateBackendError(t, e) }), { persistent: true });
   } finally {
     schemaCommentLoading.value = false;
   }
@@ -5569,10 +5710,14 @@ async function createDuckDbAttachedDatabaseFile() {
     }
     await connectionStore.ensureVisibleDatabase(node.connectionId, name);
     await connectionStore.loadDatabases(node.connectionId, { force: true });
-    connectionStore.selectedTreeNodeId = `${node.connectionId}:${name}`;
+    const nodeId = `${node.connectionId}:${name}`;
+    connectionStore.connectionMultiSelectActive = false;
+    connectionStore.selectedTreeNodeId = nodeId;
+    connectionStore.selectedTreeNodeIds = [nodeId];
+    connectionStore.treeSelectionAnchorId = nodeId;
     toast(t("contextMenu.createDuckDbFileSuccess", { name }), 3000);
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), { persistent: true });
   }
 }
 
@@ -5614,10 +5759,14 @@ async function attachSqliteDatabaseFile() {
     }
     await connectionStore.ensureVisibleDatabase(node.connectionId, name);
     await connectionStore.loadDatabases(node.connectionId, { force: true });
-    connectionStore.selectedTreeNodeId = `${node.connectionId}:${name}`;
+    const nodeId = `${node.connectionId}:${name}`;
+    connectionStore.connectionMultiSelectActive = false;
+    connectionStore.selectedTreeNodeId = nodeId;
+    connectionStore.selectedTreeNodeIds = [nodeId];
+    connectionStore.treeSelectionAnchorId = nodeId;
     toast(t("contextMenu.attachSqliteDatabaseSuccess", { name }), 3000);
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), { persistent: true });
   }
 }
 
@@ -5666,7 +5815,7 @@ async function confirmCreateDatabase() {
     showCreateDatabaseDialog.value = false;
     showCreateDatabasePreviewDialog.value = true;
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), { persistent: true });
   }
 }
 
@@ -5718,10 +5867,10 @@ async function applyCreateDatabaseAuthorizationPlan() {
         await connectionStore.loadDatabases(node.connectionId, { force: true });
       }
     }
-    toast(t(status === "success" ? "contextMenu.createDatabaseSuccess" : status === "partial" ? "contextMenu.createDatabasePartial" : "contextMenu.createDatabaseFailed", { name }), status === "success" ? 3000 : 5000);
+    toast(t(status === "success" ? "contextMenu.createDatabaseSuccess" : status === "partial" ? "contextMenu.createDatabasePartial" : "contextMenu.createDatabaseFailed", { name }), status === "success" ? 3000 : { persistent: true });
   } catch (error: any) {
     const message = appendCreateDatabaseErrorHint(connectionStore.getConfig(node.connectionId)?.db_type, error?.message || String(error), t);
-    toast(t("contextMenu.tableOperationFailed", { message }), 8000);
+    toast(t("contextMenu.tableOperationFailed", { message }), { persistent: true });
   } finally {
     createDatabaseAuthorizationApplying.value = false;
   }
@@ -5798,7 +5947,10 @@ async function confirmDropDatabase() {
     notifyDatabaseBrowserMutation({ connectionId, database: node.database || node.label, operation: "drop-database" });
     queryStore.closeDatabaseTabs(connectionId, node.database || node.label);
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    const message = e?.message || String(e);
+    const otherSessions = dropDatabaseOtherSessionCount(message);
+    if (otherSessions === undefined) toast(t("contextMenu.tableOperationFailed", { message }), { persistent: true });
+    else toast(otherSessions === null ? t("contextMenu.dropDatabaseInUse", { name: node.label }) : t("contextMenu.dropDatabaseInUseSessions", { name: node.label, count: otherSessions }), { persistent: true });
   } finally {
     dropDatabaseLoading.value = false;
   }
@@ -5833,7 +5985,7 @@ async function confirmCreateSchema() {
       await connectionStore.loadSchemas(node.connectionId, targetDatabase || "", { force: true });
     }
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), { persistent: true });
   }
 }
 
@@ -5874,7 +6026,7 @@ async function confirmDropSchema() {
       await connectionStore.loadSchemas(node.connectionId, node.database, { force: true });
     }
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), { persistent: true });
   }
 }
 
@@ -5951,13 +6103,21 @@ async function confirmDuplicateStructureImpl() {
       cloneDialog.showFailure(e);
       return;
     }
-    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), { persistent: true });
   }
 }
 
 async function confirmPasteTable() {
-  const hasOceanbaseClone = pasteTableEntries.value.some((entry) => entry.connectionId && effectiveDatabaseTypeForConnection(connectionStore.getConfig(entry.connectionId)) === "oceanbase-oracle");
-  return hasOceanbaseClone ? cloneDialog.run(confirmPasteTableImpl) : confirmPasteTableImpl();
+  const databaseTypes = pasteTableEntries.value.filter((entry) => entry.targetName.trim()).map((entry) => (entry.connectionId ? effectiveDatabaseTypeForConnection(connectionStore.getConfig(entry.connectionId)) : undefined));
+  if (databaseTypes.includes("oceanbase-oracle")) return cloneDialog.run(confirmPasteTableImpl);
+  if (databaseTypes.every((type) => type === "mysql")) return confirmPasteTableImpl();
+
+  const progressToast = toast(`${t("tableCopyTask.title")} · ${t("tableCopyTask.running")}`, { persistent: true, loading: true });
+  try {
+    await confirmPasteTableImpl();
+  } finally {
+    if (progressToast !== undefined) dismissToast(progressToast);
+  }
 }
 
 async function confirmPasteTableImpl() {
@@ -5971,6 +6131,12 @@ async function confirmPasteTableImpl() {
   const mode = pasteTableMode.value;
   const copyData = pasteTableModeCopiesData(mode) && pasteTableDataCopySupported.value;
   showPasteDialog.value = false;
+  if (entries.every((entry) => entry.databaseType === "mysql")) {
+    const copies = entries.map((entry) => ({ ...entry, connection: { ...connectionStore.getConfig(entry.connectionId)! } }));
+    const completed = await useTableCopyTaskStore().run(copies, mode);
+    if (completed && shouldConsumeTableClipboard && connectionStore.treeClipboard === clipboardAtPasteStart) connectionStore.treeClipboard = null;
+    return;
+  }
   let successCount = 0;
   let pasteFailCount = 0;
   let firstPasteError: unknown;
@@ -6128,7 +6294,7 @@ async function confirmPasteTableImpl() {
     }
     if (refreshFailCount > 0) {
       const refreshMessage = refreshError instanceof Error ? refreshError.message : String(refreshError);
-      toast(t("contextMenu.pasteTableRefreshFailed", { message: translateBackendError(t, refreshMessage) }), 5000);
+      toast(t("contextMenu.pasteTableRefreshFailed", { message: translateBackendError(t, refreshMessage) }), { persistent: true });
     }
     return;
   }
@@ -6139,11 +6305,11 @@ async function confirmPasteTableImpl() {
     }
     toast(t("contextMenu.batchPasteSuccess", { count: successCount }), 3000);
   } else {
-    toast(`${t("contextMenu.batchPastePartialFail", { success: pasteFeedback.successCount, failed: pasteFeedback.failedCount })}\n${t("contextMenu.tableOperationFailed", { message: translateBackendError(t, pasteFeedback.firstError) })}`, 5000);
+    toast(`${t("contextMenu.batchPastePartialFail", { success: pasteFeedback.successCount, failed: pasteFeedback.failedCount })}\n${t("contextMenu.tableOperationFailed", { message: translateBackendError(t, pasteFeedback.firstError) })}`, { persistent: true });
   }
   if (refreshFailCount > 0) {
     const refreshMessage = refreshError instanceof Error ? refreshError.message : String(refreshError);
-    toast(t("contextMenu.pasteTableRefreshFailed", { message: translateBackendError(t, refreshMessage) }), 5000);
+    toast(t("contextMenu.pasteTableRefreshFailed", { message: translateBackendError(t, refreshMessage) }), { persistent: true });
   }
 }
 
@@ -6229,7 +6395,7 @@ async function confirmDeleteHBaseTable() {
     await connectionStore.refreshObjectListTreeNode(node.connectionId, node.database);
     toast(t("hbase.tableDeleted", { table: node.database === "default" ? node.label : `${node.database}:${node.label}` }));
   } catch (error: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: error?.message || String(error) }), 5000);
+    toast(t("contextMenu.tableOperationFailed", { message: error?.message || String(error) }), { persistent: true });
     throw error;
   }
 }
@@ -6391,6 +6557,13 @@ function dangerRequest(request: Omit<SidebarDangerDialogRequest, "target">): Sid
       await onChange(checked);
     };
   }
+  if (request.select?.onChange) {
+    const onChange = request.select.onChange;
+    request.select.onChange = async (value) => {
+      activateActionTarget(target);
+      await onChange(value);
+    };
+  }
   if (request.textInput?.onInput) {
     const onInput = request.textInput.onInput;
     request.textInput.onInput = async (value) => {
@@ -6467,8 +6640,9 @@ routeDangerDialog(showBatchEmptyConfirm, () =>
     title: batchEmptyConfirmTitle(),
     message: batchEmptyConfirmMessage(),
     get sql() {
-      return batchEmptyPreviewSql.value;
+      return batchForeignKeyChecksDisplaySql(batchEmptyTargets.value, batchEmptyPreviewSql.value);
     },
+    select: batchForeignKeyChecksSelect(batchEmptyTargets.value),
     confirmLabel: batchEmptyConfirmLabel(),
     confirm: confirmBatchEmpty,
   }),
@@ -6620,8 +6794,9 @@ routeDangerDialog(showBatchDropConfirm, () =>
     title: batchDropConfirmTitle(),
     message: batchDropConfirmMessage(),
     get sql() {
-      return batchDropPreviewSql.value;
+      return batchForeignKeyChecksDisplaySql(batchDropTargets.value, batchDropPreviewSql.value);
     },
+    select: batchForeignKeyChecksSelect(batchDropTargets.value),
     get confirmDisabled() {
       return batchDropTargets.value.some((node) => !!exactOracleTriggerNodeMetadata(node)) && (exactBatchDropExecuting.value || exactBatchDropLoading.value || !exactBatchDropPreview.value || !isExactBatchDropPreviewCurrent(exactBatchDropPreview.value) || !!exactBatchDropError.value);
     },
@@ -6661,8 +6836,9 @@ routeDangerDialog(showBatchTruncateConfirm, () =>
     title: batchTruncateConfirmTitle(),
     message: batchTruncateConfirmMessage(),
     get sql() {
-      return batchTruncatePreviewSql.value;
+      return batchForeignKeyChecksDisplaySql(batchTruncateTargets.value, batchTruncatePreviewSql.value);
     },
+    select: batchForeignKeyChecksSelect(batchTruncateTargets.value),
     confirmLabel: batchTruncateMenuLabel(),
     option: canBatchTruncateCascade.value
       ? {
@@ -7105,6 +7281,7 @@ function addToAiMenuItem(node: TreeNode): ContextMenuItem {
 }
 
 function exportDataSubmenu(includeSqlInsert = true): ContextMenuItem {
+  if (sidebarTableDataExportTargets(activeNode.value, connectionStore.treeNodes, acceptedSelectionIds ?? connectionStore.selectedTreeNodeIds).some((target) => mysqlDataCharsetEnabled(connectionStore.getConfig(target.connectionId ?? "")))) includeSqlInsert = false;
   const count = selectedDataExportTargetCount();
   const children: ContextMenuItem[] = [
     { label: "CSV", action: () => exportData("csv") },

@@ -19,7 +19,9 @@ use serde_json::json;
 use url::Url;
 use uuid::Uuid;
 
-use crate::backend::{format_query_result, new_connection_config, parse_database_type, ConnectionSummary, DbxBackend};
+use crate::backend::{
+    format_query_result, new_connection_config_with_external_config, parse_database_type, ConnectionSummary, DbxBackend,
+};
 use crate::mongo::{self, MongoCommand, MongoSafetyError};
 use crate::runtime::McpTransport;
 use crate::session::{McpSession, McpSessionStore};
@@ -41,8 +43,8 @@ use dbx_core::{
     models::connection::ConnectionConfig,
     models::connection::DatabaseType,
     production_safety::{
-        is_production_database, mongo_pipeline_targets_production_database, sql_references_disallowed_database,
-        targets_production_database,
+        is_production_database, mongo_pipeline_targets_production_database,
+        sql_references_disallowed_database_for_connection, targets_production_database,
     },
     query_execution_sql::{classify_salesforce_statement_risk, is_write_sql_for_database, SalesforceStatementRisk},
     sql_risk::{
@@ -239,6 +241,7 @@ pub struct NacosRegisterInstanceRequest {
     pub group_name: Option<String>,
     pub cluster_name: Option<String>,
     pub weight: Option<f64>,
+    #[schemars(extend("type" = "object"))]
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -460,6 +463,12 @@ pub struct AddConnectionRequest {
     pub ssl: bool,
     #[schemars(extend("type" = "string"))]
     pub driver_profile: Option<String>,
+    /// Dialect-specific external configuration. Nacos: camelCase admin config
+    /// (`implementation`, `versionMode`, `contextPath`, `serverAddr`,
+    /// `namespace`, `auth`, …). Omitted Nacos fields are filled from
+    /// host/port/username/password/database with the desktop defaults
+    /// (`implementation=nacos`, `versionMode=v2`, `contextPath=/nacos`).
+    pub external_config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2229,6 +2238,7 @@ impl DbxMcpServer {
             Ok(allowed) => allowed,
             Err(error) => return error,
         };
+        let read_only_by_connection = self.plugin_connection_read_only_if_unconfigured().await;
         if self.scope.enabled() && allowed_connections.is_empty() {
             return tool_error(
                 "PLUGIN_OUT_OF_SCOPE",
@@ -2243,12 +2253,24 @@ impl DbxMcpServer {
         let connection_hidden = owned
             .iter()
             .filter(|entry| {
-                !plugin_entry_has_allowed_connection(access.as_ref(), group_paths.as_ref(), entry, &allowed_connections)
+                !plugin_entry_has_allowed_connection(
+                    access.as_ref(),
+                    group_paths.as_ref(),
+                    entry,
+                    &allowed_connections,
+                    &read_only_by_connection,
+                )
             })
             .count();
         hidden += connection_hidden;
         owned.retain(|entry| {
-            plugin_entry_has_allowed_connection(access.as_ref(), group_paths.as_ref(), entry, &allowed_connections)
+            plugin_entry_has_allowed_connection(
+                access.as_ref(),
+                group_paths.as_ref(),
+                entry,
+                &allowed_connections,
+                &read_only_by_connection,
+            )
         });
         if owned.is_empty() {
             // An all-allowlist-hidden plugin, a plugin with no usable
@@ -2273,6 +2295,7 @@ impl DbxMcpServer {
                             group_paths.get(connection_id).map(|path| path.ids.as_slice()).unwrap_or(&[]),
                             entry,
                             connection_id,
+                            read_only_by_connection.get(connection_id).copied(),
                         )
                     })
                     .cloned()
@@ -3900,6 +3923,8 @@ impl DbxMcpServer {
                 partition: request.partition,
                 offset: request.offset,
                 timestamp: None,
+                end_timestamp: None,
+                sort_order: None,
             };
             match self.backend.peek_messages(&resolved.connection, topic, count, options).await {
                 Ok(result) => text(format_peek_messages_result(result, count as usize)),
@@ -4145,7 +4170,7 @@ impl DbxMcpServer {
             Some(port) => port,
             None => return text("Port is required for this database type."),
         };
-        let config = match new_connection_config(
+        let config = match new_connection_config_with_external_config(
             Uuid::new_v4().to_string(),
             request.name,
             db_type,
@@ -4156,6 +4181,7 @@ impl DbxMcpServer {
             request.database,
             request.ssl,
             request.driver_profile,
+            request.external_config,
         ) {
             Ok(config) => config,
             Err(error) => return tool_error("INVALID_CONNECTION", error),
@@ -5050,7 +5076,7 @@ impl DbxMcpServer {
             .await
             .map_err(|error| backend_tool_error("MCP_POLICY_UNAVAILABLE", error))?;
         if entry.scope.is_none() && connection_id.is_none() {
-            return ensure_plugin_scope(&access, entry, &[], None, arguments);
+            return ensure_plugin_scope(&access, entry, &[], None, None, arguments);
         }
         let policy = self.load_policy().await?;
         let group_paths = self
@@ -5059,7 +5085,21 @@ impl DbxMcpServer {
             .map_err(|error| backend_tool_error("MCP_POLICY_UNAVAILABLE", error))?;
         let group_ids =
             connection_id.and_then(|id| group_paths.get(id)).map(|path| path.ids.clone()).unwrap_or_default();
-        ensure_plugin_scope(&access, entry, &group_ids, connection_id, arguments)
+        // The connection's own protection level feeds the plugin-connection
+        // default (writable plugin connections resolve to at least write when
+        // no explicit rule says otherwise). The default only applies to fresh
+        // installs: once the user saves any MCP policy, its explicit settings
+        // are authoritative. The same configured-aware map the listings use
+        // keeps advertised visibility and call decisions identical. Unknown
+        // facts keep the plain policy default.
+        let connection_read_only = match connection_id {
+            Some(id) => {
+                let read_only_by_connection = self.plugin_connection_read_only_if_unconfigured().await;
+                read_only_by_connection.get(id).copied()
+            }
+            None => None,
+        };
+        ensure_plugin_scope(&access, entry, &group_ids, connection_id, connection_read_only, arguments)
     }
 
     /// The advertised `tools/list` view: router-enabled tools narrowed to the
@@ -5410,6 +5450,7 @@ impl DbxMcpServer {
         let entries = crate::plugin_tools::build_catalog(&providers);
         // Tool calls fail closed on policy errors anyway; keep the view.
         let allowed = self.allowed_plugin_connections().await.unwrap_or_default();
+        let read_only_by_connection = self.plugin_connection_read_only_if_unconfigured().await;
         let access = self.backend.load_mcp_access_policy().await.ok();
         let policy = policy.cloned();
         let group_paths = match policy.as_ref() {
@@ -5424,7 +5465,13 @@ impl DbxMcpServer {
                     return None;
                 }
                 let connections = allowed.get(&entry.plugin_id).cloned().unwrap_or_default();
-                if !plugin_entry_has_allowed_connection(access.as_ref(), group_paths.as_ref(), &entry, &connections) {
+                if !plugin_entry_has_allowed_connection(
+                    access.as_ref(),
+                    group_paths.as_ref(),
+                    &entry,
+                    &connections,
+                    &read_only_by_connection,
+                ) {
                     return None;
                 }
                 let connections = match (&access, &group_paths) {
@@ -5436,6 +5483,7 @@ impl DbxMcpServer {
                                 group_paths.get(connection_id).map(|path| path.ids.as_slice()).unwrap_or(&[]),
                                 &entry,
                                 connection_id,
+                                read_only_by_connection.get(connection_id).copied(),
                             )
                         })
                         .collect(),
@@ -5558,6 +5606,7 @@ impl DbxMcpServer {
         // Listing degrades on policy errors the same way the flat view does;
         // `dbx_plugin_tools`/`dbx_plugin_call` still fail closed.
         let allowed = self.allowed_plugin_connections().await.unwrap_or_default();
+        let read_only_by_connection = self.plugin_connection_read_only_if_unconfigured().await;
         let policy = self.load_policy().await.ok();
         let access = self.backend.load_mcp_access_policy().await.ok();
         let group_paths = match policy.as_ref() {
@@ -5598,6 +5647,7 @@ impl DbxMcpServer {
                             group_paths.as_ref(),
                             entry,
                             connections,
+                            &read_only_by_connection,
                         )
                 })
                 .collect::<Vec<_>>();
@@ -5615,6 +5665,7 @@ impl DbxMcpServer {
                                     group_paths.get(connection_id).map(|path| path.ids.as_slice()).unwrap_or(&[]),
                                     entry,
                                     connection_id,
+                                    read_only_by_connection.get(connection_id).copied(),
                                 ),
                                 _ => true,
                             }
@@ -5632,6 +5683,35 @@ impl DbxMcpServer {
     async fn allowed_plugin_connections_for(&self, plugin_id: &str) -> Result<Vec<(String, String)>, CallToolResult> {
         let allowed = self.allowed_plugin_connections().await?;
         Ok(allowed.get(plugin_id).cloned().unwrap_or_default())
+    }
+
+    /// Read-only flag per plugin connection. Feeds the plugin-connection
+    /// access default (writable plugin connections resolve to at least write
+    /// when no explicit rule says otherwise) on both the listing and the call
+    /// path so a tool never advertises where it cannot run, and never hides
+    /// where it can.
+    async fn plugin_connection_read_only(&self) -> Result<HashMap<String, bool>, CallToolResult> {
+        let connections =
+            self.backend.load_connections().await.map_err(|error| tool_error("CONNECTION_LOAD_ERROR", error))?;
+        Ok(connections
+            .into_iter()
+            .filter(|config| config.plugin_id.as_deref().is_some_and(|id| !id.trim().is_empty()))
+            .map(|config| (config.id, config.read_only))
+            .collect())
+    }
+
+    /// The configured-aware plugin-connection read-only map: the single
+    /// source every listing and the call path share. The write-widening
+    /// default only applies to fresh installs — once the user saves any MCP
+    /// policy its explicit settings are authoritative, so the map stays empty
+    /// and resolution falls back to the plain policy default on listings and
+    /// calls alike. Backends map unreadable storage to configured, so this
+    /// fails closed (never widens) there too.
+    async fn plugin_connection_read_only_if_unconfigured(&self) -> HashMap<String, bool> {
+        if self.backend.mcp_policy_configured().await {
+            return HashMap::new();
+        }
+        self.plugin_connection_read_only().await.unwrap_or_default()
     }
 
     /// Shared call core for `dbx_plugin_call`: locates the tool by
@@ -6246,6 +6326,7 @@ fn empty_query_result() -> dbx_core::db::QueryResult {
         deferred_large_value_cells: Vec::new(),
         column_sortables: Vec::new(),
         spatial_columns: Vec::new(),
+        raw_key_cells: Vec::new(),
         spatial_values: Vec::new(),
         rows: Vec::new(),
         affected_rows: 0,
@@ -6325,8 +6406,21 @@ fn plugin_connection_level_allowed(
     group_ids: &[String],
     entry: &crate::plugin_tools::PluginToolEntry,
     connection_id: &str,
+    connection_read_only: Option<bool>,
 ) -> bool {
     let required = plugin_tool_required_access(entry);
+    // Scope-less entries resolve directly so the plugin-connection default
+    // (writable plugin connections count as write) applies to the listing
+    // exactly as it does at call time. Scope-bound entries keep the
+    // sub-scope-aware check.
+    if entry.scope.is_none() {
+        let resolved = match connection_read_only {
+            Some(read_only) => access.resolve_plugin_connection(group_ids, connection_id, read_only),
+            None => access.resolve(group_ids, connection_id, None),
+        };
+        let ceiling = access.toolset_ceiling(connection_id, &entry.toolset);
+        return resolved.visible && ceiling.map_or(resolved.level, |c| resolved.level.min(c)) >= required;
+    }
     let scopes = entry.scope.as_ref().map(|(kind, _)| [kind.as_str()]);
     connection_has_tool_access(
         access,
@@ -6354,6 +6448,7 @@ fn plugin_entry_has_allowed_connection(
     group_paths: Option<&HashMap<String, dbx_core::mcp_policy::McpConnectionGroupPath>>,
     entry: &crate::plugin_tools::PluginToolEntry,
     connections: &[(String, String)],
+    read_only_by_connection: &HashMap<String, bool>,
 ) -> bool {
     if !entry.requires_connection() {
         return access.is_none_or(|access| access.default_access >= plugin_tool_required_access(entry));
@@ -6368,6 +6463,7 @@ fn plugin_entry_has_allowed_connection(
                 group_paths.get(connection_id).map(|path| path.ids.as_slice()).unwrap_or(&[]),
                 entry,
                 connection_id,
+                read_only_by_connection.get(connection_id).copied(),
             )
         }),
         _ => true,
@@ -6384,6 +6480,7 @@ fn ensure_plugin_scope(
     entry: &crate::plugin_tools::PluginToolEntry,
     group_ids: &[String],
     connection_id: Option<&str>,
+    connection_read_only: Option<bool>,
     arguments: &serde_json::Value,
 ) -> Result<dbx_core::mcp_access::McpAccessLevel, CallToolResult> {
     let Some(connection_id) = connection_id else {
@@ -6393,10 +6490,16 @@ fn ensure_plugin_scope(
                 format!("Plugin tool \"{}\" requires a policy-bound connection.", entry.exposed_name),
             ));
         }
-        if access.default_access < plugin_tool_required_access(entry) {
+        let needed = plugin_tool_required_access(entry);
+        if access.default_access < needed {
             return Err(tool_error(
                 "MCP_READ_ONLY",
-                format!("Plugin tool \"{}\" is above the effective DBX MCP access level.", entry.exposed_name),
+                format!(
+                    "Plugin tool \"{}\" needs {} access but the global default is {}. Raise the connection's access level in DBX Settings → MCP, or call it with an authorized connectionId.",
+                    entry.exposed_name,
+                    access_level_name(needed),
+                    access_level_name(access.default_access)
+                ),
             ));
         }
         return Ok(access.default_access);
@@ -6425,7 +6528,10 @@ fn ensure_plugin_scope(
             }
         }
     } else {
-        access.resolve(group_ids, connection_id, None)
+        match connection_read_only {
+            Some(read_only) => access.resolve_plugin_connection(group_ids, connection_id, read_only),
+            None => access.resolve(group_ids, connection_id, None),
+        }
     };
     if !resolved.visible {
         return Err(tool_error(
@@ -6436,10 +6542,26 @@ fn ensure_plugin_scope(
     if cap(resolved.level) < needed {
         return Err(tool_error(
             "MCP_READ_ONLY",
-            format!("Plugin tool \"{}\" is above the effective DBX MCP access level.", entry.exposed_name),
+            format!(
+                "Plugin tool \"{}\" needs {} access; connection \"{}\" resolves to {} in the DBX MCP settings. Raise that connection's access level in DBX Settings → MCP.",
+                entry.exposed_name,
+                access_level_name(needed),
+                connection_id,
+                access_level_name(resolved.level)
+            ),
         ));
     }
     Ok(cap(resolved.level))
+}
+
+/// Lowercase stable names for error messages and audits.
+fn access_level_name(level: dbx_core::mcp_access::McpAccessLevel) -> &'static str {
+    match level {
+        dbx_core::mcp_access::McpAccessLevel::None => "none",
+        dbx_core::mcp_access::McpAccessLevel::Read => "read",
+        dbx_core::mcp_access::McpAccessLevel::Write => "write",
+        dbx_core::mcp_access::McpAccessLevel::Full => "full",
+    }
 }
 
 /// The exposed tool is declared `full`: `exposed_tools` rewrites
@@ -6519,7 +6641,7 @@ fn ensure_sql_database_scope(
     let DatabaseScope::Selected(allowed_databases) = scope else {
         return Ok(());
     };
-    if sql_references_disallowed_database(sql, &connection.db_type, active_database, allowed_databases) {
+    if sql_references_disallowed_database_for_connection(sql, connection, active_database, allowed_databases) {
         return Err(tool_error(
             "DATABASE_OUT_OF_SCOPE",
             "SQL references a database that is not allowed by DBX MCP settings for this connection.",
@@ -6594,9 +6716,14 @@ fn mcp_permissions(
     connection: &dbx_core::models::connection::ConnectionConfig,
     policy: &McpGlobalPolicy,
 ) -> dbx_core::agent_tools::AgentSqlPermissions {
+    // Invalid compatibility configuration must not advertise write permission.
+    let compatibility_read_only = dbx_core::query::mysql_data_charset_policy::enabled(connection).unwrap_or(true);
     dbx_core::agent_tools::AgentSqlPermissions {
-        allow_writes: !policy.read_only && !connection.read_only,
-        allow_dangerous: !policy.read_only && !connection.read_only && policy.allow_dangerous_sql,
+        allow_writes: !policy.read_only && !connection.read_only && !compatibility_read_only,
+        allow_dangerous: !policy.read_only
+            && !connection.read_only
+            && !compatibility_read_only
+            && policy.allow_dangerous_sql,
         confirmed_write_sql: mcp_confirmed_write_sql_from_env(),
     }
 }
@@ -7066,6 +7193,12 @@ fn validate_sql_policy(
     sql: &str,
     allow_database_switch: bool,
 ) -> Result<dbx_core::agent_tools::AgentSqlPermissions, CallToolResult> {
+    if dbx_core::query::mysql_data_charset_policy::enabled(connection)
+        .map_err(|error| tool_error("MYSQL_DATA_CHARSET_CONFIG_INVALID", error))?
+    {
+        dbx_core::query::mysql_data_charset_policy::check_sql(sql, &connection.name)
+            .map_err(|error| tool_error("MYSQL_DATA_CHARSET_SQL_BLOCKED", error))?;
+    }
     if !allow_database_switch && mcp_sql_has_forbidden_database_switch(sql, connection.db_type) {
         return Err(tool_error(
             "SQL_BLOCKED",
@@ -7586,6 +7719,7 @@ mod tests {
                     deferred_large_value_cells: Vec::new(),
                     column_sortables: Vec::new(),
                     spatial_columns: Vec::new(),
+                    raw_key_cells: Vec::new(),
                     spatial_values: Vec::new(),
                     rows: Vec::new(),
                     affected_rows: 0,
@@ -7661,6 +7795,7 @@ mod tests {
     struct FakeBackend {
         connections: Vec<ConnectionConfig>,
         policy: McpGlobalPolicy,
+        mcp_policy_configured: bool,
         recorded_arguments: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
         history: std::sync::Mutex<Vec<dbx_core::history::HistoryEntry>>,
         closed_sessions: std::sync::Mutex<Vec<String>>,
@@ -7699,6 +7834,7 @@ mod tests {
             Self {
                 connections: Vec::new(),
                 policy: McpGlobalPolicy::default(),
+                mcp_policy_configured: true,
                 recorded_arguments: std::sync::Mutex::new(Vec::new()),
                 history: std::sync::Mutex::new(Vec::new()),
                 closed_sessions: std::sync::Mutex::new(Vec::new()),
@@ -8077,6 +8213,10 @@ mod tests {
             Ok(self.policy_override.lock().unwrap().clone().unwrap_or_else(|| self.policy.clone()))
         }
 
+        async fn mcp_policy_configured(&self) -> bool {
+            self.mcp_policy_configured
+        }
+
         async fn load_mcp_access_policy(&self) -> Result<dbx_core::mcp_access::McpAccessPolicy, String> {
             self.access_policy_loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if !self.tool_approvals.lock().unwrap().is_empty() {
@@ -8316,6 +8456,7 @@ mod tests {
                     deferred_large_value_cells: Vec::new(),
                     column_sortables: vec![],
                     spatial_columns: vec![],
+                    raw_key_cells: Vec::new(),
                     spatial_values: vec![],
                     rows: vec![],
                     affected_rows: 0,
@@ -9598,9 +9739,100 @@ mod tests {
                 McpRuleTarget::Scope { connection_id: "k1".into(), scope: "namespace".into(), value: "prod".into() },
                 rule,
             );
-            let error = ensure_plugin_scope(&access, &entry, &[], Some("k1"), &json!({})).unwrap_err();
+            let error = ensure_plugin_scope(&access, &entry, &[], Some("k1"), None, &json!({})).unwrap_err();
             assert!(result_text(&error).contains("SCOPE_REQUIRED"));
         }
+    }
+
+    #[test]
+    fn writable_plugin_connections_default_to_write_without_explicit_rules() {
+        use dbx_core::mcp_access::{McpAccessLevel, McpAccessPolicy, McpAccessRule, McpRuleTarget};
+        let provider = plugin_provider("io.dbx.ssh", "Terminal", json!({"tools": [{"name": "exec"}]}));
+        let entry = crate::plugin_tools::build_catalog(&[provider]).remove(0);
+        let access = McpAccessPolicy::default(); // default_access: Read
+
+        // No rule + writable plugin connection: the connection's own
+        // protection level replaces the global read default.
+        let level = ensure_plugin_scope(&access, &entry, &[], Some("c1"), Some(false), &json!({})).unwrap();
+        assert_eq!(level, McpAccessLevel::Write);
+
+        // Read-only plugin connection keeps the read default.
+        let error = ensure_plugin_scope(&access, &entry, &[], Some("c1"), Some(true), &json!({})).unwrap_err();
+        assert!(result_text(&error).contains("MCP_READ_ONLY"), "{}", result_text(&error));
+
+        // Unknown facts (older call paths) keep the plain policy default.
+        let error = ensure_plugin_scope(&access, &entry, &[], Some("c1"), None, &json!({})).unwrap_err();
+        assert!(result_text(&error).contains("MCP_READ_ONLY"), "{}", result_text(&error));
+
+        // An explicit connection rule always wins over the default.
+        let mut explicit = McpAccessPolicy::default();
+        explicit.rules.insert(
+            McpRuleTarget::Connection { id: "c1".into() },
+            McpAccessRule { access: Some(McpAccessLevel::Read), ..Default::default() },
+        );
+        let error = ensure_plugin_scope(&explicit, &entry, &[], Some("c1"), Some(false), &json!({})).unwrap_err();
+        assert!(result_text(&error).contains("resolves to read"), "{}", result_text(&error));
+        explicit.rules.insert(
+            McpRuleTarget::Connection { id: "c1".into() },
+            McpAccessRule { access: Some(McpAccessLevel::Full), ..Default::default() },
+        );
+        let level = ensure_plugin_scope(&explicit, &entry, &[], Some("c1"), Some(false), &json!({})).unwrap();
+        assert_eq!(level, McpAccessLevel::Full);
+    }
+
+    #[tokio::test]
+    async fn saved_policy_keeps_plugin_write_tools_out_of_every_listing() {
+        // A saved policy with a read default must stay authoritative on every
+        // surface: the write-widening plugin-connection default (writable
+        // connection => at least write) only applies to fresh installs with
+        // no saved policy. Here the connection IS writable, so the raw map
+        // would widen — the listings must not advertise what the call denies.
+        let backend = |configured: bool| {
+            Arc::new(FakeBackend {
+                connections: vec![plugin_connection("k1", "prod", "io.dbx.kafka")],
+                // A saved read-default policy: from_v1 maps read_only => Read.
+                policy: McpGlobalPolicy { read_only: true, ..Default::default() },
+                plugin_providers: vec![plugin_provider("io.dbx.kafka", "Kafka Studio", kafka_plugin_listing())],
+                mcp_policy_configured: configured,
+                ..Default::default()
+            })
+        };
+
+        // Saved policy: the write-tier tool disappears from the flat
+        // tools/list and the call denies it, while the read-only one stays.
+        let server = DbxMcpServer::with_runtime_options(backend(true), McpScope::default(), false);
+        let names =
+            server.policy_filtered_tools().await.into_iter().map(|tool| tool.name.to_string()).collect::<HashSet<_>>();
+        assert!(!names.contains("dbx_kafka__kafka_topics_delete"), "flat listing must not widen: {names:?}");
+        assert!(names.contains("dbx_kafka__kafka_topics_list"), "read-only tool stays visible: {names:?}");
+
+        let list = server.plugin_list(Parameters(PluginListRequest { filter: None })).await;
+        let text = result_text(&list);
+        assert!(text.contains("1 tool(s)"), "dbx_plugin_list counts only the read tool: {text}");
+
+        let tools = server.plugin_tools(Parameters(PluginToolsRequest { plugin_id: "io.dbx.kafka".into() })).await;
+        let text = result_text(&tools);
+        assert!(!text.contains("kafka_topics_delete"), "dbx_plugin_tools must not widen: {text}");
+        assert!(text.contains("kafka_topics_list"), "{text}");
+
+        let call = server
+            .plugin_call(Parameters(PluginCallRequest {
+                plugin_id: "io.dbx.kafka".into(),
+                tool: "kafka_topics_delete".into(),
+                arguments: Some(json!({ "topics": ["t"] })),
+                dbx_connection: None,
+            }))
+            .await;
+        assert!(result_text(&call).contains("MCP_READ_ONLY"), "{}", result_text(&call));
+
+        // Fresh install (no saved policy): the widening default applies again
+        // and listings stay consistent with calls.
+        let server = DbxMcpServer::with_runtime_options(backend(false), McpScope::default(), false);
+        let names =
+            server.policy_filtered_tools().await.into_iter().map(|tool| tool.name.to_string()).collect::<HashSet<_>>();
+        assert!(names.contains("dbx_kafka__kafka_topics_delete"), "zero-config widening expected: {names:?}");
+        let tools = server.plugin_tools(Parameters(PluginToolsRequest { plugin_id: "io.dbx.kafka".into() })).await;
+        assert!(result_text(&tools).contains("kafka_topics_delete"), "{}", result_text(&tools));
     }
 
     #[tokio::test]
@@ -10475,6 +10707,7 @@ mod tests {
             ("dbx_execute_and_show", &["database"]),
             ("dbx_add_connection", &["port", "database", "driver_profile"]),
             ("dbx_remove_connection", &["connection_id", "connection_name"]),
+            ("dbx_nacos_register_instance", &["metadata"]),
             ("dbx_execute_redis_command", &["db"]),
             ("dbx_get_schema_context", &["database", "schema", "max_tables"]),
         ];
@@ -10511,6 +10744,23 @@ mod tests {
                 );
                 assert!(!required.iter().any(|required| *required == field), "{tool_name}.{field} must stay optional");
             }
+        }
+    }
+
+    #[test]
+    fn nacos_register_instance_metadata_preserves_optional_json() {
+        for metadata in [
+            None,
+            Some(json!(null)),
+            Some(json!({})),
+            Some(json!({"region": "local", "weight": 2, "ready": true, "tags": ["blue"], "nested": {"value": null}})),
+        ] {
+            let mut arguments = json!({"service_name": "api", "ip": "127.0.0.1", "port": 8080});
+            if let Some(value) = &metadata {
+                arguments["metadata"] = value.clone();
+            }
+            let request: NacosRegisterInstanceRequest = serde_json::from_value(arguments).unwrap();
+            assert_eq!(request.metadata, metadata.filter(|value| !value.is_null()));
         }
     }
 
@@ -10948,18 +11198,35 @@ mod tests {
 
     #[test]
     fn configured_database_allowlist_blocks_qualified_sql_references() {
-        let connection = connection("sql", "sql", "mysql", "reporting");
+        // PostgreSQL query blocks need the connection profile: a compatible
+        // engine can use the same database type with different qualifier rules.
+        let mut connection = connection("sql", "sql", "mysql", "reporting");
         let scope = DatabaseScope::Selected(vec!["reporting".to_string()]);
 
         assert!(ensure_sql_database_scope(&scope, &connection, "reporting", "SELECT * FROM reporting.users").is_ok());
         let error =
             ensure_sql_database_scope(&scope, &connection, "reporting", "SELECT * FROM production.users").unwrap_err();
         assert!(result_text(&error).contains("DATABASE_OUT_OF_SCOPE"));
+
+        connection.db_type = DatabaseType::Postgres;
+        let cte = "WITH c AS (SELECT id FROM public.users) SELECT id, 2 FROM c";
+        assert!(ensure_sql_database_scope(&scope, &connection, "reporting", cte).is_ok());
+        connection.driver_profile = Some("cockroachdb".to_string());
+        let error = ensure_sql_database_scope(
+            &scope,
+            &connection,
+            "reporting",
+            "WITH c AS (SELECT id FROM reporting.public.users) SELECT c.id, 2 FROM c, production.public.secrets s",
+        )
+        .unwrap_err();
+        assert!(result_text(&error).contains("DATABASE_OUT_OF_SCOPE"));
     }
 
     #[test]
     fn database_execution_policy_overrides_connection_and_global_defaults_and_blocks_cross_database_sql() {
-        let connection = connection("sql", "sql", "mysql", "operations");
+        // Database-specific execution policy must apply the same profile-aware
+        // scope check as the explicit database allowlist.
+        let mut connection = connection("sql", "sql", "mysql", "operations");
         let policy = McpGlobalPolicy {
             connection_policies: vec![dbx_core::storage::McpConnectionPolicy {
                 connection_id: "sql".to_string(),
@@ -11002,6 +11269,103 @@ mod tests {
         )
         .unwrap_err();
         assert!(result_text(&error).contains("DATABASE_EXECUTION_POLICY_OUT_OF_SCOPE"));
+
+        connection.db_type = DatabaseType::Postgres;
+        let cte = "WITH c AS (SELECT id FROM public.users) SELECT id, 2 FROM c";
+        assert!(ensure_sql_database_execution_scope(&policy, &connection, "operations", cte).is_ok());
+        connection.driver_profile = Some("cockroachdb".to_string());
+        let error = ensure_sql_database_execution_scope(
+            &policy,
+            &connection,
+            "operations",
+            "WITH c AS (SELECT id FROM operations.public.users) SELECT c.id, 2 FROM c, reporting.public.secrets s",
+        )
+        .unwrap_err();
+        assert!(result_text(&error).contains("DATABASE_EXECUTION_POLICY_OUT_OF_SCOPE"));
+    }
+
+    #[tokio::test]
+    async fn postgres_query_scope_preserves_legacy_rejections_for_unreviewed_calls() {
+        // Exercise both permission gates through the tool entry point: these
+        // query shapes retain their original rejection before reaching the backend.
+        let cases = [
+            (
+                "WITH samples(state) AS (VALUES ('new'), ('other')), compared AS (SELECT CASE WHEN state = 'new' THEN CAST(1 AS integer) ELSE 0 END AS changed FROM samples) SELECT COUNT(*), SUM(changed) FROM compared",
+                true,
+            ),
+            (
+                "WITH c(x) AS (VALUES (1), (2)), compared AS (SELECT x FROM c) SELECT COUNT(*), SUM(x) FROM compared",
+                true,
+            ),
+            ("WITH c AS (VALUES (1)), compared AS (SELECT * FROM c) SELECT 1, 2 FROM compared", true),
+            (
+                "WITH c AS (SELECT id FROM public.users) SELECT dblink_connect('remote', 'dbname=production'), 2 FROM c",
+                false,
+            ),
+            (
+                "WITH c AS (SELECT id FROM public.users) SELECT dblink_exec('dbname=production', 'SET application_name = ''scope_review'''), 2 FROM c",
+                false,
+            ),
+            ("WITH c AS (SELECT id FROM public.users) SELECT public.read_remote_value(), 2 FROM c", false),
+            (r#"WITH c AS (SELECT id FROM public.users) SELECT "COUNT"(id), 2 FROM c"#, false),
+        ];
+        for database_policy in [false, true] {
+            let rule = dbx_core::storage::McpConnectionPolicy {
+                connection_id: "sql".to_string(),
+                read_only: true,
+                allow_dangerous_sql: false,
+                execution_mode_configured: true,
+                execution_mode_policy_version: Some(dbx_core::mcp_policy::MCP_EXECUTION_POLICY_VERSION),
+                database_scope: if database_policy { McpDatabaseScope::All } else { McpDatabaseScope::Selected },
+                allowed_databases: vec!["reporting".to_string()],
+                database_policies: if database_policy {
+                    vec![dbx_core::storage::McpDatabasePolicy {
+                        database_name: "reporting".to_string(),
+                        read_only: true,
+                        allow_dangerous_sql: false,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                allow_salesforce_dml: false,
+            };
+            let backend = Arc::new(FakeBackend {
+                connections: vec![connection("sql", "sql", "postgres", "reporting")],
+                policy: McpGlobalPolicy { connection_policies: vec![rule], ..Default::default() },
+                ..Default::default()
+            });
+            let server = DbxMcpServer::with_runtime_options(backend.clone(), McpScope::default(), false);
+            for (sql, allowed) in cases {
+                backend.recorded_arguments.lock().unwrap().clear();
+                let result = server
+                    .execute_query(Parameters(ExecuteQueryRequest {
+                        selector: selector("sql"),
+                        database: Some("reporting".to_string()),
+                        sql: sql.to_string(),
+                        session_id: None,
+                        cell_char_offset: None,
+                        cell_char_limit: None,
+                        max_rows: Some(5),
+                    }))
+                    .await;
+                let recorded = backend.recorded_arguments.lock().unwrap();
+                if allowed {
+                    assert!(!result.is_error.unwrap_or(false), "{}: {sql}", result_text(&result));
+                    assert_eq!(recorded.len(), 1, "allowed SQL must reach the backend: {sql}");
+                    assert_eq!(recorded[0].0, "execute_query");
+                    assert_eq!(recorded[0].1["sql"], sql);
+                } else {
+                    let code = if database_policy {
+                        "DATABASE_EXECUTION_POLICY_OUT_OF_SCOPE"
+                    } else {
+                        "DATABASE_OUT_OF_SCOPE"
+                    };
+                    assert_eq!(result.is_error, Some(true), "rejected SQL returned success: {sql}");
+                    assert!(result_text(&result).contains(code), "{}: {sql}", result_text(&result));
+                    assert!(recorded.is_empty(), "rejected SQL reached the backend: {sql}");
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -11445,6 +11809,25 @@ mod tests {
 
     fn selector(id: &str) -> ConnectionSelector {
         ConnectionSelector { connection_id: Some(id.to_string()), connection_name: None }
+    }
+
+    #[test]
+    fn data_charset_policy_blocks_writes_and_session_changes_despite_mcp_permissions() {
+        let mut conn = connection("mysql", "mysql", "mysql", "app");
+        conn.url_params = Some("dataCharset=GBK".to_string());
+        let policy = McpGlobalPolicy { read_only: false, allow_dangerous_sql: true, ..Default::default() };
+        assert!(!conn.read_only);
+        let permissions = mcp_permissions(&conn, &policy);
+        assert!(!permissions.allow_writes);
+        assert!(!permissions.allow_dangerous);
+        assert!(validate_sql_policy(&conn, &policy, "app", "SELECT 1", true).is_ok());
+        for sql in ["UPDATE t SET value=1", "SET NAMES latin1", "SET @v=1", "SELECT 1; UPDATE t SET value=1"] {
+            let error = validate_sql_policy(&conn, &policy, "app", sql, true).unwrap_err();
+            assert!(result_text(&error).contains("MYSQL_DATA_CHARSET"));
+        }
+        conn.url_params = None;
+        assert!(mcp_permissions(&conn, &policy).allow_writes);
+        assert!(validate_sql_policy(&conn, &policy, "app", "UPDATE t SET value=1", true).is_ok());
     }
 
     #[tokio::test]
@@ -13016,6 +13399,7 @@ mod tests {
                 deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
+                raw_key_cells: Vec::new(),
                 spatial_values: vec![],
                 rows: vec![],
                 affected_rows: 0,
@@ -13050,6 +13434,7 @@ mod tests {
                 deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
+                raw_key_cells: Vec::new(),
                 spatial_values: vec![],
                 rows: vec![],
                 affected_rows: 2,
@@ -13085,6 +13470,7 @@ mod tests {
                 deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
+                raw_key_cells: Vec::new(),
                 spatial_values: vec![],
                 rows: vec![vec![serde_json::Value::String(value)]],
                 affected_rows: 1,
