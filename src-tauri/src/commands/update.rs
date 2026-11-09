@@ -429,6 +429,10 @@ pub async fn check_for_updates(
             release_name: "DBX Custom".into(),
             release_url: "https://github.com/hunshui0/dbx/actions".into(),
             release_notes: "DBX Custom uses manually installed custom builds.".into(),
+            channel: channel.unwrap_or_default(),
+            release_tag: tag_version(env!("CARGO_PKG_VERSION")),
+            is_promoted: false,
+            promoted_from: None,
         });
     }
     let locale = locale.unwrap_or_else(|| "zh-CN".to_string());
