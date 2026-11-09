@@ -7601,17 +7601,7 @@ function openExternalUrl(url: string) {
 
 <template>
   <Dialog :open="open && !parameterEditorOpen" @update:open="open = $event">
-    <DialogContent
-      :style="dialogContentStyle"
-      class="connection-dialog-content"
-      :class="connectionDialogContentClass"
-      :data-wide="shouldUseWideConnectionDialog ? 'true' : undefined"
-      @interact-outside.prevent
-      @escape-key-down="handleDialogEscape"
-      @keydown="preventDialogDocumentSelectAll"
-      @copy="preventDialogPasswordCopy"
-      @cut="preventDialogPasswordCopy"
-    >
+    <DialogContent :style="dialogContentStyle" class="connection-dialog-content" :class="connectionDialogContentClass" @interact-outside.prevent @escape-key-down="handleDialogEscape" @keydown="preventDialogDocumentSelectAll" @copy="preventDialogPasswordCopy" @cut="preventDialogPasswordCopy">
       <DialogHeader class="cursor-move select-none" @pointerdown="onDialogHeaderPointerDown" @pointermove="onDialogHeaderPointerMove" @pointerup="onDialogHeaderPointerEnd" @pointercancel="onDialogHeaderPointerEnd">
         <DialogTitle>{{ editingId ? t("connection.editTitle") : t("connection.title") }}</DialogTitle>
       </DialogHeader>
