@@ -36,6 +36,46 @@ function semanticCompletion(markedSql: string, input: Partial<SqlCompletionProvi
 }
 
 describe("semantic SQL completion candidates", () => {
+  it("does not suggest alias snippets when completing a table name (#13750)", () => {
+    const markedSql = `SELECT *
+FROM dbo.Dh_Workcenter b
+INNER JOIN dbo.Dh_WorkcenterProcess c ON c.Workcenter_ID = b.Workcenter_ID
+INNER JOIN dbo.DH_MODEL_CAP_SUB dmcs ON c.Process_ID = dmcs.Process_ID
+INNER JOIN dbo.Dh_Process a ON c.Process_ID = a.Process_ID AND a.Process_Type = '02'
+LEFT JOIN dbo.Db_ModelSetTemplat|
+WHERE b.Workcenter_ID = :workcenter_ID`;
+    const { items } = semanticCompletion(
+      markedSql,
+      {
+        tables: [{ name: "Db_ModelSetTemplate", schema: "dbo", type: "table" }],
+        autoAliasTables: true,
+      },
+      { databaseType: "sqlserver", dialect: "sqlserver" },
+    );
+
+    expect(items.some((item) => item.type === "snippet" && item.detail?.includes("alias for"))).toBe(false);
+    expect(items.some((item) => item.label.includes("dmst") && item.type === "snippet")).toBe(false);
+    expect(items.some((item) => item.type === "table" && item.label === "Db_ModelSetTemplate")).toBe(true);
+
+    // When the cursor is after the table name and a space, alias snippets should be offered
+    const afterTableSpaceSql = `SELECT *
+FROM dbo.Dh_Workcenter b
+LEFT JOIN dbo.Db_ModelSetTemplate |
+WHERE b.Workcenter_ID = :workcenter_ID`;
+    const afterTable = semanticCompletion(
+      afterTableSpaceSql,
+      {
+        tables: [{ name: "Db_ModelSetTemplate", schema: "dbo", type: "table" }],
+        autoAliasTables: false,
+      },
+      { databaseType: "sqlserver", dialect: "sqlserver" },
+    );
+
+    const aliasSnippet = afterTable.items.find((item) => item.type === "snippet" && item.detail?.includes("alias for Db_ModelSetTemplate"));
+    expect(aliasSnippet).toBeDefined();
+    expect(aliasSnippet?.apply).toBe("dmst ");
+  });
+
   it("does not mix SELECT aliases into a following UPDATE statement", () => {
     const columnsByTable = new Map<string, SqlCompletionColumn[]>([
       ["codex_completion_a", [{ name: "id", table: "codex_completion_a", schema: "public" }]],
@@ -754,5 +794,43 @@ FROM (
 
     expect(context.suggestKeywords).toBe(true);
     expect(items.filter((item) => item.type === "keyword").map((item) => item.label)).toEqual(expect.arrayContaining(["WHERE", "WHEN", "WITH"]));
+  });
+});
+
+describe("implicit join table lists end at the next clause (#14445)", () => {
+  const columnsByTable = new Map<string, SqlCompletionColumn[]>([
+    ["emp", ["id", "emp_name"].map((name) => ({ name, table: "emp" }))],
+    ["dept", ["id", "dept_name"].map((name) => ({ name, table: "dept" }))],
+  ]);
+
+  it.each([
+    ["MySQL", { databaseType: "mysql", dialect: "mysql" }],
+    ["PostgreSQL", { databaseType: "postgres", dialect: "postgres" }],
+    ["Oracle", { databaseType: "oracle" }],
+  ] as const)("offers columns after WHERE in a %s comma join", (_label, options) => {
+    const { context, items } = semanticCompletion("SELECT * FROM emp e, dept d WHERE |", { columnsByTable }, options);
+
+    expect(context.contextKind).toBe("column");
+    expect(context.suggestColumns).toBe(true);
+    const labels = items.filter((item) => item.type === "column").map((item) => item.label);
+    expect(labels).toEqual(expect.arrayContaining(["e.emp_name", "d.dept_name"]));
+  });
+
+  it.each([
+    ["WHERE", "SELECT * FROM emp e, dept d WHERE e.id = 1 AND |"],
+    ["ORDER BY", "SELECT * FROM emp e, dept d ORDER BY |"],
+    ["GROUP BY", "SELECT * FROM emp e, dept d GROUP BY |"],
+  ] as const)("keeps column completion after %s in a comma join", (_label, markedSql) => {
+    const { context } = semanticCompletion(markedSql, { columnsByTable }, { databaseType: "mysql", dialect: "mysql" });
+
+    expect(context.contextKind).toBe("column");
+    expect(context.suggestColumns).toBe(true);
+  });
+
+  it("still treats the slot after a FROM-list comma as a table name", () => {
+    const { context } = semanticCompletion("SELECT * FROM emp e, dept d, |", {}, { databaseType: "mysql", dialect: "mysql" });
+
+    expect(context.contextKind).toBe("table");
+    expect(context.suggestTables).toBe(true);
   });
 });

@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use super::file_validator::validate_file_path;
 use crate::execution::{await_stream_with_progress_timeout, DbOperationBudget, StreamProgressClock};
 use crate::models::connection::DatabaseType;
-use crate::sql::starts_with_executable_sql_keyword;
+use crate::sql::{starts_with_executable_sql_keyword, starts_with_executable_sql_keyword_sequence};
 use crate::types::{
     ColumnInfo, ColumnMetadataCapabilities, CompletionAssistantCandidate, CompletionAssistantCandidateKind,
     CompletionAssistantMatchMode, CompletionAssistantObjectKind, CompletionAssistantRequest,
@@ -48,6 +48,9 @@ use crate::types::{
 pub const GAUSSDB_COMPATIBILITY_SQL: &str =
     "SELECT datcompatibility FROM pg_catalog.pg_database WHERE datname = current_database()";
 
+/// Identifier quote implied by the GaussDB database compatibility mode
+/// (`pg_database.datcompatibility`): MySQL-style modes need backticks while
+/// Oracle and PostgreSQL modes need double quotes.
 pub async fn gaussdb_identifier_quote(pool: &Pool) -> Option<String> {
     let timeout = super::connection_timeout();
     let client = checkout_postgres_client(pool, None, timeout).await.ok()?;
@@ -55,6 +58,17 @@ pub async fn gaussdb_identifier_quote(pool: &Pool) -> Option<String> {
     let row = tokio::time::timeout(timeout, client.query_opt(GAUSSDB_COMPATIBILITY_SQL, &[])).await.ok()?.ok()??;
     let compatibility_mode = row.try_get::<_, String>(0).ok()?;
     gaussdb_identifier_quote_for_compatibility_mode(&compatibility_mode).map(str::to_string)
+}
+
+/// Identifier quote for an openGauss database, derived from the same
+/// `datcompatibility` catalog value. openGauss exposes A/B/PG modes, so the
+/// MySQL-compatible (B) databases need backticks while A/PG need double quotes.
+pub async fn opengauss_identifier_quote(pool: &Pool) -> Option<String> {
+    opengauss_compatibility_mode(pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|mode| gaussdb_identifier_quote_for_compatibility_mode(&mode).map(str::to_string))
 }
 
 pub fn gaussdb_identifier_quote_for_compatibility_mode(compatibility_mode: &str) -> Option<&'static str> {
@@ -68,7 +82,7 @@ pub fn gaussdb_identifier_quote_for_compatibility_mode(compatibility_mode: &str)
 pub async fn opengauss_compatibility_mode(pool: &Pool) -> Result<Option<String>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let client = &EncodingClient::new(&client);
-    let row = postgres_query_one_cached(client, GAUSSDB_COMPATIBILITY_SQL, &[]).await.map_err(|e| e.to_string())?;
+    let row = postgres_query_one_cached(client, GAUSSDB_COMPATIBILITY_SQL, &[]).await.map_err(pg_error_to_string)?;
     Ok(row.try_get::<_, Option<String>>(0).ok().flatten().filter(|value| !value.trim().is_empty()))
 }
 
@@ -1544,7 +1558,7 @@ fn escape_tsvector_lexeme(value: &str) -> String {
 fn pg_error_to_string(err: impl Into<PgError>) -> String {
     let err = err.into();
     let Some(db_error) = err.as_db_error() else {
-        return err.to_string();
+        return error_with_sources_to_string(&err);
     };
     let mut message = db_error.to_string();
     // Carry the server-reported cursor position across the `db` layer's
@@ -1563,7 +1577,7 @@ fn pg_error_to_string(err: impl Into<PgError>) -> String {
 /// be resolved against the user's SQL and point at the wrong place.
 fn pg_error_to_string_plain(err: impl Into<PgError>) -> String {
     let err = err.into();
-    err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string())
+    err.as_db_error().map(pg_db_error_to_string).unwrap_or_else(|| error_with_sources_to_string(&err))
 }
 
 /// Tries each SQL tier in `tiers` in order (most-capable first), via `run`,
@@ -1802,7 +1816,11 @@ fn pg_pool_error_to_string(err: PoolError) -> String {
 }
 
 fn should_retry_postgres_text_query(err: &PgError) -> bool {
-    let message = err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string()).to_ascii_lowercase();
+    let message = err
+        .as_db_error()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| error_with_sources_to_string(err))
+        .to_ascii_lowercase();
     should_retry_postgres_text_query_message(&message)
 }
 
@@ -1820,7 +1838,8 @@ fn should_retry_postgres_stale_cache(err: &PgError) -> bool {
             db_error.message(),
         );
     }
-    should_retry_postgres_stale_cache_fields(None, None, &err.to_string())
+    let message = error_with_sources_to_string(err);
+    should_retry_postgres_stale_cache_fields(None, None, &message)
 }
 
 fn should_retry_postgres_stale_cache_fields(sqlstate: Option<&str>, routine: Option<&str>, message: &str) -> bool {
@@ -1836,7 +1855,8 @@ fn should_fallback_postgres_missing_prepared_statement(err: &PgError) -> bool {
             db_error.message(),
         );
     }
-    should_fallback_postgres_missing_prepared_statement_fields(None, &err.to_string())
+    let message = error_with_sources_to_string(err);
+    should_fallback_postgres_missing_prepared_statement_fields(None, &message)
 }
 
 fn should_fallback_postgres_missing_prepared_statement_fields(sqlstate: Option<&str>, message: &str) -> bool {
@@ -2184,6 +2204,7 @@ async fn execute_select_prepared(
         deferred_large_value_cells: Vec::new(),
         column_sortables: Vec::new(),
         spatial_columns,
+        raw_key_cells: Vec::new(),
         spatial_values,
         rows: result_rows,
         affected_rows: 0,
@@ -2294,6 +2315,7 @@ async fn execute_select_text(
         deferred_large_value_cells: Vec::new(),
         column_sortables: Vec::new(),
         spatial_columns,
+        raw_key_cells: Vec::new(),
         spatial_values,
         rows: result_rows,
         affected_rows: 0,
@@ -3916,7 +3938,7 @@ fn database_storage_sql() -> &'static str {
 pub async fn list_databases(pool: &Pool) -> Result<Vec<DatabaseInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let client = &EncodingClient::new(&client);
-    let rows = postgres_query_cached(client, list_databases_sql(), &[]).await.map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached(client, list_databases_sql(), &[]).await.map_err(pg_error_to_string)?;
 
     Ok(rows.iter().map(|row| DatabaseInfo { name: pg_row_try_string(row, 0), ..Default::default() }).collect())
 }
@@ -3927,7 +3949,7 @@ pub async fn list_opengauss_databases(pool: &Pool) -> Result<Vec<DatabaseInfo>, 
     let rows = match postgres_query_cached(client, list_opengauss_databases_sql(), &[]).await {
         Ok(rows) => rows,
         Err(primary_error) => {
-            let primary_error = primary_error.to_string();
+            let primary_error = pg_error_to_string(primary_error);
             return postgres_query_cached(client, list_databases_sql(), &[])
                 .await
                 .map(|rows| {
@@ -3936,6 +3958,7 @@ pub async fn list_opengauss_databases(pool: &Pool) -> Result<Vec<DatabaseInfo>, 
                         .collect()
                 })
                 .map_err(|fallback_error| {
+                    let fallback_error = pg_error_to_string(fallback_error);
                     format!(
                         "openGauss database compatibility lookup failed: {primary_error}; database list fallback failed: {fallback_error}"
                     )
@@ -4005,7 +4028,7 @@ pub async fn list_tables_filtered(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<Vec<TableInfo>, String> {
-    list_tables_filtered_by_kind(pool, schema, filter, limit, offset, false).await
+    list_tables_filtered_by_kind(pool, schema, filter, limit, offset, false, false).await
 }
 
 /// Lists only table-like relations, excluding views and materialized views while
@@ -4017,7 +4040,32 @@ pub async fn list_table_objects_filtered(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<Vec<TableInfo>, String> {
-    list_tables_filtered_by_kind(pool, schema, filter, limit, offset, true).await
+    list_tables_filtered_by_kind(pool, schema, filter, limit, offset, true, false).await
+}
+
+/// Sidebar pagination variant: `limit`/`offset` count top-level relations and
+/// every partition below a returned root is included in the same page. Used by
+/// the table tree only; other callers keep row-based pagination.
+pub async fn list_table_roots_page_filtered(
+    pool: &Pool,
+    schema: &str,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    table_objects_only: bool,
+) -> Result<Vec<TableInfo>, String> {
+    list_tables_filtered_by_kind(pool, schema, filter, limit, offset, table_objects_only, true).await
+}
+
+fn postgres_table_info_from_row(row: &Row) -> TableInfo {
+    TableInfo {
+        name: pg_row_try_string(row, 0),
+        table_type: pg_row_try_string(row, 1),
+        valid: None,
+        comment: row.try_get::<_, Option<String>>(2).ok().flatten().filter(|s| !s.is_empty()),
+        parent_schema: row.try_get::<_, Option<String>>(3).ok().flatten().filter(|s| !s.is_empty()),
+        parent_name: row.try_get::<_, Option<String>>(4).ok().flatten().filter(|s| !s.is_empty()),
+    }
 }
 
 async fn list_tables_filtered_by_kind(
@@ -4027,6 +4075,7 @@ async fn list_tables_filtered_by_kind(
     limit: Option<usize>,
     offset: Option<usize>,
     table_objects_only: bool,
+    page_table_roots: bool,
 ) -> Result<Vec<TableInfo>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let filter = filter.unwrap_or("").trim();
@@ -4037,28 +4086,42 @@ async fn list_tables_filtered_by_kind(
     let offset_param = offset.and_then(|value| i64::try_from(value).ok()).unwrap_or(0);
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let client = &EncodingClient::new(&client);
+    let params: &[(&(dyn tokio_postgres::types::ToSql + Sync), Type)] =
+        &[(&schema, Type::VARCHAR), (&filter_pattern, Type::VARCHAR), (&fuzzy_filter_pattern, Type::VARCHAR)];
+    if page_table_roots && filter.is_empty() {
+        if let Some(limit) = limit_param {
+            let roots_sql = postgres_table_roots_page_sql(limit, offset_param, table_objects_only);
+            // The roots query only takes the schema: PostgreSQL rejects a bind
+            // message whose parameter count does not match the statement.
+            let root_params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 1] = [(&schema, Type::VARCHAR)];
+            // The pagination literals make this SQL vary by page. Use an unnamed
+            // typed query so each load stays one round trip without growing the
+            // statement cache.
+            let roots = client.query_typed(&roots_sql, &root_params).await.map_err(|e| e.to_string())?;
+            let partitioned_roots: Vec<i64> =
+                roots.iter().filter_map(|row| row.try_get::<_, Option<i64>>(5).ok().flatten()).collect();
+            let mut tables: Vec<TableInfo> = roots.iter().map(postgres_table_info_from_row).collect();
+            if !partitioned_roots.is_empty() {
+                let descendants_sql = postgres_partition_descendants_sql(table_objects_only);
+                let descendant_params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 2] =
+                    [(&schema, Type::VARCHAR), (&partitioned_roots, Type::INT8_ARRAY)];
+                let descendants =
+                    client.query_typed(&descendants_sql, &descendant_params).await.map_err(|e| e.to_string())?;
+                tables.extend(descendants.iter().map(postgres_table_info_from_row));
+            }
+            return Ok(tables);
+        }
+    }
     let sql = if table_objects_only {
         postgres_table_objects_sql(limit_param, offset_param)
     } else {
         postgres_tables_sql(limit_param, offset_param)
     };
-    let params: &[(&(dyn tokio_postgres::types::ToSql + Sync), Type)] =
-        &[(&schema, Type::VARCHAR), (&filter_pattern, Type::VARCHAR), (&fuzzy_filter_pattern, Type::VARCHAR)];
     // The pagination literals make this SQL vary by page. Use an unnamed typed
     // query so each load stays one round trip without growing the statement cache.
     let rows = client.query_typed(&sql, params).await.map_err(|e| e.to_string())?;
 
-    Ok(rows
-        .iter()
-        .map(|row| TableInfo {
-            name: pg_row_try_string(row, 0),
-            table_type: pg_row_try_string(row, 1),
-            valid: None,
-            comment: row.try_get::<_, Option<String>>(2).ok().flatten().filter(|s| !s.is_empty()),
-            parent_schema: row.try_get::<_, Option<String>>(3).ok().flatten().filter(|s| !s.is_empty()),
-            parent_name: row.try_get::<_, Option<String>>(4).ok().flatten().filter(|s| !s.is_empty()),
-        })
-        .collect())
+    Ok(rows.iter().map(postgres_table_info_from_row).collect())
 }
 
 pub async fn completion_assistant_search(
@@ -6373,6 +6436,82 @@ fn postgres_table_objects_sql(limit: Option<i64>, offset: i64) -> String {
     postgres_tables_sql_with_kind(limit, offset, true)
 }
 
+/// Sidebar table paging counts top-level relations, not every relation in the
+/// schema. Partition children are appended to the page that contains their
+/// root, so a default page size of 100 shows 100 tables even when a schema also
+/// contains 1,600 partitions (issue #13860).
+///
+/// The roots query is deliberately plain SQL: pre-10 servers (Redshift) have no
+/// declarative partitions, so it must keep working there. Only the follow-up
+/// descendant query needs `WITH RECURSIVE`, and it is skipped entirely when the
+/// page contains no partitioned root.
+fn postgres_table_roots_page_sql(limit: i64, offset: i64, table_objects_only: bool) -> String {
+    let relation_kinds = if table_objects_only { "'r','f','p'" } else { "'r','v','m','f','p'" };
+    format!(
+        "SELECT c.relname AS table_name, \
+         CASE c.relkind WHEN 'r' THEN 'BASE TABLE' WHEN 'v' THEN 'VIEW' \
+           WHEN 'm' THEN 'MATERIALIZED_VIEW' WHEN 'f' THEN 'FOREIGN TABLE' \
+           WHEN 'p' THEN 'BASE TABLE' END AS table_type, \
+         obj_description(c.oid) AS table_comment, \
+         NULL::text AS parent_schema, \
+         NULL::text AS parent_name, \
+         CASE WHEN c.relkind = 'p' THEN c.oid::bigint END AS partitioned_oid \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = $1 AND c.relkind IN ({relation_kinds}) \
+           AND NOT EXISTS ( \
+             SELECT 1 \
+             FROM pg_catalog.pg_inherits i \
+             JOIN pg_catalog.pg_class parent ON parent.oid = i.inhparent \
+             JOIN pg_catalog.pg_namespace parent_n ON parent_n.oid = parent.relnamespace \
+             WHERE i.inhrelid = c.oid AND parent.relkind = 'p' AND parent_n.nspname = n.nspname \
+           ) \
+         ORDER BY c.relname \
+         LIMIT {limit} OFFSET {offset}"
+    )
+}
+
+/// Every descendant partition of the partitioned roots on the current page,
+/// at any depth. `$2` is the `bigint[]` of root OIDs returned by
+/// [`postgres_table_roots_page_sql`].
+fn postgres_partition_descendants_sql(table_objects_only: bool) -> String {
+    let relation_kinds = if table_objects_only { "'r','f','p'" } else { "'r','v','m','f','p'" };
+    format!(
+        "WITH RECURSIVE partition_tree AS ( \
+           SELECT i.inhrelid AS oid \
+           FROM pg_catalog.pg_inherits i \
+           JOIN pg_catalog.pg_class parent ON parent.oid = i.inhparent \
+           JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid \
+           JOIN pg_catalog.pg_namespace child_n ON child_n.oid = child.relnamespace \
+           WHERE i.inhparent = ANY($2::bigint[]) AND parent.relkind = 'p' \
+             AND child_n.nspname = $1 \
+           UNION ALL \
+           SELECT i.inhrelid \
+           FROM partition_tree tree \
+           JOIN pg_catalog.pg_inherits i ON i.inhparent = tree.oid \
+           JOIN pg_catalog.pg_class parent ON parent.oid = i.inhparent \
+           JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid \
+           JOIN pg_catalog.pg_namespace child_n ON child_n.oid = child.relnamespace \
+           WHERE parent.relkind = 'p' AND child_n.nspname = $1 \
+         ) \
+         SELECT c.relname AS table_name, \
+                CASE c.relkind WHEN 'r' THEN 'BASE TABLE' WHEN 'v' THEN 'VIEW' \
+                  WHEN 'm' THEN 'MATERIALIZED_VIEW' WHEN 'f' THEN 'FOREIGN TABLE' \
+                  WHEN 'p' THEN 'BASE TABLE' END AS table_type, \
+                obj_description(c.oid) AS table_comment, \
+                pn.nspname AS parent_schema, \
+                pc.relname AS parent_name \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_catalog.pg_inherits i ON i.inhrelid = c.oid \
+         JOIN pg_catalog.pg_class pc ON pc.oid = i.inhparent AND pc.relkind = 'p' \
+         JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
+         WHERE n.nspname = $1 AND c.relkind IN ({relation_kinds}) \
+           AND c.oid IN (SELECT oid FROM partition_tree) \
+         ORDER BY c.relname"
+    )
+}
+
 fn postgres_tables_sql_with_kind(limit: Option<i64>, offset: i64, table_objects_only: bool) -> String {
     // PostgreSQL-compatible servers do not agree on the inferred wire types
     // or accepted expression grammar for LIMIT/OFFSET parameters. These values
@@ -8196,6 +8335,46 @@ pub async fn list_schema_infos_with_system(pool: &Pool, show_system_schemas: boo
         .collect())
 }
 
+/// Distinct user-defined type names for the structure editor's type dropdown.
+/// Same predicate as the object browser's TYPE branch (base/composite/domain/
+/// enum/range/multirange types outside the system schemas), so types provided
+/// by installed extensions — `vector`, `hstore`, `ltree`, … — become
+/// selectable in the create/edit column type picker (#14525).
+///
+/// Types visible through `search_path` are returned bare so they stay
+/// interchangeable with the static list; everything else comes back
+/// schema-qualified (quoted only when the identifier requires it) so the
+/// generated `CREATE TABLE` / `ALTER TABLE ... TYPE` still resolves outside
+/// the search path instead of failing with `type "..." does not exist`
+/// (#14525 review).
+pub async fn list_data_types(pool: &Pool) -> Result<Vec<String>, String> {
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let client = &EncodingClient::new(&client);
+    let rows = postgres_query_cached(client, list_data_types_sql(), &[]).await.map_err(|e| e.to_string())?;
+
+    Ok(rows.iter().map(|row| pg_row_try_string(row, 0)).filter(|name| !name.is_empty()).collect())
+}
+
+fn list_data_types_sql() -> &'static str {
+    "SELECT DISTINCT CASE \
+       WHEN t.typname ~ '^[a-z_][a-z0-9_$]*$' AND n.nspname = ANY (current_schemas(true)) \
+         THEN t.typname \
+       ELSE format('%I.%I', n.nspname, t.typname) \
+     END AS type_name \
+     FROM pg_catalog.pg_type t \
+     JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+     LEFT JOIN pg_catalog.pg_class c ON c.oid = t.typrelid \
+     WHERE t.typtype IN ('b', 'c', 'd', 'e', 'r', 'm') \
+       AND t.typisdefined \
+       AND t.typelem = 0 \
+       AND (t.typrelid = 0 OR c.relkind = 'c') \
+       AND n.nspname <> 'pg_catalog' \
+       AND n.nspname <> 'information_schema' \
+       AND n.nspname NOT LIKE 'pg_toast%' \
+       AND n.nspname NOT LIKE 'pg_temp%' \
+     ORDER BY type_name"
+}
+
 // Sibling of `postgres_columns_for_relations_sql`/`_compat_sql` above (~line
 // 3086), for a single (schema, table) instead of a batch of oids — see the
 // note there about why these aren't merged into a shared fragment.
@@ -8261,7 +8440,7 @@ const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
                LIMIT 1 \
              ) dep ON TRUE \
              LEFT JOIN pg_sequence pseq ON pseq.seqrelid = dep.objid \
-             WHERE a.attrelid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
+             WHERE a.attrelid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE pg_catalog.textcat(pg_catalog.textcat(quote_ident($1), '.'), quote_ident($2)) END)::regclass \
              AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum";
 
@@ -8315,7 +8494,7 @@ const POSTGRES_COLUMNS_COMPAT_SQL: &str = "SELECT a.attname AS column_name, \
                ORDER BY sequence_dep.objid \
                LIMIT 1 \
              ) AND serial_seq.relkind = 'S' \
-             WHERE a.attrelid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
+             WHERE a.attrelid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE pg_catalog.textcat(pg_catalog.textcat(quote_ident($1), '.'), quote_ident($2)) END)::regclass \
              AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum";
 
@@ -8915,6 +9094,15 @@ pub fn postgres_statement_returns_rows(sql: &str) -> bool {
         return true;
     }
 
+    // GaussDB executes the inner statement on the named data nodes and returns
+    // its rows. The first word alone cannot decide this: `EXECUTE prepared` is a
+    // different statement whose row count depends on the prepared SQL, so keep
+    // it on the command path (#13870).
+    // ON separates this routing syntax from a prepared statement named DIRECT.
+    if starts_with_executable_sql_keyword_sequence(sql, &["EXECUTE", "DIRECT", "ON"]) {
+        return true;
+    }
+
     // A leading `WITH` is usually a CTE query, but PostgreSQL also allows a CTE
     // to be followed directly by INSERT/UPDATE/DELETE/MERGE, which only returns
     // rows with `RETURNING`. The prefix alone cannot decide, so parse it and
@@ -8972,6 +9160,7 @@ pub async fn execute_query_with_max_rows(
                 deferred_large_value_cells: Vec::new(),
                 column_sortables: Vec::new(),
                 spatial_columns: vec![],
+                raw_key_cells: Vec::new(),
                 spatial_values: vec![],
                 rows: vec![],
                 affected_rows: affected,
@@ -9813,6 +10002,7 @@ async fn execute_query_with_max_rows_inner(
             deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: vec![],
+            raw_key_cells: Vec::new(),
             spatial_values: vec![],
             rows: vec![],
             affected_rows: affected,
@@ -9859,6 +10049,9 @@ pub async fn execute_query_on_client_unnamed(
 // relation: a FOREIGN KEY stores the referenced table's unique index in
 // `conindid`, so matching on `conindid` alone marked that standalone index as
 // constraint-backed and dropped it from generated DDL (#10484).
+// The qualified name is joined with `pg_catalog.textcat` rather than `||`:
+// openGauss B mode without `pipes_as_concat` reads `||` as logical OR, and
+// indexes have no information_schema fallback to recover from it (#13873).
 //
 // `AND k.attnum >= 0` skips system attributes (negative `indkey` entries such as
 // `tableoid`) that openGauss / GaussDB can carry in `pg_index.indkey`: because the
@@ -9888,7 +10081,7 @@ const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum AND k.attnum > 0 \
              LEFT JOIN pg_opclass oc ON oc.oid = k.class_oid \
              LEFT JOIN pg_namespace opcns ON opcns.oid = oc.opcnamespace \
-             WHERE t.oid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
+             WHERE t.oid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE pg_catalog.textcat(pg_catalog.textcat(quote_ident($1), '.'), quote_ident($2)) END)::regclass \
              AND k.attnum >= 0 \
              GROUP BY i.relname, i.oid, ix.indisunique, ix.indisvalid, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indnkeyatts, ix.indkey \
              ORDER BY i.relname";
@@ -9949,7 +10142,7 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
              JOIN pg_class i ON i.oid = ix.indexrelid \
              JOIN pg_namespace n ON n.oid = t.relnamespace \
              JOIN pg_am am ON am.oid = i.relam \
-             WHERE t.oid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
+             WHERE t.oid = (CASE WHEN coalesce(length($1::text), 0) = 0 THEN quote_ident($2) ELSE pg_catalog.textcat(pg_catalog.textcat(quote_ident($1), '.'), quote_ident($2)) END)::regclass \
              ORDER BY i.relname";
 
 const POSTGRES_OWNERS_SQL: &str =
@@ -12647,6 +12840,29 @@ mod tests {
     }
 
     #[test]
+    fn postgres_statement_returns_rows_for_gaussdb_execute_direct() {
+        for sql in [
+            "EXECUTE DIRECT ON (dn_6001_6002_6003) $$ SELECT indexname FROM pg_indexes $$;",
+            "-- run on every datanode\nexecute direct on (dn_1, dn_2) 'SELECT 1'",
+            "EXECUTE /* route to datanode */ DIRECT ON (dn_1) 'SELECT 1'",
+            "  execute direct on (dn_1) 'SELECT 1'",
+        ] {
+            assert!(postgres_statement_returns_rows(sql), "expected rows for: {sql}");
+        }
+
+        // A plain prepared-statement EXECUTE may be DML, so it keeps using the
+        // command path and its affected-row count.
+        for sql in [
+            "EXECUTE prepared_statement",
+            "EXECUTE DIRECT",
+            "EXECUTE DIRECT(1)",
+            "EXECUTED DIRECT ON (dn_1) 'SELECT 1'",
+        ] {
+            assert!(!postgres_statement_returns_rows(sql), "expected command result for: {sql}");
+        }
+    }
+
+    #[test]
     fn postgres_statement_returns_rows_for_returning_dml_only() {
         for sql in [
             "INSERT INTO users (id) VALUES (1) RETURNING id",
@@ -13317,6 +13533,70 @@ mod tests {
             all_names.iter().all(|name| !name.starts_with('_')),
             "auto-generated array companions leaked into the listing: {all:?}"
         );
+    }
+
+    #[test]
+    fn list_data_types_sql_targets_user_defined_types() {
+        let sql = list_data_types_sql();
+        assert!(sql.contains("DISTINCT"), "{sql}");
+        // Types visible through search_path stay bare; everything else comes back
+        // schema-qualified so generated DDL resolves outside the search path.
+        assert!(sql.contains("n.nspname = ANY (current_schemas(true))"), "{sql}");
+        assert!(sql.contains("format('%I.%I', n.nspname, t.typname)"), "{sql}");
+        assert!(sql.contains("t.typtype IN ('b', 'c', 'd', 'e', 'r', 'm')"), "{sql}");
+        assert!(sql.contains("t.typisdefined"), "{sql}");
+        assert!(sql.contains("t.typelem = 0"), "{sql}");
+        assert!(sql.contains("n.nspname <> 'pg_catalog'"), "{sql}");
+        assert!(sql.contains("n.nspname <> 'information_schema'"), "{sql}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL database"]
+    async fn postgres_list_data_types_includes_extension_and_user_types() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect postgres");
+        // hstore is a contrib extension base type (typtype='b') in `public` — the
+        // same catalog shape as pgvector's `vector` type.
+        execute_query(&pool, "CREATE EXTENSION IF NOT EXISTS hstore").await.expect("create hstore extension");
+        let schema = format!("dbx_custom_{}", uuid::Uuid::new_v4().simple());
+        let schema_ident = pg_quote_ident(&schema);
+        execute_query(&pool, &format!("CREATE SCHEMA {schema_ident}")).await.expect("create schema");
+
+        let exercise = async {
+            // The same type name in two schemas must not fold into one entry, and
+            // the search_path-invisible one has to come back schema-qualified.
+            execute_query(&pool, "CREATE TYPE public.mood AS ENUM ('sad', 'ok')").await?;
+            execute_query(&pool, &format!("CREATE TYPE {schema_ident}.mood AS ENUM ('sad', 'ok')")).await?;
+            // Mixed-case identifiers need the %I quoting.
+            execute_query(&pool, &format!("CREATE TYPE {schema_ident}.\"Mood\" AS ENUM ('sad', 'ok')")).await?;
+            let qualified_mood = format!("{schema}.mood");
+
+            // The returned names must be directly usable in DDL: create a column
+            // from the qualified name, then ALTER it to the same-name public type.
+            let probe = format!("{schema_ident}.usage_probe");
+            execute_query(&pool, &format!("CREATE TABLE {probe} (id bigint, m {qualified_mood})")).await?;
+            execute_query(
+                &pool,
+                &format!("ALTER TABLE {probe} ALTER COLUMN m TYPE public.mood USING m::text::public.mood"),
+            )
+            .await?;
+            execute_query(&pool, &format!("DROP TABLE {probe}")).await?;
+
+            list_data_types(&pool).await
+        }
+        .await;
+
+        let cleanup = execute_query(&pool, &format!("DROP SCHEMA {schema_ident} CASCADE")).await;
+        cleanup.expect("drop schema");
+        execute_query(&pool, "DROP TYPE IF EXISTS public.mood").await.expect("drop public.mood");
+        let types = exercise.expect("list data types");
+
+        assert!(types.iter().any(|name| name == "hstore"), "search_path extension type stays bare: {types:?}");
+        assert!(types.iter().any(|name| name == "mood"), "public enum stays bare: {types:?}");
+        let qualified_mood = format!("{schema}.mood");
+        assert!(types.iter().any(|name| name == &qualified_mood), "off-search_path enum must be qualified: {types:?}");
+        let qualified_mixed = format!("{schema}.\"Mood\"");
+        assert!(types.iter().any(|name| name == &qualified_mixed), "mixed-case type must keep quoting: {types:?}");
     }
 
     #[tokio::test]
@@ -14543,6 +14823,36 @@ mod tests {
     }
 
     #[test]
+    fn postgres_table_roots_page_sql_counts_top_level_relations() {
+        let sql = postgres_table_roots_page_sql(101, 100, true);
+
+        assert!(sql.contains("c.relkind IN ('r','f','p')"));
+        assert!(sql.contains("NOT EXISTS"));
+        assert!(sql.contains("parent.relkind = 'p'"));
+        assert!(sql.contains("parent_n.nspname = n.nspname"));
+        assert!(sql.contains("LIMIT 101 OFFSET 100"));
+        assert!(sql.contains("CASE WHEN c.relkind = 'p' THEN c.oid::bigint END AS partitioned_oid"));
+        assert!(sql.contains("NULL::text AS parent_schema"));
+        assert!(sql.contains("NULL::text AS parent_name"));
+        // Root paging must stay usable on servers without recursive CTEs.
+        assert!(!sql.contains("WITH RECURSIVE"));
+    }
+
+    #[test]
+    fn postgres_partition_descendants_sql_walks_every_partition_level() {
+        let sql = postgres_partition_descendants_sql(false);
+
+        assert!(sql.contains("WITH RECURSIVE partition_tree AS"));
+        assert!(sql.contains("i.inhparent = ANY($2::bigint[])"));
+        assert!(sql.contains("i.inhparent = tree.oid"));
+        assert!(sql.contains("child_n.nspname = $1"));
+        assert!(sql.contains("c.oid IN (SELECT oid FROM partition_tree)"));
+        assert!(sql.contains("pn.nspname AS parent_schema"));
+        assert!(sql.contains("pc.relname AS parent_name"));
+        assert!(sql.contains("c.relkind IN ('r','v','m','f','p')"));
+    }
+
+    #[test]
     fn postgres_table_comment_sql_targets_single_table() {
         let sql = postgres_table_comment_sql();
 
@@ -14790,6 +15100,24 @@ mod tests {
                 .contains("CASE WHEN coalesce(length($1::text), 0) = 0 THEN current_schema() ELSE $1 END"),
             "{POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL}"
         );
+    }
+
+    #[test]
+    fn postgres_single_relation_metadata_does_not_build_the_name_with_pipes() {
+        // openGauss B (MySQL) mode without `pipes_as_concat` reads `||` as logical OR, so
+        // `quote_ident($1) || '.' || quote_ident($2)` became a boolean and the regclass
+        // lookup failed with `relation "0" does not exist` (#13873).
+        for sql in
+            [POSTGRES_COLUMNS_SQL, POSTGRES_COLUMNS_COMPAT_SQL, POSTGRES_INDEXES_SQL, POSTGRES_INDEXES_COMPAT_SQL]
+        {
+            assert!(
+                sql.contains(
+                    "pg_catalog.textcat(pg_catalog.textcat(quote_ident($1), '.'), quote_ident($2)) END)::regclass"
+                ),
+                "{sql}"
+            );
+            assert!(!sql.contains("quote_ident($1) || '.' || quote_ident($2)"), "{sql}");
+        }
     }
 
     #[test]
@@ -16540,6 +16868,7 @@ mod tests {
             deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: Vec::new(),
+            raw_key_cells: Vec::new(),
             spatial_values: Vec::new(),
             rows: vec![vec![
                 serde_json::json!("amount"),
@@ -17554,6 +17883,109 @@ mod tests {
         );
         let other_schema = format!("CREATE OR REPLACE PROCEDURE other.p1{body}");
         assert_eq!(strip_routine_schema_qualifier(&other_schema, "cux"), other_schema);
+    }
+
+    #[test]
+    fn pg_error_to_string_preserves_underlying_sources_when_as_db_error_is_none() {
+        // The `port=invalid` config error chain is: "invalid connection
+        // string" caused by "invalid value for option `port`" — this
+        // tokio-postgres version does not expose the integer parse error as
+        // a deeper source, so assert the chain we actually get, joined.
+        let err = tokio_postgres::Config::from_str("port=invalid").unwrap_err();
+        let formatted = pg_error_to_string(err);
+        assert_eq!(
+            formatted, "invalid connection string: invalid value for option `port`",
+            "formatted error should chain all sources: {formatted}"
+        );
+
+        let err2 = tokio_postgres::Config::from_str("port=invalid").unwrap_err();
+        let plain = pg_error_to_string_plain(err2);
+        assert_eq!(
+            plain, "invalid connection string: invalid value for option `port`",
+            "plain formatted error should chain all sources: {plain}"
+        );
+    }
+
+    #[test]
+    fn error_with_sources_to_string_deduplicates_and_chains_all_levels() {
+        #[derive(Debug)]
+        struct TestCustomError {
+            msg: &'static str,
+            source: Option<Box<dyn std::error::Error + 'static>>,
+        }
+        impl std::fmt::Display for TestCustomError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.msg)
+            }
+        }
+        impl std::error::Error for TestCustomError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.source.as_deref()
+            }
+        }
+
+        let inner = TestCustomError { msg: "`V` field contained an invalid value", source: None };
+        let middle = TestCustomError { msg: "error parsing response from server", source: Some(Box::new(inner)) };
+        let outer = TestCustomError { msg: "error parsing response from server", source: Some(Box::new(middle)) };
+
+        assert_eq!(
+            error_with_sources_to_string(&outer),
+            "error parsing response from server: `V` field contained an invalid value"
+        );
+    }
+
+    #[tokio::test]
+    async fn pg_error_to_string_surfaces_server_error_even_with_non_standard_v_severity() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // NoTls skips the SSLRequest handshake, so the first message is
+            // the StartupMessage itself: read its length, then its body.
+            // (Reading an 8-byte SSLRequest first and replying 'N' hangs:
+            // the client is waiting for a framed message, not a bare byte.)
+            let mut len_bytes = [0u8; 4];
+            socket.read_exact(&mut len_bytes).await.unwrap();
+            let len = u32::from_be_bytes(len_bytes) as usize;
+            let mut startup_body = vec![0u8; len - 4];
+            socket.read_exact(&mut startup_body).await.unwrap();
+
+            // Send ErrorResponse message with invalid 'V' field
+            // 'E' + length (4 bytes) + fields + '\0'
+            let mut payload = Vec::new();
+            payload.push(b'S');
+            payload.extend_from_slice(b"ERROR\0");
+            payload.push(b'V');
+            payload.extend_from_slice(b"NON_STANDARD_SEVERITY\0");
+            payload.push(b'C');
+            payload.extend_from_slice(b"42P01\0");
+            payload.push(b'M');
+            payload.extend_from_slice(b"relation does not exist\0");
+            payload.push(0); // delimiter
+
+            let total_len = (payload.len() + 4) as u32;
+            let mut msg = Vec::new();
+            msg.push(b'E');
+            msg.extend_from_slice(&total_len.to_be_bytes());
+            msg.extend_from_slice(&payload);
+
+            socket.write_all(&msg).await.unwrap();
+        });
+
+        let config = format!("host=127.0.0.1 port={port} user=postgres dbname=test connect_timeout=3");
+        let client_err = match tokio_postgres::connect(&config, tokio_postgres::NoTls).await {
+            Ok(_) => panic!("connection must fail"),
+            Err(err) => err,
+        };
+
+        let formatted = pg_error_to_string(client_err);
+        assert_eq!(
+            formatted, "ERROR: relation does not exist",
+            "formatted error should surface the actual server message: {formatted}"
+        );
+
+        server.await.unwrap();
     }
 }
 

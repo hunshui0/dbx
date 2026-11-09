@@ -16,6 +16,18 @@ fn transfer_identifier_policy_preserves_legacy_output() {
 }
 
 #[test]
+fn tdengine_transfer_identifiers_use_backticks() {
+    // #14540: TDengine treats double quotes as string literals, so every
+    // export/transfer identifier must take the backtick family instead of the
+    // ANSI default arm.
+    assert_eq!(quote_transfer_identifier("device_desc", &DatabaseType::Tdengine), "`device_desc`");
+    assert_eq!(
+        qualified_transfer_table("device_desc", "demo_db", &DatabaseType::Tdengine, None),
+        "`demo_db`.`device_desc`"
+    );
+}
+
+#[test]
 fn backtick_family_predicate_matches_quoting() {
     // `uses_backtick_identifier_quoting` is the single source of truth the "Standard
     // SQL" export dialect consults to decide when to deviate from ANSI double
@@ -609,6 +621,32 @@ fn jdbc_table_data_qualifies_schema_without_forcing_identifier_quotes() {
             ..Default::default()
         }),
         "SELECT * FROM STUDENT;"
+    );
+}
+
+#[test]
+fn opengauss_table_data_uses_compatibility_identifier_quote() {
+    // openGauss keeps the PostgreSQL catalog but switches identifier quoting with
+    // the database compatibility mode: B/MySQL databases reject the double quotes
+    // that A/PG databases require (#13596).
+    let base = TableDataSelectSqlOptions {
+        database_type: Some(DatabaseType::OpenGauss),
+        schema: Some("dbx-demo".to_string()),
+        table_name: "order".to_string(),
+        limit: Some(25),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            identifier_quote: Some("`".to_string()),
+            ..base.clone()
+        }),
+        "SELECT * FROM `dbx-demo`.`order` LIMIT 25;"
+    );
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions { identifier_quote: Some("\"".to_string()), ..base }),
+        "SELECT * FROM \"dbx-demo\".\"order\" LIMIT 25;"
     );
 }
 

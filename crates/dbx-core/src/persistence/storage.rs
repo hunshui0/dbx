@@ -66,6 +66,10 @@ const APP_STATE_EDITOR_SETTINGS_KEY: &str = "editor_settings";
 const APP_STATE_OPEN_TABS_KEY: &str = "open_tabs";
 const APP_STATE_SAVED_SQL_EDITOR_POSITIONS_KEY: &str = "saved_sql_editor_positions";
 const APP_STATE_TRANSFER_TASK_LIBRARY_KEY: &str = "transfer_task_library";
+/// Beta build version the app was told is the promoted stable release. Kept in
+/// app_state (not renderer localStorage) because the native About panel is
+/// built before the webview could report it again on a cold start.
+const APP_STATE_PROMOTED_BUILD_KEY: &str = "promoted_build";
 const APP_APPEARANCE_SETTINGS_KEY: &str = "app_appearance";
 const MCP_GLOBAL_POLICY_KEY: &str = "mcp_global_policy";
 /// Policy v2 (`dbx_core::mcp_access::McpAccessPolicy`). Written next to the
@@ -94,6 +98,7 @@ fn saved_mcp_access_policy(
 const MCP_HTTP_SERVER_SETTINGS_KEY: &str = "mcp_http_server_settings";
 const WEB_MCP_SETTINGS_KEY: &str = "web_mcp_settings";
 const MAX_RETRIES_KEY: &str = "max_retries";
+const WEB_LOGIN_CAPTCHA_KEY: &str = "web_login_captcha";
 const HISTORY_RETENTION_LIMIT_KEY: &str = "history_retention_limit";
 const MCP_HISTORY_RETENTION_LIMIT_KEY: &str = "mcp_history_retention_limit";
 const SQL_FILE_UPLOAD_MAX_MB_KEY: &str = "sql_file_upload_max_mb";
@@ -3626,6 +3631,11 @@ fn scrub_mq_auth_secrets(config: &mut ConnectionConfig) {
     }
 }
 
+/// Password and certificate (optional username/password) auth both store `auth.password`.
+fn mqtt_auth_kind_carries_password(auth: &serde_json::Map<String, serde_json::Value>) -> bool {
+    matches!(auth.get("kind").and_then(serde_json::Value::as_str), Some("password" | "certificate"))
+}
+
 fn scrub_mqtt_auth_secrets(config: &mut ConnectionConfig) {
     if config.db_type != DatabaseType::Mqtt {
         return;
@@ -3636,7 +3646,7 @@ fn scrub_mqtt_auth_secrets(config: &mut ConnectionConfig) {
     let Some(auth) = auth.as_object_mut() else {
         return;
     };
-    if auth.get("kind").and_then(serde_json::Value::as_str) == Some("password") {
+    if mqtt_auth_kind_carries_password(auth) {
         scrub_json_secret(auth, "password");
     }
 }
@@ -6088,6 +6098,20 @@ impl Storage {
         self.save_app_settings_json(&settings).await
     }
 
+    /// Captcha policy chosen in the Web settings dialog (`设置 → 安全`).
+    /// Stored in the shared app settings map so it travels with the data
+    /// directory, but read-modify-write keeps every other key intact.
+    pub async fn save_web_login_captcha_mode(&self, mode: &str) -> Result<(), String> {
+        let mut settings = self.load_app_settings_json().await?;
+        settings.insert(WEB_LOGIN_CAPTCHA_KEY.to_string(), serde_json::Value::String(mode.to_string()));
+        self.save_app_settings_json(&settings).await
+    }
+
+    pub async fn load_web_login_captcha_mode(&self) -> Result<Option<String>, String> {
+        let settings = self.load_app_settings_json().await?;
+        Ok(settings.get(WEB_LOGIN_CAPTCHA_KEY).and_then(|value| value.as_str()).map(str::to_string))
+    }
+
     pub async fn load_pinned_tree_node_ids(&self) -> Result<Vec<String>, String> {
         let settings = self.load_app_settings_json().await?;
         let Some(value) = settings.get("pinned_tree_node_ids") else {
@@ -6149,6 +6173,22 @@ impl Storage {
     /// Load open tabs from an isolated state key.
     pub async fn load_open_tabs_state_with_key(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
         self.load_app_state_value(key).await
+    }
+
+    /// Store the promoted-build marker. Only the native About panel reads it,
+    /// and only for the build recorded here — a stale marker from another build
+    /// is ignored by its reader rather than rewritten during startup.
+    pub async fn save_promoted_build(&self, build_version: &str) -> Result<(), String> {
+        let value = serde_json::Value::String(build_version.trim().to_string());
+        self.save_app_state_value(APP_STATE_PROMOTED_BUILD_KEY, &value).await
+    }
+
+    pub async fn load_promoted_build(&self) -> Result<Option<String>, String> {
+        Ok(self
+            .load_app_state_value(APP_STATE_PROMOTED_BUILD_KEY)
+            .await?
+            .and_then(|value| value.as_str().map(str::trim).map(ToOwned::to_owned))
+            .filter(|value| !value.is_empty()))
     }
 
     pub async fn save_saved_sql_editor_positions(&self, positions: &serde_json::Value) -> Result<(), String> {
@@ -8024,6 +8064,51 @@ impl Storage {
         .await
     }
 
+    pub async fn migrate_sidebar_user_admin_visibility(&self, legacy_show_user_admin: bool) -> Result<(), String> {
+        self.with_conn(move |conn| {
+            let tx =
+                conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+            let migrated: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM app_state WHERE key = 'sidebar_user_admin_visibility_migration_v1')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if migrated {
+                return Ok(());
+            }
+            if !legacy_show_user_admin {
+                let rows = {
+                    let mut stmt =
+                        tx.prepare("SELECT id, config_json FROM connections").map_err(|error| error.to_string())?;
+                    let rows = stmt
+                        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                        .map_err(|error| error.to_string())?;
+                    rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?
+                };
+                for (id, json) in rows {
+                    let Ok(serde_json::Value::Object(mut config)) = serde_json::from_str(&json) else {
+                        continue;
+                    };
+                    config.insert("show_user_admin".into(), serde_json::Value::Bool(false));
+                    tx.execute(
+                        "UPDATE connections SET config_json = ?1 WHERE id = ?2",
+                        params![serde_json::to_string(&config).map_err(|error| error.to_string())?, id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+            tx.execute(
+                "INSERT INTO app_state (key, value_json) VALUES ('sidebar_user_admin_visibility_migration_v1', 'true')",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())
+        })
+        .await
+    }
+
     pub async fn load_connections(&self) -> Result<Vec<ConnectionConfig>, String> {
         let rows: Vec<(String, String)> = self
             .with_conn(|conn| {
@@ -8217,7 +8302,7 @@ impl Storage {
         let Some(auth) = auth.as_object_mut() else {
             return Ok(false);
         };
-        if auth.get("kind").and_then(serde_json::Value::as_str) != Some("password") {
+        if !mqtt_auth_kind_carries_password(auth) {
             return Ok(false);
         }
         hydrate_mq_json_secret(self, connection_id, MQTT_AUTH_PASSWORD_KEY, auth, "password").await
@@ -10110,7 +10195,7 @@ fn persist_mqtt_auth_secrets_in_tx(
         delete_secret_prefix_in_tx(tx, &config.id, MQTT_AUTH_SECRET_PREFIX)?;
         return Ok(());
     };
-    if auth.get("kind").and_then(serde_json::Value::as_str) != Some("password") {
+    if !mqtt_auth_kind_carries_password(auth) {
         delete_secret_prefix_in_tx(tx, &config.id, MQTT_AUTH_SECRET_PREFIX)?;
         return Ok(());
     }
@@ -10468,6 +10553,157 @@ mod tests {
     use rusqlite::{Connection, TransactionBehavior};
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn sidebar_user_admin_migration_preserves_other_fields_and_secrets() {
+        for legacy_visible in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let storage = crate::persistence::test_storage::open(&directory.path().join("storage.db")).await.unwrap();
+            let originals = vec![
+                ("missing", r#"{"show_database_links":false,"show_native_jobs":true,"future":{"value":42}}"#),
+                ("shown", r#"{"show_user_admin":true,"host":"unchanged"}"#),
+                ("hidden", r#"{"show_user_admin":false}"#),
+                ("broken", "not-json"),
+                ("array", "[]"),
+            ];
+            let inserted = originals.clone();
+            storage.with_conn(move |conn| {
+                for (id, json) in inserted {
+                    conn.execute("INSERT INTO connections (id, config_json) VALUES (?1, ?2)", [id, json]).map_err(|e| e.to_string())?;
+                }
+                conn.execute("INSERT INTO connection_secrets (connection_id, key, secret, secret_enc) VALUES ('missing', 'password', '', 'unchanged-ciphertext')", []).map_err(|e| e.to_string())?;
+                Ok(())
+            }).await.unwrap();
+            storage.migrate_sidebar_user_admin_visibility(legacy_visible).await.unwrap();
+            let (rows, secret) = storage
+                .with_conn(|conn| {
+                    let mut stmt = conn
+                        .prepare("SELECT id, config_json FROM connections ORDER BY id")
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                        .map_err(|e| e.to_string())?
+                        .collect::<Result<BTreeMap<_, _>, _>>()
+                        .map_err(|e| e.to_string())?;
+                    let secret: String = conn
+                        .query_row(
+                            "SELECT secret_enc FROM connection_secrets WHERE connection_id = 'missing'",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    Ok((rows, secret))
+                })
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), originals.len());
+            assert_eq!(secret, "unchanged-ciphertext");
+            for (id, original) in originals {
+                if legacy_visible || id == "broken" || id == "array" {
+                    assert_eq!(rows[id], original);
+                } else {
+                    let mut expected: serde_json::Value = serde_json::from_str(original).unwrap();
+                    expected["show_user_admin"] = serde_json::Value::Bool(false);
+                    assert_eq!(serde_json::from_str::<serde_json::Value>(&rows[id]).unwrap(), expected);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sidebar_user_admin_migration_keeps_later_choices_and_new_connections_after_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("storage.db");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        let mut config: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "existing", "name": "Existing", "db_type": "oracle", "host": "localhost",
+            "port": 1521, "username": "test", "password": "", "save_password": false
+        }))
+        .unwrap();
+        storage.save_connections(&[config.clone()]).await.unwrap();
+        storage.migrate_sidebar_user_admin_visibility(false).await.unwrap();
+        assert_eq!(storage.load_connections().await.unwrap()[0].show_user_admin, Some(false));
+        config.show_user_admin = Some(true);
+        let mut added = config.clone();
+        added.id = "new".into();
+        added.show_user_admin = None;
+        storage.save_connections(&[config, added]).await.unwrap();
+        drop(storage);
+        let reopened = crate::persistence::test_storage::open(&path).await.unwrap();
+        reopened.migrate_sidebar_user_admin_visibility(false).await.unwrap();
+        let configs = reopened.load_connections().await.unwrap();
+        assert_eq!(configs.iter().find(|c| c.id == "existing").unwrap().show_user_admin, Some(true));
+        assert_eq!(configs.iter().find(|c| c.id == "new").unwrap().show_user_admin, None);
+    }
+
+    #[tokio::test]
+    async fn sidebar_user_admin_migration_rolls_back_updates_and_marker_before_retry() {
+        for failure in [
+            "CREATE TRIGGER reject_migration BEFORE UPDATE ON connections WHEN OLD.id = 'b' BEGIN SELECT RAISE(ABORT, 'injected update failure'); END;",
+            "CREATE TRIGGER reject_migration BEFORE INSERT ON app_state WHEN NEW.key = 'sidebar_user_admin_visibility_migration_v1' BEGIN SELECT RAISE(ABORT, 'injected marker failure'); END;",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let storage = crate::persistence::test_storage::open(&directory.path().join("storage.db")).await.unwrap();
+            storage.with_conn(move |conn| {
+                conn.execute_batch("INSERT INTO connections (id, config_json) VALUES ('a', '{}'), ('b', '{}');").map_err(|e| e.to_string())?;
+                conn.execute_batch(failure).map_err(|e| e.to_string())
+            }).await.unwrap();
+            assert!(storage.migrate_sidebar_user_admin_visibility(false).await.is_err());
+            storage.with_conn(|conn| {
+                let unchanged: i64 = conn.query_row("SELECT COUNT(*) FROM connections WHERE config_json = '{}'", [], |row| row.get(0)).map_err(|e| e.to_string())?;
+                let marked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM app_state WHERE key = 'sidebar_user_admin_visibility_migration_v1')", [], |row| row.get(0)).map_err(|e| e.to_string())?;
+                assert_eq!(unchanged, 2);
+                assert!(!marked);
+                conn.execute_batch("DROP TRIGGER reject_migration;").map_err(|e| e.to_string())
+            }).await.unwrap();
+            storage.migrate_sidebar_user_admin_visibility(false).await.unwrap();
+            storage.with_conn(|conn| {
+                let changed: i64 = conn.query_row("SELECT COUNT(*) FROM connections WHERE json_extract(config_json, '$.show_user_admin') = 0", [], |row| row.get(0)).map_err(|e| e.to_string())?;
+                assert_eq!(changed, 2);
+                Ok(())
+            }).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sidebar_user_admin_migration_first_client_wins_across_storage_instances() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("storage.db");
+        let first = crate::persistence::test_storage::open(&path).await.unwrap();
+        let second = crate::persistence::test_storage::open(&path).await.unwrap();
+        first
+            .with_conn(|conn| {
+                conn.execute_batch("INSERT INTO connections (id, config_json) VALUES ('a', '{}'), ('b', '{}');")
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+        let (a, b) = tokio::join!(
+            first.migrate_sidebar_user_admin_visibility(false),
+            second.migrate_sidebar_user_admin_visibility(true)
+        );
+        a.unwrap();
+        b.unwrap();
+        let values = first
+            .with_conn(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT config_json FROM connections ORDER BY id").map_err(|e| e.to_string())?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(values[0], values[1]);
+        second.migrate_sidebar_user_admin_visibility(false).await.unwrap();
+        let unchanged = first
+            .with_conn(|conn| {
+                conn.query_row("SELECT config_json FROM connections WHERE id = 'a'", [], |row| row.get::<_, String>(0))
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(unchanged, values[0]);
+    }
 
     #[cfg(feature = "mq-admin")]
     #[tokio::test]
@@ -12673,6 +12909,8 @@ mod tests {
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
             show_database_links: None,
+            show_native_jobs: None,
+            show_user_admin: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -12755,6 +12993,8 @@ mod tests {
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
             show_database_links: None,
+            show_native_jobs: None,
+            show_user_admin: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -14943,6 +15183,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn promoted_build_marker_roundtrips_in_local_app_state() {
+        let path = temp_db_path("promoted-build");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+
+        assert_eq!(storage.load_promoted_build().await.unwrap(), None);
+
+        storage.save_promoted_build(" 0.6.67-beta.20261105.1 ").await.unwrap();
+        assert_eq!(storage.load_promoted_build().await.unwrap().as_deref(), Some("0.6.67-beta.20261105.1"));
+
+        // Overwriting replaces the marker instead of accumulating values.
+        storage.save_promoted_build("0.6.68-beta.20261106.1").await.unwrap();
+        assert_eq!(storage.load_promoted_build().await.unwrap().as_deref(), Some("0.6.68-beta.20261106.1"));
+    }
+
+    #[tokio::test]
     async fn ai_chat_selection_roundtrips_in_local_app_state() {
         let path = temp_db_path("ai-chat-selection");
         let storage = crate::persistence::test_storage::open(&path).await.unwrap();
@@ -16287,6 +16542,64 @@ mod tests {
             .is_some_and(|secret| secret == "mqtt-secret"));
         assert_eq!(storage.load_connections().await.unwrap()[0], config);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn mqtt_certificate_password_is_encrypted_at_rest_and_hydrated_on_load() {
+        let path = temp_db_path("mqtt-certificate-password-secret");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        let mut config = plain_connection("mqtt-certificate", "");
+        config.db_type = DatabaseType::Mqtt;
+        config.external_config = Some(serde_json::json!({
+            "auth": {
+                "kind": "certificate",
+                "username": "mqtt-user",
+                "password": "mqtt-cert-secret",
+                "clientCertPath": "/tmp/client.pem"
+            }
+        }));
+        storage.save_connections(std::slice::from_ref(&config)).await.unwrap();
+
+        let raw = raw_connection_json(&storage, "mqtt-certificate").await;
+        assert!(!raw.contains("mqtt-cert-secret"), "{raw}");
+        assert_eq!(
+            storage.get_secret("mqtt-certificate", MQTT_AUTH_PASSWORD_KEY).await.unwrap().as_deref(),
+            Some("mqtt-cert-secret")
+        );
+        assert_eq!(storage.load_connections().await.unwrap()[0], config);
+
+        // Re-saving the hydrated config must keep the stored secret.
+        storage.save_connections(std::slice::from_ref(&config)).await.unwrap();
+        assert_eq!(
+            storage.get_secret("mqtt-certificate", MQTT_AUTH_PASSWORD_KEY).await.unwrap().as_deref(),
+            Some("mqtt-cert-secret")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn migration_moves_legacy_mqtt_certificate_password_into_secret_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::persistence::test_storage::open_unmigrated(&dir.path().join("dbx.db")).await.unwrap();
+        let mut config = plain_connection("mqtt-legacy-certificate", "");
+        config.db_type = DatabaseType::Mqtt;
+        config.external_config = Some(serde_json::json!({
+            "auth": { "kind": "certificate", "username": "mqtt-user", "password": "legacy-cert-secret" }
+        }));
+        insert_raw_connection(&storage, &config).await;
+
+        assert_eq!(storage.inspect_data_migration().await.unwrap().database_plaintext_count, 1);
+        storage.start_data_migration().await.unwrap();
+
+        let raw = raw_connection_json(&storage, "mqtt-legacy-certificate").await;
+        assert!(!raw.contains("legacy-cert-secret"), "{raw}");
+        assert_eq!(
+            storage.get_secret("mqtt-legacy-certificate", MQTT_AUTH_PASSWORD_KEY).await.unwrap().as_deref(),
+            Some("legacy-cert-secret")
+        );
+        let after = storage.inspect_data_migration().await.unwrap();
+        assert_eq!(after.database_plaintext_count, 0);
+        assert!(!after.needs_migration);
     }
 
     #[tokio::test]

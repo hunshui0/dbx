@@ -2861,6 +2861,7 @@ fn keeps_backslash_literal(target_db: &DatabaseType) -> bool {
         DatabaseType::Oracle
             | DatabaseType::OceanbaseOracle
             | DatabaseType::Dameng
+            | DatabaseType::Xugu
             | DatabaseType::Sqlite
             | DatabaseType::Rqlite
             | DatabaseType::Turso
@@ -2934,15 +2935,49 @@ fn format_mysql_default_literal(raw: &str, data_type: &str) -> String {
     format!("'{}'", trimmed.replace('\'', "''"))
 }
 
+fn dameng_to_postgres_default(value: &str, target_type: &str) -> Option<String> {
+    static STRING_LITERAL: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"\A'([^'\x00]|'')*'\z").expect("valid string literal regex"));
+    static TIMESTAMP_DEFAULT: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"\A(?:CURRENT_TIMESTAMP|LOCALTIMESTAMP)(?:\([ \t]*[0-6][ \t]*\))?\z")
+            .expect("valid timestamp default regex")
+    });
+
+    // Dameng returns SQL expressions. Keep defaults with a PostgreSQL equivalent
+    // for the mapped column type, without copying Dameng functions or sequences.
+    let target_base_type = target_type.split('(').next().unwrap_or(target_type).trim();
+    let upper = value.to_ascii_uppercase();
+    match (target_base_type, upper.as_str()) {
+        (_, "NULL") => Some(upper),
+        ("BOOLEAN", "1" | "TRUE") => Some("TRUE".to_string()),
+        ("BOOLEAN", "0" | "FALSE") => Some("FALSE".to_string()),
+        ("DATE" | "TIMESTAMP", "CURRENT_DATE") => Some(upper),
+        ("DATE" | "TIMESTAMP", _) if TIMESTAMP_DEFAULT.is_match(&upper) => Some(upper),
+        ("SMALLINT", _) if value.parse::<i16>().is_ok() => Some(value.to_string()),
+        ("INTEGER", _) if value.parse::<i32>().is_ok() => Some(value.to_string()),
+        ("BIGINT", _) if value.parse::<i64>().is_ok() => Some(value.to_string()),
+        ("NUMERIC" | "DECIMAL" | "DOUBLE PRECISION", _) if looks_like_numeric_literal(value) => Some(value.to_string()),
+        ("VARCHAR" | "CHAR" | "TEXT", _) if STRING_LITERAL.is_match(value) => {
+            Some(quote_postgres_string_literal(&value[1..value.len() - 1].replace("''", "'")))
+        }
+        _ => None,
+    }
+}
+
 fn column_default_clause(
     column: &db::ColumnInfo,
     source_schema: &str,
     target_schema: &str,
     source_db: &DatabaseType,
     target_db: &DatabaseType,
+    target_type: &str,
 ) -> Option<String> {
     if is_postgres_compat_transfer(source_db, target_db) {
         return postgres_default_clause(column, source_schema, target_schema, source_db, target_db);
+    }
+    if matches!((source_db, target_db), (DatabaseType::Dameng, DatabaseType::Postgres)) {
+        let value = column.column_default.as_deref()?.trim();
+        return dameng_to_postgres_default(value, target_type).map(|value| format!("DEFAULT {value}"));
     }
     if is_mysql_family_target(target_db) {
         let default_value = column.column_default.as_deref()?.trim();
@@ -2952,6 +2987,44 @@ fn column_default_clause(
         return Some(format!("DEFAULT {}", format_mysql_default_literal(default_value, &column.data_type)));
     }
     None
+}
+
+fn mysql_default_for_dameng(column: &db::ColumnInfo) -> Option<String> {
+    static CURRENT_TIMESTAMP: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"\ACURRENT_TIMESTAMP(?:\([0-6]?\))?\z").expect("valid timestamp default regex")
+    });
+    let value = column.column_default.as_deref()?;
+    let trimmed = value.trim();
+    let base_type = column.data_type.split(['(', ' ']).next().unwrap_or_default().to_ascii_lowercase();
+    let upper = trimmed.to_ascii_uppercase();
+    if matches!(base_type.as_str(), "timestamp" | "datetime") && CURRENT_TIMESTAMP.is_match(&upper) {
+        return Some(upper.strip_suffix("()").unwrap_or(&upper).to_string());
+    }
+    if column
+        .extra
+        .as_deref()
+        .is_some_and(|extra| extra.split_ascii_whitespace().any(|part| part.eq_ignore_ascii_case("DEFAULT_GENERATED")))
+    {
+        return None;
+    }
+
+    // COLUMN_DEFAULT is the raw string on MySQL. Quote it even when it looks
+    // like NULL or a function, and check integer bounds after type mapping.
+    let compatible_number = match base_type.as_str() {
+        "tinyint" => trimmed.parse::<i8>().is_ok(),
+        "smallint" => trimmed.parse::<i16>().is_ok(),
+        "mediumint" | "int" | "integer" => trimmed.parse::<i32>().is_ok(),
+        "bigint" => trimmed.parse::<i64>().is_ok(),
+        "numeric" | "decimal" | "double" => looks_like_numeric_literal(trimmed),
+        _ => false,
+    };
+    if compatible_number {
+        Some(trimmed.to_string())
+    } else if matches!(base_type.as_str(), "char" | "varchar") && !value.contains('\0') {
+        Some(quote_string_literal(value))
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -4974,7 +5047,38 @@ fn generate_create_table_ddl_with_column_quoting(
     catalog: Option<&str>,
     quote_target_column_names: bool,
 ) -> String {
+    generate_create_table_ddl_with_source_profile(
+        columns,
+        table,
+        source_schema,
+        schema,
+        target_db,
+        source_db,
+        None,
+        table_comment,
+        catalog,
+        quote_target_column_names,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_create_table_ddl_with_source_profile(
+    columns: &[db::ColumnInfo],
+    table: &str,
+    source_schema: &str,
+    schema: &str,
+    target_db: &DatabaseType,
+    source_db: &DatabaseType,
+    source_driver_profile: Option<&str>,
+    table_comment: Option<&str>,
+    catalog: Option<&str>,
+    quote_target_column_names: bool,
+) -> String {
     let full_table = qualified_table(table, schema, target_db, catalog);
+    // MySQL-compatible profiles can return SQL literals instead of raw string values.
+    let preserve_mysql_defaults_in_dameng =
+        matches!((source_db, target_db), (DatabaseType::Mysql, DatabaseType::Dameng))
+            && matches!(source_driver_profile, None | Some("mysql"));
 
     let is_mysql_family = matches!(
         target_db,
@@ -5089,10 +5193,16 @@ fn generate_create_table_ddl_with_column_quoting(
                             || mysql_extra_clauses.as_ref().is_some_and(|extra| extra.auto_increment));
                     if !skip_default && !mysql_auto_increment {
                         if let Some(default_clause) =
-                            column_default_clause(c, source_schema, schema, source_db, target_db)
+                            column_default_clause(c, source_schema, schema, source_db, target_db, &mapped_type)
                         {
                             line.push(' ');
                             line.push_str(&default_clause);
+                        }
+                    }
+                    if preserve_mysql_defaults_in_dameng && !skip_default && !column_is_auto_increment(c) {
+                        if let Some(value) = mysql_default_for_dameng(c) {
+                            line.push_str(" DEFAULT ");
+                            line.push_str(&value);
                         }
                     }
                     if !c.is_nullable
@@ -9871,6 +9981,18 @@ pub fn should_transfer_schema_objects(
 /// outcome. Executes in dependency order (sequence → view → function →
 /// procedure → trigger → event). Errors are collected per object and the
 /// transfer continues.
+pub async fn check_data_charset_transfer(state: &AppState, request: &TransferRequest) -> Result<(), String> {
+    for connection_id in [&request.source_connection_id, &request.target_connection_id] {
+        crate::query::mysql_data_charset_policy::reject_operation(
+            state,
+            connection_id,
+            crate::query::mysql_data_charset_policy::TRANSFER_UNSUPPORTED,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub async fn transfer_schema_objects<F>(
     state: &AppState,
     request: &TransferRequest,
@@ -9881,6 +10003,7 @@ pub async fn transfer_schema_objects<F>(
 where
     F: FnMut(TransferProgress),
 {
+    check_data_charset_transfer(state, request).await?;
     if request.has_package_selection() {
         let source_db_type = get_db_type(state, &request.source_connection_id).await?;
         let target_db_type = get_db_type(state, &request.target_connection_id).await?;
@@ -9940,6 +10063,7 @@ pub(crate) async fn transfer_schema_objects_with_routine_context<F>(
 where
     F: FnMut(TransferProgress),
 {
+    check_data_charset_transfer(state, request).await?;
     if matches!(request.content, TransferContent::DataOnly) && !request.has_package_selection() {
         return Ok(TransferObjectOutcome::default());
     }
@@ -11578,9 +11702,17 @@ async fn fetch_foreign_keys_for_tables(
     database: &str,
     schema: &str,
     tables: &[String],
+    cancel_transfer_id: Option<&str>,
 ) -> Result<HashMap<String, Vec<db::ForeignKeyInfo>>, String> {
     let mut result = HashMap::new();
     for table in tables {
+        // One metadata round trip per table: on a large schema this phase can run for
+        // minutes, so a cancel request must be honoured between tables.
+        if let Some(transfer_id) = cancel_transfer_id {
+            if is_cancelled(transfer_id).await {
+                return Err("Cancelled".to_string());
+            }
+        }
         let fks = crate::schema::list_foreign_keys_core(state, connection_id, database, schema, table).await?;
         result.insert(table.clone(), fks);
     }
@@ -11613,6 +11745,20 @@ pub async fn sort_tables_by_fk_dependency_with_foreign_keys(
     tables: &[String],
     parents_first: bool,
 ) -> Result<(Vec<String>, HashMap<String, Vec<db::ForeignKeyInfo>>), String> {
+    sort_tables_by_fk_dependency_cancellable(state, connection_id, database, schema, tables, parents_first, None).await
+}
+
+/// Same as `sort_tables_by_fk_dependency_with_foreign_keys`, but stops with `Err("Cancelled")`
+/// as soon as `cancel_transfer_id` is flagged cancelled while foreign keys are being fetched.
+pub async fn sort_tables_by_fk_dependency_cancellable(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    tables: &[String],
+    parents_first: bool,
+    cancel_transfer_id: Option<&str>,
+) -> Result<(Vec<String>, HashMap<String, Vec<db::ForeignKeyInfo>>), String> {
     if tables.len() <= 1 {
         return Ok((tables.to_vec(), HashMap::new()));
     }
@@ -11637,7 +11783,7 @@ pub async fn sort_tables_by_fk_dependency_with_foreign_keys(
         (db::postgres::list_table_dependencies(&pool, schema).await?, HashMap::new())
     } else {
         let foreign_keys_by_table =
-            fetch_foreign_keys_for_tables(state, connection_id, database, schema, tables).await?;
+            fetch_foreign_keys_for_tables(state, connection_id, database, schema, tables, cancel_transfer_id).await?;
         let dependencies = foreign_keys_by_table
             .iter()
             .flat_map(|(table, fks)| fks.iter().map(move |fk| (table.clone(), fk.ref_table.clone())))
@@ -12511,6 +12657,7 @@ pub async fn rename_tables_to_backup<F>(
 where
     F: FnMut(TransferProgress),
 {
+    check_data_charset_transfer(state, request).await?;
     let source_pool_key = ensure_transfer_pool(
         state,
         &request.source_connection_id,
@@ -14236,6 +14383,7 @@ pub async fn drop_backup_tables(
     backup_names: &HashMap<String, String>,
     drop_order: &[String],
 ) -> Result<(), String> {
+    check_data_charset_transfer(state, request).await?;
     let mut ordered: Vec<&String> = drop_order.iter().filter(|table| backup_names.contains_key(*table)).collect();
     let mut leftovers: Vec<&String> = backup_names.keys().filter(|table| !drop_order.contains(*table)).collect();
     leftovers.sort();
@@ -14350,6 +14498,7 @@ where
     F: FnMut(TransferProgress),
     C: FnMut(Option<u64>),
 {
+    check_data_charset_transfer(state, request).await?;
     validate_transfer_database_pair(request, source_db_type, target_db_type)?;
     let state = state.clone();
     if mysql_xugu::is_pair(source_db_type, target_db_type) {
@@ -15349,6 +15498,8 @@ for line in sys.stdin:
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
             show_database_links: None,
+            show_native_jobs: None,
+            show_user_admin: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -15658,6 +15809,57 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
     }
 
     #[test]
+    fn xugu_transfer_preserves_text_and_json_escape_sequences() {
+        let values = [
+            "".to_string(),
+            r"C:\tmp\o'clock\".to_string(),
+            r"\\server\share\\file".to_string(),
+            "中文\nactual\ttab\r\nnext".to_string(),
+            r"literal\n\r\t\u4e2d".to_string(),
+            r#"{"path":"C:\\tmp\\o'clock","quoted":"\"value\"","newline":"a\nb","unicode":"\u4e2d"}"#.to_string(),
+            "中文\\'\"\n".repeat(25_000),
+        ];
+        for kind in [None, Some("VARCHAR(500)"), Some("CHAR(500)"), Some("CLOB"), Some("JSON"), Some("XML")] {
+            for text in &values {
+                assert_eq!(
+                    escape_value_typed(&json!(text), &DatabaseType::Xugu, kind),
+                    quote_string_literal(text),
+                    "Xugu literal must retain source characters for {kind:?}"
+                );
+            }
+            assert_eq!(escape_value_typed(&serde_json::Value::Null, &DatabaseType::Xugu, kind), "NULL");
+        }
+    }
+
+    #[test]
+    fn xugu_insert_preserves_text_without_modifying_binary_literals() {
+        let text = r"C:\tmp\o'clock\";
+        let document = r#"{"path":"C:\\tmp","line":"a\nb"}"#;
+        let sql = generate_insert_typed(
+            &["ID".into(), "V".into(), "L".into(), "J".into(), "B".into()],
+            &[
+                Some("INT".into()),
+                Some("VARCHAR(100)".into()),
+                Some("CLOB".into()),
+                Some("JSON".into()),
+                Some("BLOB".into()),
+            ],
+            &[vec![json!(1), json!(text), json!(text), json!(document), json!("0x005C27FF")]],
+            "ESCAPE_TEST",
+            "APP",
+            &DatabaseType::Xugu,
+            None,
+        );
+        assert_eq!(
+            sql,
+            format!(
+                "INSERT INTO \"APP\".\"ESCAPE_TEST\" (\"ID\", \"V\", \"L\", \"J\", \"B\") VALUES\n(1, {}, {}, {}, X'005C27FF')",
+                quote_string_literal(text), quote_string_literal(text), quote_string_literal(document)
+            )
+        );
+    }
+
+    #[test]
     fn h2_transfer_literals_preserve_json_binary_and_backslashes() {
         assert_eq!(
             escape_value_typed(&json!(r"C:\tmp\o'clock"), &DatabaseType::H2, Some("CHARACTER VARYING")),
@@ -15710,6 +15912,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: vec![],
+            raw_key_cells: Vec::new(),
             spatial_values: vec![],
             rows,
             affected_rows: 0,
@@ -23657,6 +23860,8 @@ SELECT 1 FROM dual"#
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
             show_database_links: None,
+            show_native_jobs: None,
+            show_user_admin: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,

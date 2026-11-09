@@ -1,7 +1,7 @@
 {
   "productName": "DBX Custom",
   "identifier": "com.hunshui0.dbx.custom",
-  "version": "0.6.51-custom.1",
+  "version": "0.6.68-custom.1",
   "mainBinaryName": "dbx-custom",
   "app": {
     "windows": [{

@@ -310,6 +310,16 @@ pub trait DbxBackend: Send + Sync {
     }
 
     async fn load_connections(&self) -> Result<Vec<ConnectionConfig>, String>;
+
+    /// Whether the user has saved any MCP policy. Fresh installs have none,
+    /// in which case writable plugin connections fall back to their own
+    /// protection level (at least write) instead of the global default. Once
+    /// a policy is saved, its explicit settings are authoritative everywhere.
+    /// Unreadable storage counts as configured: unreadable hides, never widens.
+    async fn mcp_policy_configured(&self) -> bool {
+        false
+    }
+
     async fn save_history_entry(&self, entry: &HistoryEntry) -> Result<(), String> {
         let _ = entry;
         Err("Query history is not supported by this backend.".to_string())
@@ -1298,6 +1308,10 @@ impl DbxBackend for LocalBackend {
         self.state.storage.load_mcp_access_policy().await.map(effective_mcp_access_policy)
     }
 
+    async fn mcp_policy_configured(&self) -> bool {
+        self.state.storage.load_enforced_mcp_policy().await.map(|state| state.configured).unwrap_or(true)
+    }
+
     async fn list_plugin_mcp_tools(&self) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
         self.detect_plugin_tool_providers().await
     }
@@ -1496,6 +1510,7 @@ impl DbxBackend for LocalBackend {
                 connection.id.clone(),
                 database.to_string(),
                 client_session_id.to_string(),
+                pool.data_charset(),
             ),
             owner_config,
             resource_permit,
@@ -1778,6 +1793,16 @@ impl DbxBackend for WebBackend {
             .await
             .map(effective_mcp_policy)
             .map_err(|error| format!("Invalid MCP policy response: {error}"))
+    }
+
+    async fn mcp_policy_configured(&self) -> bool {
+        // Same source as `load_mcp_global_policy` and as LocalBackend: the
+        // enforced global policy state's `configured` flag. Transport or
+        // parse failures count as configured — unreadable hides, never widens.
+        match self.request(reqwest::Method::GET, "/api/app-settings/mcp-policy", None).await {
+            Ok(response) => response.json::<McpGlobalPolicyState>().await.map(|state| state.configured).unwrap_or(true),
+            Err(_) => true,
+        }
     }
 
     async fn load_mcp_access_policy(&self) -> Result<dbx_core::mcp_access::McpAccessPolicy, String> {
@@ -2970,6 +2995,7 @@ fn query_result(columns: Vec<String>, rows: Vec<Vec<Value>>, affected_rows: u64)
         deferred_large_value_cells: Vec::new(),
         column_sortables: Vec::new(),
         spatial_columns: vec![],
+        raw_key_cells: Vec::new(),
         spatial_values: vec![],
         rows,
         affected_rows,
@@ -3154,10 +3180,81 @@ pub fn new_connection_config(
     ssl: bool,
     driver_profile: Option<String>,
 ) -> Result<ConnectionConfig, String> {
+    new_connection_config_with_external_config(
+        id,
+        name,
+        db_type,
+        host,
+        port,
+        username,
+        password,
+        database,
+        ssl,
+        driver_profile,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Nacos connections need a dialect-specific `external_config` to be reachable:
+/// Nacos 2.x only serves its API under the `/nacos` context, and the desktop
+/// dialog defaults new connections to `implementation=nacos`, `versionMode=v2`,
+/// `contextPath=/nacos`. MCP-created connections must get the same defaults, and
+/// a user-provided `external_config` wins field-by-field while host, port,
+/// credentials and the namespace (from `database`) fill the rest (#14527).
+pub fn new_connection_config_with_external_config(
+    id: String,
+    name: String,
+    db_type: DatabaseType,
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    database: Option<String>,
+    ssl: bool,
+    driver_profile: Option<String>,
+    external_config: Option<serde_json::Value>,
+) -> Result<ConnectionConfig, String> {
     let minimal =
         NewConnectionConfig { id, name, db_type, host, port, username, password, database, ssl, driver_profile };
-    serde_json::from_value(serde_json::to_value(minimal).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+    let mut config: ConnectionConfig =
+        serde_json::from_value(serde_json::to_value(minimal).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    if config.db_type != DatabaseType::Nacos {
+        if external_config.is_some() {
+            return Err("external_config is only supported for Nacos connections.".to_string());
+        }
+        return Ok(config);
+    }
+    let mut merged = match external_config {
+        Some(serde_json::Value::Object(map)) => map,
+        Some(_) => return Err("external_config must be a JSON object.".to_string()),
+        None => serde_json::Map::new(),
+    };
+    let scheme = if config.ssl { "https" } else { "http" };
+    merged
+        .entry("serverAddr".to_string())
+        .or_insert_with(|| serde_json::json!(format!("{scheme}://{}:{}", config.host.trim(), config.port)));
+    if config.database.as_deref().is_some_and(|namespace| !namespace.trim().is_empty()) {
+        merged.entry("namespace".to_string()).or_insert_with(|| serde_json::json!(config.database));
+    }
+    if !config.username.trim().is_empty() {
+        merged
+            .entry("auth".to_string())
+            .or_insert_with(|| serde_json::json!({ "kind": "usernamePassword", "username": config.username, "password": config.password }));
+    }
+    merged.entry("implementation".to_string()).or_insert_with(|| serde_json::json!("nacos"));
+    merged.entry("versionMode".to_string()).or_insert_with(|| serde_json::json!("v2"));
+    merged.entry("contextPath".to_string()).or_insert_with(|| serde_json::json!("/nacos"));
+    let parsed: dbx_core::admin::nacos::config::NacosAdminConfig =
+        serde_json::from_value(serde_json::Value::Object(merged))
+            .map_err(|error| format!("Failed to parse Nacos external_config: {error}"))?;
+    config.external_config = Some(serde_json::to_value(&parsed).map_err(|error| error.to_string())?);
+    // Validate and store the normalized form so endpoint/context errors surface
+    // at add time instead of when the connection is first opened.
+    let validated = dbx_core::admin::nacos::config::NacosAdminConfig::from_connection(&config)?;
+    config.external_config = Some(serde_json::to_value(&validated).map_err(|error| error.to_string())?);
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -3618,6 +3715,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_backend_policy_configured_follows_the_enforced_state() {
+        // `mcp_policy_configured` must mirror the same source the local
+        // backend uses: the enforced global policy state's `configured` flag.
+        // A configured (or unreadable) web source keeps the saved policy
+        // authoritative — unreadable hides, never widens.
+        for (body, expected) in [
+            (r#"{"configured":true,"readOnly":false,"allowDangerousSql":false}"#, true),
+            (r#"{"configured":false,"readOnly":true,"allowDangerousSql":false}"#, false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let (request_sender, request_receiver) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..count]);
+                    if count == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                request_sender.send(String::from_utf8(request).unwrap().lines().next().unwrap().to_string()).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            });
+
+            let backend = WebBackend::new(format!("http://{address}"), String::new()).unwrap();
+            backend.auth.lock().await.checked = true;
+            let configured = backend.mcp_policy_configured().await;
+
+            server.join().unwrap();
+            assert_eq!(request_receiver.recv().unwrap(), "GET /api/app-settings/mcp-policy HTTP/1.1");
+            assert_eq!(configured, expected, "body: {body}");
+        }
+
+        // Unreachable desktop (transport error) counts as configured.
+        let backend = WebBackend::new("http://127.0.0.1:1".to_string(), String::new()).unwrap();
+        backend.auth.lock().await.checked = true;
+        assert!(backend.mcp_policy_configured().await);
+    }
+
+    #[tokio::test]
     async fn web_backend_loads_v2_access_policy_with_plugin_scope_rules() {
         // The desktop test suite normally exercises the HTTP path below. Some
         // restricted CI sandboxes disallow local listeners altogether; the
@@ -4019,6 +4166,8 @@ mod tests {
                     partition: Some(2),
                     offset: Some(17),
                     timestamp: None,
+                    end_timestamp: None,
+                    sort_order: None,
                 },
             )
             .await
@@ -4843,19 +4992,12 @@ mod tests {
         let server_csr = dir.path().join("server.csr");
         let server_pem = dir.path().join("server.pem");
         let run = |args: &[&str]| {
-            let status = std::process::Command::new("openssl")
-                .args(args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap();
             let output = std::process::Command::new("openssl").args(args).output().unwrap();
             assert!(
                 output.status.success(),
                 "openssl failed: {args:?} stderr={}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            let _ = status;
         };
         // Self-signed CA.
         run(&[
@@ -4891,7 +5033,12 @@ mod tests {
         // Server cert signed by the CA, with SAN for 127.0.0.1. The x509 -req
         // subcommand takes extensions via -extfile, not -addext.
         let ext_path = dir.path().join("server.ext");
-        std::fs::write(&ext_path, "subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\n").unwrap();
+        // Native TLS on macOS requires an explicit TLS server purpose.
+        std::fs::write(
+            &ext_path,
+            "subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n",
+        )
+        .unwrap();
         run(&[
             "x509",
             "-req",
@@ -5342,5 +5489,132 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not supported"));
+    }
+}
+
+#[cfg(test)]
+mod nacos_external_config_tests {
+    use super::*;
+    use dbx_core::admin::nacos::config::{NacosAdminConfig, NacosAuthConfig, NacosImplementation, NacosVersionMode};
+
+    fn nacos_connection(external_config: Option<Value>) -> ConnectionConfig {
+        new_connection_config_with_external_config(
+            "nacos-1".into(),
+            "Nacos".into(),
+            DatabaseType::Nacos,
+            "127.0.0.1".into(),
+            8848,
+            "nacos".into(),
+            "secret".into(),
+            Some("public".into()),
+            false,
+            None,
+            external_config,
+        )
+        .unwrap()
+    }
+
+    fn parsed_external(config: &ConnectionConfig) -> NacosAdminConfig {
+        serde_json::from_value(config.external_config.clone().expect("external_config must be set")).unwrap()
+    }
+
+    #[test]
+    fn nacos_connections_get_the_desktop_default_context() {
+        let config = nacos_connection(None);
+        let parsed = parsed_external(&config);
+
+        assert_eq!(parsed.server_addr, "http://127.0.0.1:8848");
+        assert_eq!(parsed.context_path, "/nacos");
+        assert_eq!(parsed.implementation, Some(NacosImplementation::Nacos));
+        assert_eq!(parsed.version_mode, Some(NacosVersionMode::V2));
+        assert_eq!(parsed.namespace, "public");
+        assert_eq!(
+            parsed.auth,
+            NacosAuthConfig::UsernamePassword { username: "nacos".to_string(), password: "secret".to_string() }
+        );
+    }
+
+    #[test]
+    fn nacos_user_external_config_wins_over_the_defaults() {
+        let config = nacos_connection(Some(json!({
+            "implementation": "rnacos",
+            "versionMode": "v3",
+            "contextPath": "/my-nacos",
+        })));
+        let parsed = parsed_external(&config);
+
+        assert_eq!(parsed.implementation, Some(NacosImplementation::RNacos));
+        assert_eq!(parsed.version_mode, Some(NacosVersionMode::V3));
+        assert_eq!(parsed.context_path, "/my-nacos");
+        // serverAddr still comes from the connection fields.
+        assert_eq!(parsed.server_addr, "http://127.0.0.1:8848");
+        // Credentials still flow from the connection fields when the user's
+        // external_config does not carry an auth block.
+        assert_eq!(
+            parsed.auth,
+            NacosAuthConfig::UsernamePassword { username: "nacos".to_string(), password: "secret".to_string() }
+        );
+    }
+
+    #[test]
+    fn nacos_ssl_connections_use_https_server_addr() {
+        let config = new_connection_config_with_external_config(
+            "nacos-2".into(),
+            "Nacos TLS".into(),
+            DatabaseType::Nacos,
+            "nacos.example".into(),
+            8848,
+            String::new(),
+            String::new(),
+            None,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let parsed = parsed_external(&config);
+
+        assert_eq!(parsed.server_addr, "https://nacos.example:8848");
+        assert_eq!(parsed.auth, NacosAuthConfig::None);
+    }
+
+    #[test]
+    fn external_config_is_rejected_for_other_database_types() {
+        let error = new_connection_config_with_external_config(
+            "pg-1".into(),
+            "Postgres".into(),
+            DatabaseType::Postgres,
+            "127.0.0.1".into(),
+            5432,
+            "postgres".into(),
+            "pw".into(),
+            None,
+            false,
+            None,
+            Some(json!({ "contextPath": "/nacos" })),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("external_config"), "{error}");
+    }
+
+    #[test]
+    fn malformed_external_config_fails_at_add_time() {
+        let error = new_connection_config_with_external_config(
+            "nacos-3".into(),
+            "Nacos".into(),
+            DatabaseType::Nacos,
+            "127.0.0.1".into(),
+            8848,
+            String::new(),
+            String::new(),
+            None,
+            false,
+            None,
+            Some(json!("not-an-object")),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("external_config"), "{error}");
     }
 }

@@ -62,6 +62,17 @@ func TestHandshakeResponse(t *testing.T) {
 	}
 }
 
+func TestConnectionInfoMethodIsSupported(t *testing.T) {
+	s := newServer()
+	resp, _ := s.handleLine(`{"jsonrpc":"2.0","id":8,"method":"connection_info","params":{}}`)
+	if resp.Error == nil {
+		t.Fatal("connection_info must fail on a disconnected server")
+	}
+	if !strings.Contains(resp.Error.Message, "not connected") {
+		t.Fatalf("connection_info must use the active connection: %s", resp.Error.Message)
+	}
+}
+
 func TestRuntimeHandshakeAdvertisesMultiSessionProtocol(t *testing.T) {
 	runtime := newRuntimeServer()
 	resp, shutdown := runtime.handleLine(`{"jsonrpc":"2.0","id":7,"method":"handshake","params":{"appVersion":"dev"}}`)
@@ -332,6 +343,7 @@ func TestExecuteOracleSelectRetriesXMLTypeDecodeFailures(t *testing.T) {
 			}
 			return rewrittenSQL, nil
 		},
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -359,6 +371,7 @@ func TestExecuteOracleSelectDoesNotRewriteSuccessfulQueries(t *testing.T) {
 			rewriteCalled = true
 			return sqlText, nil
 		},
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -386,6 +399,7 @@ func TestExecuteOracleSelectDoesNotRetryOrdinaryErrors(t *testing.T) {
 			rewriteCalled = true
 			return sqlText, nil
 		},
+		nil,
 	)
 	if !errors.Is(err, originalErr) {
 		t.Fatalf("error = %v, want original error", err)
@@ -409,6 +423,7 @@ func TestExecuteOracleSelectKeepsDecodeErrorWhenNoXMLTypeRewriteApplies(t *testi
 		func(input string) (string, error) {
 			return input, nil
 		},
+		nil,
 	)
 	if !errors.Is(err, originalErr) {
 		t.Fatalf("error = %v, want original error", err)
@@ -2735,8 +2750,13 @@ func TestOracleListTriggersSQLLoadsSourceWithoutLongColumns(t *testing.T) {
 	if strings.Contains(sqlText, "TRIGGER_BODY") {
 		t.Fatalf("trigger listing should avoid Oracle LONG trigger bodies, got: %s", oracleListTriggersSQL)
 	}
-	if !strings.Contains(sqlText, "T.OWNER = :1") || !strings.Contains(sqlText, "T.TABLE_NAME = :2") {
-		t.Fatalf("trigger listing should stay scoped to the selected schema and table, got: %s", oracleListTriggersSQL)
+	// Strict TABLE_OWNER scoping matches every sibling trigger path (the Rust
+	// reader, the Java agent, the DDL loader in this file, DBeaver) and keeps
+	// oracle_table_triggers' inventory OWNER match intact; an OR OWNER branch
+	// would list same-named tables in other schemas and then hard-fail that
+	// inventory check (#13498 review).
+	if !strings.Contains(sqlText, "T.TABLE_OWNER = :1") || !strings.Contains(sqlText, "T.TABLE_NAME = :2") || strings.Contains(sqlText, "T.OWNER = :1") {
+		t.Fatalf("trigger listing should scope strictly by the base table owner and table, got: %s", oracleListTriggersSQL)
 	}
 }
 
@@ -3312,7 +3332,7 @@ func TestIsOracleExtprocAgentFailure(t *testing.T) {
 	}
 }
 
-func TestOracleExtprocFallbackSQL(t *testing.T) {
+func TestOracleGeometryFunctionFallbackSQL(t *testing.T) {
 	sdeColumns := func(schema, table string) ([]oracleColumnMeta, error) {
 		return []oracleColumnMeta{
 			{Name: "ID", DataType: "NUMBER"},
@@ -3320,7 +3340,7 @@ func TestOracleExtprocFallbackSQL(t *testing.T) {
 		}, nil
 	}
 	t.Run("returns placeholder projection for extproc failure", func(t *testing.T) {
-		sqlText, ok := oracleExtprocFallbackSQL(
+		sqlText, ok := oracleGeometryFunctionFallbackSQL(
 			`SELECT * FROM SDE.TEST_GEOM`,
 			sdeColumns,
 			errors.New("ORA-28595: Extproc agent: Invalid DLL Path"),
@@ -3336,7 +3356,7 @@ func TestOracleExtprocFallbackSQL(t *testing.T) {
 		}
 	})
 	t.Run("keeps ST_AsText error for unrelated failures", func(t *testing.T) {
-		sqlText, ok := oracleExtprocFallbackSQL(
+		sqlText, ok := oracleGeometryFunctionFallbackSQL(
 			`SELECT * FROM SDE.TEST_GEOM`,
 			sdeColumns,
 			errors.New("ORA-12170: TNS:Connect timeout occurred"),
@@ -3346,7 +3366,7 @@ func TestOracleExtprocFallbackSQL(t *testing.T) {
 		}
 	})
 	t.Run("no fallback without rewriteable columns", func(t *testing.T) {
-		sqlText, ok := oracleExtprocFallbackSQL(
+		sqlText, ok := oracleGeometryFunctionFallbackSQL(
 			`SELECT * FROM SDE.TEST_GEOM`,
 			func(schema, table string) ([]oracleColumnMeta, error) {
 				return []oracleColumnMeta{{Name: "ID", DataType: "NUMBER"}}, nil
@@ -3358,7 +3378,7 @@ func TestOracleExtprocFallbackSQL(t *testing.T) {
 		}
 	})
 	t.Run("no fallback when column metadata fails", func(t *testing.T) {
-		sqlText, ok := oracleExtprocFallbackSQL(
+		sqlText, ok := oracleGeometryFunctionFallbackSQL(
 			`SELECT * FROM SDE.TEST_GEOM`,
 			func(schema, table string) ([]oracleColumnMeta, error) {
 				return nil, errors.New("ORA-00942: table or view does not exist")
@@ -4268,10 +4288,10 @@ func TestOracleQueryRowsFallsBackToPlaceholderOnExtprocFailure(t *testing.T) {
 		{queryContains: "SDE.ST_AsText", args: []driver.Value{}, err: errors.New("ORA-28595: Extproc agent: Invalid DLL Path")},
 		metadataStep,
 		{
-			queryContains: "'<ST_GEOMETRY>'",
+			queryContains: `SELECT "ID", CASE WHEN "GEOM" IS NULL THEN NULL ELSE '<ST_GEOMETRY>' END AS "GEOM" FROM SDE.TEST_GEOM`,
 			args:          []driver.Value{},
-			columns:       []string{"ID", "GEOM", "__DBX_LARGE_VALUE_BYTES_C_1"},
-			rows:          [][]driver.Value{{int64(1), "<ST_GEOMETRY>", "D:1"}},
+			columns:       []string{"ID", "GEOM"},
+			rows:          [][]driver.Value{{int64(1), "<ST_GEOMETRY>"}},
 		},
 	})
 	s := newServer()
@@ -4281,23 +4301,16 @@ func TestOracleQueryRowsFallsBackToPlaceholderOnExtprocFailure(t *testing.T) {
 		t.Fatalf("expected placeholder fallback to serve rows, got %v", err)
 	}
 	defer rows.Close()
-	columns, err := rows.Columns()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(columns, []string{"ID", "GEOM", "__DBX_LARGE_VALUE_BYTES_C_1"}) {
-		t.Fatalf("unexpected placeholder columns: %v", columns)
-	}
 	if !rows.Next() {
 		t.Fatalf("expected one placeholder row, got %v", rows.Err())
 	}
 	var id int64
-	var geom, marker string
-	if err := rows.Scan(&id, &geom, &marker); err != nil {
+	var geom string
+	if err := rows.Scan(&id, &geom); err != nil {
 		t.Fatal(err)
 	}
-	if id != 1 || geom != "<ST_GEOMETRY>" || marker != "D:1" {
-		t.Fatalf("unexpected placeholder row: %v %v %v", id, geom, marker)
+	if id != 1 || geom != "<ST_GEOMETRY>" {
+		t.Fatalf("unexpected placeholder row: %v %v", id, geom)
 	}
 }
 
