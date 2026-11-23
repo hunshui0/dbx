@@ -32,6 +32,9 @@ export interface DataCompareConfig {
   nullEqualsEmpty?: boolean;
   /** Explicit match columns per source table; absent entry means "use the primary key". */
   keyColumnsByTable: Record<string, string[]>;
+  /** Columns ignored in every table of the compare. */
+  globalIgnoredColumns?: string[];
+  /** Additional ignored columns per source table, merged with the global list. */
   ignoredColumnsByTable?: Record<string, string[]>;
   keyExclusionsByTable?: Record<string, DataCompareKeyExclusion[]>;
   whereConditionsByTable?: Record<string, string>;
@@ -52,6 +55,7 @@ export interface DataCompareConfigSnapshot {
   amountToleranceEnabled?: boolean;
   nullEqualsEmpty?: boolean;
   keyColumnsByTable: Record<string, string[]>;
+  globalIgnoredColumns?: string[];
   ignoredColumnsByTable?: Record<string, string[]>;
   keyExclusionsByTable?: Record<string, DataCompareKeyExclusion[]>;
   whereConditionsByTable?: Record<string, string>;
@@ -106,6 +110,7 @@ function sanitizeConfig(raw: unknown): DataCompareConfig | undefined {
     amountToleranceEnabled: item.amountToleranceEnabled === true,
     nullEqualsEmpty: item.nullEqualsEmpty === true,
     keyColumnsByTable: sanitizeKeyColumns(item.keyColumnsByTable),
+    globalIgnoredColumns: sanitizeStringArray(item.globalIgnoredColumns),
     ignoredColumnsByTable: sanitizeKeyColumns(item.ignoredColumnsByTable),
     keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(item.keyExclusionsByTable),
     whereConditionsByTable: normalizeDataCompareWhereConditions(item.whereConditionsByTable),
@@ -157,6 +162,7 @@ export function useDataCompareConfig() {
       amountToleranceEnabled: snapshot.amountToleranceEnabled === true,
       nullEqualsEmpty: snapshot.nullEqualsEmpty === true,
       keyColumnsByTable: sanitizeKeyColumns(snapshot.keyColumnsByTable),
+      globalIgnoredColumns: sanitizeStringArray(snapshot.globalIgnoredColumns),
       ignoredColumnsByTable: sanitizeKeyColumns(snapshot.ignoredColumnsByTable),
       keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(snapshot.keyExclusionsByTable),
       whereConditionsByTable: normalizeDataCompareWhereConditions(snapshot.whereConditionsByTable),
@@ -182,6 +188,7 @@ export function useDataCompareConfig() {
       ...(patch.amountToleranceEnabled !== undefined ? { amountToleranceEnabled: patch.amountToleranceEnabled === true } : {}),
       ...(patch.nullEqualsEmpty !== undefined ? { nullEqualsEmpty: patch.nullEqualsEmpty === true } : {}),
       ...(patch.keyColumnsByTable ? { keyColumnsByTable: sanitizeKeyColumns(patch.keyColumnsByTable) } : {}),
+      ...(patch.globalIgnoredColumns ? { globalIgnoredColumns: sanitizeStringArray(patch.globalIgnoredColumns) } : {}),
       ...(patch.ignoredColumnsByTable ? { ignoredColumnsByTable: sanitizeKeyColumns(patch.ignoredColumnsByTable) } : {}),
       ...(patch.keyExclusionsByTable ? { keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(patch.keyExclusionsByTable) } : {}),
       ...(patch.whereConditionsByTable !== undefined ? { whereConditionsByTable: normalizeDataCompareWhereConditions(patch.whereConditionsByTable) } : {}),
@@ -218,6 +225,7 @@ export function useDataCompareConfig() {
       updatedAt: now,
       selectedSourceTables: [...source.selectedSourceTables],
       keyColumnsByTable: sanitizeKeyColumns(source.keyColumnsByTable),
+      globalIgnoredColumns: sanitizeStringArray(source.globalIgnoredColumns),
       ignoredColumnsByTable: sanitizeKeyColumns(source.ignoredColumnsByTable),
       keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(source.keyExclusionsByTable),
       whereConditionsByTable: normalizeDataCompareWhereConditions(source.whereConditionsByTable),

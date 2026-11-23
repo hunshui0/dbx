@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildConnectionUrlCopy, connectionSupportsUrlCopy, connectionUrlCopyFormats, type ConnectionUrlCopyConfig } from "@/lib/connection/connectionUrlBuilder";
+import { parseConnectionUrl } from "@/lib/connection/connectionUrl";
 
 function config(overrides: Partial<ConnectionUrlCopyConfig> = {}): ConnectionUrlCopyConfig {
   return { db_type: "postgres", host: "db.example.com", port: 5432, username: "app_user", password: "secret", database: "appdb", url_params: "", ssl: false, ...overrides };
@@ -225,5 +226,34 @@ describe("TDengine connection URL copy", () => {
     const secure = config({ db_type: "tdengine", host: "td.example.com", port: 6041, username: "root", password: "secret", database: "power", ssl: true });
     expect(buildConnectionUrlCopy(secure, "url")).toBe("taoswss://root@td.example.com:6041/power?useSSL=true");
     expect(buildConnectionUrlCopy(secure, "jdbcUrl")).toBe("jdbc:TAOS-RS://td.example.com:6041/power?useSSL=true");
+  });
+});
+
+describe("InfluxDB connection URL copy", () => {
+  it("copies the API base path instead of the database name", () => {
+    const connection = config({ db_type: "influxdb", host: "influx.example.com", port: 8086, username: "", password: "token", database: "metrics", external_config: { basePath: "/influxdb" } });
+
+    expect(buildConnectionUrlCopy(connection, "url")).toBe("http://influx.example.com:8086/influxdb");
+  });
+
+  it("omits the path when no base path is configured", () => {
+    const connection = config({ db_type: "influxdb3", host: "influx.example.com", port: 8181, username: "", password: "token", database: "metrics" });
+
+    expect(buildConnectionUrlCopy(connection, "url")).toBe("http://influx.example.com:8181");
+  });
+
+  it("round-trips the copied URL back into the base path", () => {
+    const connection = config({ db_type: "influxdb", host: "influx.example.com", port: 8086, username: "", password: "token", database: "metrics", external_config: { basePath: "/influxdb/" } });
+    const copied = buildConnectionUrlCopy(connection, "url")!;
+
+    expect(parseConnectionUrl(copied, "influxdb").basePath).toBe("/influxdb");
+  });
+
+  it("does not fall back to the base path alias when the first key is null", () => {
+    // The driver stops at the first present key, so the copied URL must not
+    // advertise a prefix the driver would not request.
+    const connection = config({ db_type: "influxdb", host: "influx.example.com", port: 8086, username: "", password: "token", database: "metrics", external_config: { basePath: null, base_path: "/influxdb" } });
+
+    expect(buildConnectionUrlCopy(connection, "url")).toBe("http://influx.example.com:8086");
   });
 });

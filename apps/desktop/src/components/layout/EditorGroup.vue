@@ -17,6 +17,8 @@ import { mayContainDmlStatement } from "@/lib/sql/dmlChangePreview";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { isOracleFamilyTypeSource } from "@/lib/database/databaseObjectCapabilities";
 import { usesProvenReadOnlyStickyTransactionState } from "@/lib/database/databaseFeatureSupport";
+import { copyToClipboard } from "@/lib/common/clipboard";
+import { firstResultCellValue } from "@/lib/query/queryResultFirstValue";
 import * as api from "@/lib/backend/api";
 import { externalSqlEditorMaxBytes, externalSqlFileOpenErrorMessage } from "@/lib/sql/sqlFileOpen";
 import { GROUP_TAB_BAR_PORTAL } from "./groupTabBarPortal";
@@ -83,6 +85,15 @@ defineExpose({
   focusWhere: () => activeSurfaceRef.value?.focusWhere() ?? false,
   openGoToColumn: () => activeSurfaceRef.value?.openGoToColumn() ?? false,
   openTableStructureEditor: (initialTab?: TableInfoTab) => activeSurfaceRef.value?.openTableStructureEditor?.(initialTab) ?? false,
+  commitTransaction: () => toolbarRef.value?.commitFromToolbar() ?? false,
+  copyResultColumn: (column: number) => {
+    const cell = firstResultCellValue(activeTab.value?.result, column);
+    if (!cell) return false;
+    void copyToClipboard(cell.value)
+      .then(() => toast(t("grid.resultColumnCopied", { column: cell.column })))
+      .catch((error: unknown) => toast(error instanceof Error ? error.message : String(error), 5000));
+    return true;
+  },
   refreshData: () => activeSurfaceRef.value?.refreshData() ?? false,
   toggleResultsPane: () => activeSurfaceRef.value?.toggleResultsPane() ?? false,
   refreshQueryEditorCompletionCache: () => activeSurfaceRef.value?.refreshQueryEditorCompletionCache() ?? false,
@@ -259,6 +270,7 @@ const groupExecutableSqlMayContainDml = computed(() => mayContainDmlStatement(gr
         @format-sql="activeTab && toolbar.formatSql(activeTab.id)"
         @compress-sql="activeTab && toolbar.compressSql(activeTab.id)"
         @fold-all="activeSurfaceRef?.foldAll?.()"
+        @toggle-line-comment="activeSurfaceRef?.toggleLineComment?.()"
         @unfold-all="activeSurfaceRef?.unfoldAll?.()"
         @toggle-sql-keyword-case="activeTab && toolbar.toggleSqlKeywordCase(activeTab.id)"
         @save-sql="(tabId: string) => toolbar.saveSql(tabId)"

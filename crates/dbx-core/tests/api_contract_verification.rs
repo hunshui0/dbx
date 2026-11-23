@@ -200,6 +200,7 @@ fn data_compare_preparation_field_names() {
         result: DataCompareResult {
             tolerance_matches: Vec::new(),
             null_empty_matches: Vec::new(),
+            ignored_only_count: 0,
             added: vec![DataCompareRow {
                 key: "1".to_string(),
                 key_values: [("id".to_string(), Value::Number(1.into()))].into(),

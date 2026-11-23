@@ -245,6 +245,7 @@ fn data_compare_from_tables_preparation_optional_fields_default() {
             added: vec![],
             removed: vec![],
             modified: vec![],
+            ignored_only_count: 0,
         },
         sync_statements: vec![],
         sync_sql: String::new(),
@@ -319,6 +320,7 @@ fn incomplete_data_compare_cannot_generate_sync_sql() {
             diff: DataCompareResult {
                 tolerance_matches: Vec::new(),
                 null_empty_matches: Vec::new(),
+                ignored_only_count: 0,
                 added: vec![DataCompareRow {
                     key: "1".to_string(),
                     key_values: HashMap::from([(String::from("id"), serde_json::json!(1))]),
@@ -348,6 +350,7 @@ fn data_compare_preparation_format_stable() {
             added: vec![],
             removed: vec![],
             modified: vec![],
+            ignored_only_count: 0,
         },
         sync_statements: vec!["INSERT INTO t VALUES (1)".to_string()],
         sync_sql: "INSERT INTO t VALUES (1)".to_string(),

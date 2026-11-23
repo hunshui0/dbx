@@ -11,6 +11,7 @@ import {
   normalizeKeyColumns,
   normalizeDataCompareKeyExclusionsByTable,
   normalizeDataCompareWhereConditions,
+  resolveEffectiveIgnoredColumns,
   type DataCompareKeyExclusion,
   type DataCompareFromTablesPreparation,
   type DataCompareMode,
@@ -53,6 +54,8 @@ export interface DataCompareTableResult {
   added: number;
   removed: number;
   modified: number;
+  /** Rows differing only in ignored columns; identical for diff and sync purposes. */
+  ignoredOnlyCount: number;
   sourceRowCount: number;
   targetRowCount: number;
   sourceTruncated: boolean;
@@ -93,6 +96,11 @@ export interface DataCompareSessionConfig {
    * again — it must not silently fall back to the primary key.
    */
   keyColumnsByTable: Record<string, string[]>;
+  /**
+   * Columns ignored in every table of this compare. Absent/empty means nothing is globally ignored.
+   */
+  globalIgnoredColumns?: string[];
+  /** Additional ignored columns per source table, merged with the global list. */
   ignoredColumnsByTable?: Record<string, string[]>;
   keyExclusionsByTable?: Record<string, DataCompareKeyExclusion[]>;
   whereConditionsByTable?: Record<string, string>;
@@ -157,10 +165,26 @@ function cloneConfig(config: DataCompareSessionConfig): DataCompareSessionConfig
     targetSchemas: [...config.targetSchemas],
     targetTables: [...config.targetTables],
     keyColumnsByTable: normalizeKeyColumnOverrides(config.keyColumnsByTable),
+    globalIgnoredColumns: config.globalIgnoredColumns ? normalizeKeyColumns(config.globalIgnoredColumns) : [],
     ignoredColumnsByTable: normalizeKeyColumnOverrides(config.ignoredColumnsByTable),
     keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(config.keyExclusionsByTable),
     whereConditionsByTable: normalizeDataCompareWhereConditions(config.whereConditionsByTable),
   };
+}
+
+/**
+ * Normalizes a per-table ignored-column map so a cloned session never shares
+ * arrays with the caller. Same shape as the match-column overrides; an absent
+ * entry and an empty array both mean "nothing extra ignored for this table".
+ */
+export function normalizeIgnoredColumnOverrides(overrides: Record<string, string[] | undefined> | null | undefined): Record<string, string[]> {
+  const normalized: Record<string, string[]> = {};
+  for (const [table, columns] of Object.entries(overrides ?? {})) {
+    if (!table) continue;
+    const normalizedColumns = normalizeKeyColumns(columns ?? []);
+    if (normalizedColumns.length > 0) normalized[table] = normalizedColumns;
+  }
+  return normalized;
 }
 
 /**
@@ -285,6 +309,7 @@ function buildTableResult(task: DataCompareTableTask, preparation: DataCompareFr
     added,
     removed,
     modified,
+    ignoredOnlyCount: preparation.result.ignoredOnlyCount ?? 0,
     sourceRowCount: preparation.sourceRowCount,
     targetRowCount: preparation.targetRowCount,
     sourceTruncated: preparation.sourceTruncated,
@@ -311,6 +336,7 @@ function buildMissingTargetResult(task: DataCompareTableTask, preparation: DataC
     added: preparation.result.added.length,
     removed: 0,
     modified: 0,
+    ignoredOnlyCount: 0,
     sourceRowCount: preparation.sourceRowCount,
     targetRowCount: 0,
     sourceTruncated: preparation.sourceTruncated,
@@ -336,6 +362,7 @@ function buildErrorResult(task: DataCompareTableTask, keyColumns: string[], data
     added: 0,
     removed: 0,
     modified: 0,
+    ignoredOnlyCount: 0,
     sourceRowCount: 0,
     targetRowCount: 0,
     sourceTruncated: false,
@@ -394,7 +421,14 @@ async function runDataCompareSession(session: DataCompareSession, tasks: DataCom
           const targetColumns = await loadColumnsWithCache(targetColumnCache, input.targetConnectionId, input.targetDatabase, input.targetSchema, task.targetTable);
           const ignoredKeys = resolvedKeys.filter((key) => ignoredColumns.some((ignored) => ignored.toLowerCase() === key.toLowerCase()));
           if (ignoredKeys.length) throw new Error(compareErrorMessage(dependencies, "ignoredKeyColumns", ignoredKeys.join(", ")));
-          const matched = intersectCompareColumns(sourceColumns, targetColumns, ignoredColumns);
+          const allMatched = intersectCompareColumns(sourceColumns, targetColumns);
+          const globalIgnored = resolveEffectiveIgnoredColumns({
+            globalIgnoredColumns: input.globalIgnoredColumns ?? [],
+            columns: allMatched.columns,
+            keyColumns: resolvedKeys,
+          });
+          const effectiveIgnoredColumns = normalizeKeyColumns([...ignoredColumns, ...globalIgnored]);
+          const matched = intersectCompareColumns(sourceColumns, targetColumns, effectiveIgnoredColumns);
           const columns = matched.columns;
           const columnInfo = columns.map((column) => targetColumns.find((target) => target.name === column)).filter((column): column is CompareColumn => !!column);
           const canonicalKeyColumns: string[] = [];
@@ -418,7 +452,7 @@ async function runDataCompareSession(session: DataCompareSession, tasks: DataCom
             targetTable: task.targetTable,
             columns,
             keyColumns: canonicalKeyColumns,
-            ignoredColumns,
+            ignoredColumns: effectiveIgnoredColumns,
             keyExclusions,
             ...(whereCondition ? { whereCondition } : {}),
             sourceColumns: matched.sourceColumns,
@@ -428,7 +462,7 @@ async function runDataCompareSession(session: DataCompareSession, tasks: DataCom
             amountToleranceEnabled: input.amountToleranceEnabled === true,
           });
           keyColumns = canonicalKeyColumns;
-          results.push({ ...buildTableResult(task, preparation, canonicalKeyColumns, columns, columnInfo, databaseType, ignoredColumns), keyExclusions, whereCondition, nullEqualsEmpty: input.nullEqualsEmpty === true, amountToleranceEnabled: input.amountToleranceEnabled === true });
+          results.push({ ...buildTableResult(task, preparation, canonicalKeyColumns, columns, columnInfo, databaseType, effectiveIgnoredColumns), keyExclusions, whereCondition, nullEqualsEmpty: input.nullEqualsEmpty === true, amountToleranceEnabled: input.amountToleranceEnabled === true });
         } else {
           const sourceColumns = await loadColumnsWithCache(sourceColumnCache, input.sourceConnectionId, input.sourceDatabase, input.sourceSchema, task.sourceTable);
           const resolvedKeys = configuredTaskKeyColumns(input, task) ?? [];
@@ -436,6 +470,12 @@ async function runDataCompareSession(session: DataCompareSession, tasks: DataCom
           keyColumns = resolvedKeys.map((key) => matchColumnNameIgnoreCase(key, sourceColumnNames) ?? key);
           const ignoredKeys = keyColumns.filter((key) => ignoredColumns.some((ignored) => ignored.toLowerCase() === key.toLowerCase()));
           if (ignoredKeys.length) throw new Error(compareErrorMessage(dependencies, "ignoredKeyColumns", ignoredKeys.join(", ")));
+          const globalIgnored = resolveEffectiveIgnoredColumns({
+            globalIgnoredColumns: input.globalIgnoredColumns ?? [],
+            columns: sourceColumnNames,
+            keyColumns,
+          });
+          const effectiveIgnoredColumns = normalizeKeyColumns([...ignoredColumns, ...globalIgnored]);
           const preparation = await api.prepareDataCompareMissingTarget({
             sourceConnectionId: input.sourceConnectionId,
             sourceDatabase: input.sourceDatabase,
@@ -446,14 +486,14 @@ async function runDataCompareSession(session: DataCompareSession, tasks: DataCom
             targetSchema: input.targetSchema,
             targetTable: task.targetTable,
             keyColumns,
-            ignoredColumns,
+            ignoredColumns: effectiveIgnoredColumns,
             keyExclusions,
             ...(whereCondition ? { whereCondition } : {}),
             degradationThreshold: dataCompareThreshold(input.sampleSize),
             compareMode: input.compareMode,
           });
-          const comparedSourceColumns = sourceColumns.filter((column) => !ignoredColumns.some((ignored) => ignored.toLowerCase() === column.name.toLowerCase()));
-          results.push({ ...buildMissingTargetResult(task, preparation, comparedSourceColumns, keyColumns, databaseType, ignoredColumns), keyExclusions, whereCondition, nullEqualsEmpty: input.nullEqualsEmpty === true, amountToleranceEnabled: input.amountToleranceEnabled === true });
+          const comparedSourceColumns = sourceColumns.filter((column) => !effectiveIgnoredColumns.some((ignored) => ignored.toLowerCase() === column.name.toLowerCase()));
+          results.push({ ...buildMissingTargetResult(task, preparation, comparedSourceColumns, keyColumns, databaseType, effectiveIgnoredColumns), keyExclusions, whereCondition, nullEqualsEmpty: input.nullEqualsEmpty === true, amountToleranceEnabled: input.amountToleranceEnabled === true });
         }
       } catch (error: unknown) {
         results.push({ ...buildErrorResult(task, keyColumns, databaseType, error), ignoredColumns, keyExclusions, whereCondition });
