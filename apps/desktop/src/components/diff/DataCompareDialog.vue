@@ -30,6 +30,7 @@ import {
   normalizeDataCompareSampleSize,
   normalizeKeyColumns,
   normalizeDataCompareKeyExclusionsByTable,
+  normalizeDataCompareTrimStrings,
   normalizeDataCompareWhereConditions,
   resolveEffectiveIgnoredColumns,
   sameKeyColumns,
@@ -160,6 +161,7 @@ const globalIgnoredColumns = ref<string[]>([]);
 const ignoredColumnOverrides = ref<Record<string, string[]>>({});
 const keyExclusionOverrides = ref<Record<string, DataCompareKeyExclusion[]>>({});
 const whereConditionOverrides = ref<Record<string, string>>({});
+const trimStringsOverrides = ref<Record<string, boolean>>({});
 /** Column metadata per source table, keyed by table name; cleared with the source endpoint. */
 const tableColumns = ref<Record<string, CompareKeyColumnOption[]>>({});
 const tableColumnErrors = ref<Record<string, string>>({});
@@ -518,6 +520,7 @@ function pruneKeyColumnState(tables: string[]) {
   ignoredColumnOverrides.value = Object.fromEntries(Object.entries(ignoredColumnOverrides.value).filter(([table]) => keep.has(table)));
   keyExclusionOverrides.value = Object.fromEntries(Object.entries(keyExclusionOverrides.value).filter(([table]) => keep.has(table)));
   whereConditionOverrides.value = Object.fromEntries(Object.entries(whereConditionOverrides.value).filter(([table]) => keep.has(table)));
+  trimStringsOverrides.value = Object.fromEntries(Object.entries(trimStringsOverrides.value).filter(([table]) => keep.has(table)));
   const nextOverrides: Record<string, string[]> = {};
   let overridesChanged = false;
   for (const [table, columns] of Object.entries(keyColumnOverrides.value)) {
@@ -645,6 +648,7 @@ async function restoreDataCompareSession(session: DataCompareSession): Promise<v
     ignoredColumnOverrides.value = normalizeKeyColumnOverrides(config.ignoredColumnsByTable);
     keyExclusionOverrides.value = normalizeDataCompareKeyExclusionsByTable(config.keyExclusionsByTable);
     whereConditionOverrides.value = normalizeDataCompareWhereConditions(config.whereConditionsByTable);
+    trimStringsOverrides.value = normalizeDataCompareTrimStrings(config.trimStringsByTable);
     resetTableColumnMetadata();
     batchResults.value = session.batchResults;
     syncPlan.value = session.syncPlan;
@@ -681,6 +685,7 @@ function dataCompareConfigSnapshot(): DataCompareConfigSnapshot {
     ignoredColumnsByTable: buildSessionIgnoredColumnsByTable(),
     keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(keyExclusionOverrides.value),
     whereConditionsByTable: normalizeDataCompareWhereConditions(whereConditionOverrides.value),
+    trimStringsByTable: normalizeDataCompareTrimStrings(trimStringsOverrides.value),
   };
 }
 
@@ -743,6 +748,7 @@ async function applyDataCompareConfig(config: DataCompareConfig): Promise<void> 
     ignoredColumnOverrides.value = normalizeKeyColumnOverrides(config.ignoredColumnsByTable);
     keyExclusionOverrides.value = normalizeDataCompareKeyExclusionsByTable(config.keyExclusionsByTable);
     whereConditionOverrides.value = normalizeDataCompareWhereConditions(config.whereConditionsByTable);
+    trimStringsOverrides.value = normalizeDataCompareTrimStrings(config.trimStringsByTable);
     resetTableColumnMetadata();
     if (config.detailPreviewLimit) detailPreviewLimit.value = config.detailPreviewLimit;
     void prefetchSelectedTableColumns(selectedSourceTableNames.value);
@@ -839,6 +845,7 @@ function swapSourceTarget() {
   ignoredColumnOverrides.value = {};
   keyExclusionOverrides.value = {};
   whereConditionOverrides.value = {};
+  trimStringsOverrides.value = {};
   resetTableColumnMetadata();
   clearResult();
   void nextTick(() => {
@@ -1105,6 +1112,14 @@ function ignoredColumnsForTable(table: string): string[] {
   return ignoredColumnOverrides.value[table] ?? [];
 }
 
+function setTableTrimStrings(table: string, enabled: boolean): void {
+  const next = { ...trimStringsOverrides.value };
+  if (enabled) next[table] = true;
+  else delete next[table];
+  trimStringsOverrides.value = next;
+  clearResult();
+}
+
 function setKeyExclusions(table: string, rules: DataCompareKeyExclusion[]): void {
   keyExclusionOverrides.value = normalizeDataCompareKeyExclusionsByTable({ ...keyExclusionOverrides.value, [table]: rules });
   clearResult();
@@ -1211,6 +1226,7 @@ function startCompare(): void {
       ignoredColumnsByTable: buildSessionIgnoredColumnsByTable(),
       keyExclusionsByTable: normalizeDataCompareKeyExclusionsByTable(keyExclusionOverrides.value),
       whereConditionsByTable: normalizeDataCompareWhereConditions(whereConditionOverrides.value),
+      trimStringsByTable: normalizeDataCompareTrimStrings(trimStringsOverrides.value),
       compareMode: compareMode.value,
       amountToleranceEnabled: amountToleranceEnabled.value,
       nullEqualsEmpty: nullEqualsEmpty.value,
@@ -1549,6 +1565,7 @@ watch(
     JSON.stringify(ignoredColumnOverrides.value),
     JSON.stringify(keyExclusionOverrides.value),
     JSON.stringify(whereConditionOverrides.value),
+    JSON.stringify(trimStringsOverrides.value),
   ],
   () => {
     if (suppressConfigSave || initializingPrefill || !dataCompareConfigId.value) return;
@@ -1811,6 +1828,20 @@ onBeforeUnmount(() => {
                 :disabled="comparing || executionLocked"
                 @update:model-value="(rules) => setKeyExclusions(singleKeyColumnRow!.table, rules)"
               />
+              <div class="rounded-md border bg-muted/20 px-2.5 py-2 space-y-1" :data-trim-strings-table="singleKeyColumnRow.table">
+                <label class="flex items-center gap-2 text-xs font-medium">
+                  <input
+                    :checked="trimStringsOverrides[singleKeyColumnRow.table] === true"
+                    type="checkbox"
+                    class="h-3.5 w-3.5 accent-primary"
+                    :disabled="comparing || executionLocked"
+                    :data-trim-strings-checkbox="singleKeyColumnRow.table"
+                    @change="(event) => setTableTrimStrings(singleKeyColumnRow!.table, (event.target as HTMLInputElement).checked)"
+                  />
+                  {{ t("dataCompare.trimStrings") }}
+                </label>
+                <p class="text-[11px] text-muted-foreground">{{ t("dataCompare.trimStringsHint") }}</p>
+              </div>
             </div>
 
             <!-- Batch compare: every table keeps its own match columns. -->
@@ -1826,6 +1857,7 @@ onBeforeUnmount(() => {
                       <ChevronRight v-else class="h-3.5 w-3.5 shrink-0" />
                       <span class="min-w-0 flex-1 truncate font-mono">{{ row.table }}</span>
                       <span v-if="whereConditionOverrides[row.table]?.trim()" class="shrink-0 text-[10px] text-primary" :title="whereConditionOverrides[row.table]">{{ t("dataCompare.whereConditionActive") }}</span>
+                      <span v-if="trimStringsOverrides[row.table]" class="shrink-0 text-[10px] text-primary">{{ t("dataCompare.trimStringsActive") }}</span>
                       <span class="min-w-0 max-w-[45%] shrink-0 truncate font-mono" :class="row.columns.length > 0 ? (row.manual ? 'text-foreground' : 'text-muted-foreground') : 'text-destructive'">
                         {{ row.loading ? t("dataCompare.keyColumnsLoading") : row.columns.length > 0 ? row.columns.join(", ") : t("dataCompare.keyColumnsNeedsSelection") }}
                       </span>
@@ -1837,6 +1869,20 @@ onBeforeUnmount(() => {
                       <CompareKeyColumnsSelect :model-value="row.columns" :columns="columnsForTable(row.table)" :loading="row.loading" :disabled="comparing || executionLocked" @update:model-value="(columns) => setTableKeyColumns(row.table, columns)" />
                       <CompareTableCondition v-model="whereConditionOverrides[row.table]" :table="row.table" :disabled="comparing || executionLocked" />
                       <CompareKeyExclusions :model-value="keyExclusionOverrides[row.table] ?? []" :columns="row.columns" :column-info="columnsForTable(row.table)" :disabled="comparing || executionLocked" @update:model-value="(rules) => setKeyExclusions(row.table, rules)" />
+                      <div class="rounded-md border bg-muted/20 px-2 py-1.5 space-y-1" :data-trim-strings-table="row.table">
+                        <label class="flex items-center gap-2 text-xs font-medium">
+                          <input
+                            :checked="trimStringsOverrides[row.table] === true"
+                            type="checkbox"
+                            class="h-3.5 w-3.5 accent-primary"
+                            :disabled="comparing || executionLocked"
+                            :data-trim-strings-checkbox="row.table"
+                            @change="(event) => setTableTrimStrings(row.table, (event.target as HTMLInputElement).checked)"
+                          />
+                          {{ t("dataCompare.trimStrings") }}
+                        </label>
+                        <p class="text-[11px] text-muted-foreground">{{ t("dataCompare.trimStringsHint") }}</p>
+                      </div>
                       <div class="flex flex-wrap items-center gap-2 text-[11px]">
                         <span data-key-column-hint :class="row.error || (row.status === 'missing' && row.matched) ? 'text-destructive' : 'text-muted-foreground'">{{ row.hint }}</span>
                         <Button v-if="row.manual" size="sm" variant="ghost" class="h-6 px-1.5 text-[11px]" :disabled="comparing || executionLocked" @click="clearTableKeyColumnsOverride(row.table)">
@@ -2086,6 +2132,7 @@ onBeforeUnmount(() => {
                           <div v-if="item.ignoredColumns?.length" class="mt-1">{{ t("dataCompare.ignoredColumns") }}: {{ item.ignoredColumns.join(", ") }}</div>
                           <div v-if="item.amountToleranceEnabled" class="mt-1 text-amber-700 dark:text-amber-400">{{ t("dataCompare.amountToleranceActive") }}</div>
                           <div v-if="item.nullEqualsEmpty" class="mt-1 text-amber-700 dark:text-amber-400">{{ t("dataCompare.nullEqualsEmpty") }}</div>
+                          <div v-if="item.trimStrings" class="mt-1 text-amber-700 dark:text-amber-400">{{ t("dataCompare.trimStrings") }}</div>
                           <div v-if="item.diff.toleranceMatches?.length" class="mt-1 font-medium text-amber-700 dark:text-amber-400">
                             {{ t("dataCompare.toleranceMatchedSummary", { rows: item.diff.toleranceMatches.length, cells: item.diff.toleranceMatches.reduce((count, row) => count + row.changes.length, 0) }) }}
                           </div>

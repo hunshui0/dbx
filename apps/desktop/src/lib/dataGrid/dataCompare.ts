@@ -178,6 +178,7 @@ export function buildDataCompareToleranceWorksheets(tables: ReadonlyArray<{ sour
 
 export interface DataCompareReportTable {
   nullEqualsEmpty?: boolean;
+  trimStrings?: boolean;
   amountToleranceEnabled?: boolean;
   sourceTable: string;
   targetTable: string;
@@ -292,6 +293,7 @@ export function buildDataCompareReportMarkdown(options: DataCompareReportOptions
         modifiedCount: table.diff.modified.length,
         amountTolerance: table.amountToleranceEnabled ? DATA_COMPARE_AMOUNT_TOLERANCE : null,
         nullEqualsEmpty: table.nullEqualsEmpty === true,
+        trimStrings: table.trimStrings === true,
         nullEmptyMatchedRows: table.diff.nullEmptyMatches?.length ?? 0,
         toleranceMatchedRows: table.diff.toleranceMatches?.length ?? 0,
         ...(table.error ? { error: table.error } : {}),
@@ -349,6 +351,7 @@ export interface DataComparePreparation {
 
 export interface DataCompareFromTablesOptions {
   nullEqualsEmpty?: boolean;
+  trimStrings?: boolean;
   amountToleranceEnabled?: boolean;
   sourceConnectionId: string;
   sourceDatabase: string;
@@ -578,4 +581,15 @@ export function auditColumnCandidates(columns: readonly string[]): string[] {
  */
 export function ignoredColumnsWithoutMatch(names: readonly string[], columnLists: readonly (readonly string[])[]): string[] {
   return names.filter((name) => !columnLists.some((columns) => matchColumnNameIgnoreCase(name, [...columns]) !== undefined));
+}
+
+export function normalizeDataCompareTrimStrings(value: unknown): Record<string, boolean> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const result: Record<string, boolean> = {};
+  for (const [table, enabled] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof table === "string" && table && enabled === true) {
+      result[table] = true;
+    }
+  }
+  return result;
 }

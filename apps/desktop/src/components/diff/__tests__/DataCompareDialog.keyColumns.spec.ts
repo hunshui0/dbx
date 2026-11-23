@@ -653,4 +653,27 @@ describe("DataCompareDialog match columns", () => {
     expect(options.sourceColumns).toEqual(["snid", "username"]);
     expect(document.body.textContent).not.toContain(i18n.global.t("dataCompare.missingKeyColumns", { columns: "snid" }));
   });
+
+  it("lets each table opt into trimming string whitespace independently", async () => {
+    setupMocks();
+    await openWithPrefilledSource("USERS");
+
+    const singleCheckbox = document.querySelector<HTMLInputElement>('[data-trim-strings-checkbox="USERS"]');
+    expect(singleCheckbox?.checked).toBe(false);
+    singleCheckbox!.checked = true;
+    singleCheckbox!.dispatchEvent(new Event("change", { bubbles: true }));
+    await flushAsyncSetup();
+
+    tableSelectionRow("ORDERS")?.click();
+    await flushAsyncSetup();
+
+    expect(keyColumnRow("USERS")?.textContent).toContain(i18n.global.t("dataCompare.trimStringsActive"));
+    expect(keyColumnRow("ORDERS")?.textContent).not.toContain(i18n.global.t("dataCompare.trimStringsActive"));
+
+    compareButton()?.click();
+    await flushAsyncSetup();
+
+    expect(mocks.prepareDataCompareFromTables.mock.calls[0]?.[0]).toMatchObject({ sourceTable: "USERS", trimStrings: true });
+    expect(mocks.prepareDataCompareFromTables.mock.calls[1]?.[0]).toMatchObject({ sourceTable: "ORDERS", trimStrings: false });
+  });
 });

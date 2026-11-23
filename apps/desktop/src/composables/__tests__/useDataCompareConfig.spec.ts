@@ -236,6 +236,23 @@ describe("per-table comparison search conditions", () => {
     expect(restored.configs.value.find((item) => item.id === created.id)?.whereConditionsByTable).toEqual({});
   });
 
+  it("saves, restores, duplicates and clears independent per-table trim flags", async () => {
+    const { useDataCompareConfig } = await import("../useDataCompareConfig");
+    const state = useDataCompareConfig();
+    const trimFlags = { users: true, orders: false };
+    const created = state.createConfig("Trimmed", snapshot({ trimStringsByTable: trimFlags }));
+    const copy = state.duplicateConfig(created.id)!;
+    trimFlags.users = false;
+    copy.trimStringsByTable!.orders = true;
+    expect(created.trimStringsByTable).toEqual({ users: true });
+    vi.resetModules();
+    const { useDataCompareConfig: restore } = await import("../useDataCompareConfig");
+    const restored = restore();
+    expect(restored.configs.value.find((item) => item.id === created.id)?.trimStringsByTable).toEqual({ users: true });
+    restored.updateConfig(created.id, { trimStringsByTable: {} });
+    expect(restored.configs.value.find((item) => item.id === created.id)?.trimStringsByTable).toEqual({});
+  });
+
   it("loads old configurations without adding a filter", async () => {
     localStorage.setItem(CONFIG_KEY, JSON.stringify([{ ...snapshot(), id: "old", name: "Old" }]));
     const { useDataCompareConfig } = await import("../useDataCompareConfig");

@@ -62,6 +62,8 @@ pub struct DataCompareKeyExclusion {
 pub struct CompareDataRowsOptions {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub null_equals_empty: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trim_strings: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub numeric_tolerance_columns: Vec<String>,
     pub columns: Vec<String>,
@@ -99,6 +101,8 @@ pub struct DataComparePreparationOptions {
 pub struct DataCompareFromTablesOptions {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub null_equals_empty: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trim_strings: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub amount_tolerance_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -415,7 +419,7 @@ pub struct VerifyDataResult {
 }
 
 pub fn prepare_data_compare(options: DataComparePreparationOptions) -> Result<DataComparePreparation, String> {
-    prepare_data_compare_where(options, "", Vec::new(), false)
+    prepare_data_compare_where(options, "", Vec::new(), false, false)
 }
 
 fn prepare_data_compare_where(
@@ -423,6 +427,7 @@ fn prepare_data_compare_where(
     where_condition: &str,
     numeric_tolerance_columns: Vec<String>,
     null_equals_empty: bool,
+    trim_strings: bool,
 ) -> Result<DataComparePreparation, String> {
     let DataComparePreparationOptions {
         table_name,
@@ -437,6 +442,7 @@ fn prepare_data_compare_where(
     } = options;
     let result = compare_data_rows(CompareDataRowsOptions {
         null_equals_empty,
+        trim_strings,
         numeric_tolerance_columns,
         columns: columns.clone(),
         key_columns: key_columns.clone(),
@@ -693,7 +699,7 @@ pub async fn prepare_data_compare_from_tables(
                 let tgt = normalize_numeric_compare_rows(&columns, tgt, &numeric_columns);
                 let column_indexes = column_index_map(&columns);
                 let (src, tgt) = pair_sample_rows_by_key(src, tgt, source_row_count, target_row_count, |row| {
-                    key_for_row(row, &options.key_columns, &column_indexes)
+                    key_for_row(row, &options.key_columns, &column_indexes, options.trim_strings)
                 });
                 let max_count = source_row_count.max(target_row_count);
                 let sample_rate =
@@ -719,12 +725,12 @@ pub async fn prepare_data_compare_from_tables(
     // `columns` has already excluded ignored and binary columns, so checksums judge
     // the exact scope that the diff judges.
     let source_checksums = if enable_checksum && !source_rows.is_empty() {
-        Some(compute_column_checksums(&columns, &source_rows))
+        Some(compute_column_checksums(&columns, &source_rows, options.trim_strings))
     } else {
         None
     };
     let target_checksums = if enable_checksum && !target_rows.is_empty() {
-        Some(compute_column_checksums(&columns, &target_rows))
+        Some(compute_column_checksums(&columns, &target_rows, options.trim_strings))
     } else {
         None
     };
@@ -756,6 +762,7 @@ pub async fn prepare_data_compare_from_tables(
             Vec::new()
         },
         options.null_equals_empty,
+        options.trim_strings,
     )?;
 
     let (sync_statements, sync_sql) =
@@ -1076,10 +1083,22 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
     }
 
     let column_indexes = column_index_map(&options.columns);
-    let (source, source_order) =
-        collect_compare_rows(&options.columns, &options.key_columns, &column_indexes, options.source_rows, "source")?;
-    let (target, target_order) =
-        collect_compare_rows(&options.columns, &options.key_columns, &column_indexes, options.target_rows, "target")?;
+    let (source, source_order) = collect_compare_rows(
+        &options.columns,
+        &options.key_columns,
+        &column_indexes,
+        options.source_rows,
+        "source",
+        options.trim_strings,
+    )?;
+    let (target, target_order) = collect_compare_rows(
+        &options.columns,
+        &options.key_columns,
+        &column_indexes,
+        options.target_rows,
+        "target",
+        options.trim_strings,
+    )?;
     let key_columns: HashSet<&str> = options.key_columns.iter().map(String::as_str).collect();
     let ignored_columns = resolve_ignored_columns(&options.columns, &options.ignored_columns, &options.key_columns);
 
@@ -1109,7 +1128,9 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
             let Some(index) = column_indexes.get(column.as_str()).copied() else { continue };
             let source_value = row_value(source_values, index);
             let target_value = row_value(target_values, index);
-            if source_value == target_value {
+            let source_cmp = compare_value_for_trim(source_value, options.trim_strings);
+            let target_cmp = compare_value_for_trim(target_value, options.trim_strings);
+            if source_cmp == target_cmp {
                 continue;
             }
             if ignored_columns.contains(column.as_str()) {
@@ -1117,8 +1138,8 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
                 continue;
             }
             if options.null_equals_empty
-                && ((source_value.is_null() && target_value.as_str() == Some(""))
-                    || (target_value.is_null() && source_value.as_str() == Some("")))
+                && ((source_cmp.is_null() && target_cmp.as_str() == Some(""))
+                    || (target_cmp.is_null() && source_cmp.as_str() == Some("")))
             {
                 null_empty.push(DataCompareChangedCell {
                     column: column.clone(),
@@ -1129,7 +1150,7 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
             }
             if let Some(absolute_difference) = tolerance_columns
                 .contains(column.as_str())
-                .then(|| numeric_difference_within_cent(source_value, target_value))
+                .then(|| numeric_difference_within_cent(&source_cmp, &target_cmp))
                 .flatten()
             {
                 tolerated.push(DataCompareToleratedCell {
@@ -1146,10 +1167,15 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
                 });
             }
         }
+        let matched_key_values = if options.trim_strings {
+            key_values_for_row(target_values, &options.key_columns, &column_indexes)
+        } else {
+            key_values_for_row(source_values, &options.key_columns, &column_indexes)
+        };
         if !tolerated.is_empty() {
             tolerance_matches.push(DataCompareToleranceMatch {
                 key: key.clone(),
-                key_values: key_values_for_row(source_values, &options.key_columns, &column_indexes),
+                key_values: matched_key_values.clone(),
                 source_values: row_object(&options.columns, source_values),
                 target_values: row_object(&options.columns, target_values),
                 changes: tolerated,
@@ -1158,7 +1184,7 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
         if !null_empty.is_empty() {
             null_empty_matches.push(DataCompareNullEmptyMatch {
                 key: key.clone(),
-                key_values: key_values_for_row(source_values, &options.key_columns, &column_indexes),
+                key_values: matched_key_values.clone(),
                 changes: null_empty,
             });
         }
@@ -1173,7 +1199,7 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
         if !changes.is_empty() {
             modified.push(DataCompareModifiedRow {
                 key: key.clone(),
-                key_values: key_values_for_row(source_values, &options.key_columns, &column_indexes),
+                key_values: matched_key_values,
                 source_values: row_object(&options.columns, source_values),
                 target_values: row_object(&options.columns, target_values),
                 changes,
@@ -1236,12 +1262,13 @@ fn collect_compare_rows(
     column_indexes: &HashMap<&str, usize>,
     rows: Vec<Vec<Value>>,
     label: &str,
+    trim_strings: bool,
 ) -> Result<(CompareRowMap, Vec<String>), String> {
     let mut items = HashMap::with_capacity(rows.len());
     let mut order = Vec::with_capacity(rows.len());
 
     for row in rows {
-        let key = key_for_row(&row, key_columns, column_indexes);
+        let key = key_for_row(&row, key_columns, column_indexes, trim_strings);
         if items.contains_key(&key) {
             return Err(duplicate_key_error(label, key_columns, &key));
         }
@@ -1322,13 +1349,30 @@ fn key_for(row: &HashMap<String, Value>, key_columns: &[String]) -> String {
     key_columns.iter().map(|column| json_stringify(&value_for(row, column))).collect::<Vec<_>>().join("\u{001f}")
 }
 
-fn key_for_row(row: &[Value], key_columns: &[String], column_indexes: &HashMap<&str, usize>) -> String {
+fn compare_value_for_trim<'a>(value: &'a Value, trim_strings: bool) -> std::borrow::Cow<'a, Value> {
+    if trim_strings {
+        if let Value::String(text) = value {
+            let trimmed = text.trim();
+            if trimmed.len() != text.len() {
+                return std::borrow::Cow::Owned(Value::String(trimmed.to_string()));
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(value)
+}
+
+fn key_for_row(
+    row: &[Value],
+    key_columns: &[String],
+    column_indexes: &HashMap<&str, usize>,
+    trim_strings: bool,
+) -> String {
     key_columns
         .iter()
         .map(|column| {
             column_indexes
                 .get(column.as_str())
-                .map(|index| json_stringify(row_value(row, *index)))
+                .map(|index| json_stringify(&compare_value_for_trim(row_value(row, *index), trim_strings)))
                 .unwrap_or_else(|| json_stringify(&NULL_VALUE))
         })
         .collect::<Vec<_>>()
@@ -2933,7 +2977,7 @@ async fn fetch_sampled_compare_rows(
     }
 }
 
-fn compute_column_checksums(columns: &[String], rows: &[Vec<Value>]) -> HashMap<String, String> {
+fn compute_column_checksums(columns: &[String], rows: &[Vec<Value>], trim_strings: bool) -> HashMap<String, String> {
     let mut column_hashers: HashMap<String, Sha256> = columns.iter().map(|col| (col.clone(), Sha256::new())).collect();
 
     let column_indexes = column_index_map(columns);
@@ -2941,7 +2985,7 @@ fn compute_column_checksums(columns: &[String], rows: &[Vec<Value>]) -> HashMap<
     for row in rows {
         for (column_name, index) in &column_indexes {
             if let Some(hasher) = column_hashers.get_mut(*column_name) {
-                let value_str = json_stringify(row_value(row, *index));
+                let value_str = json_stringify(&compare_value_for_trim(row_value(row, *index), trim_strings));
                 hasher.update(value_str.as_bytes());
                 hasher.update(b"\n");
             }
@@ -2991,6 +3035,7 @@ pub async fn verify_data(state: &AppState, options: VerifyDataOptions) -> Result
     let from_tables_options = DataCompareFromTablesOptions {
         amount_tolerance_enabled: false,
         null_equals_empty: false,
+        trim_strings: false,
         where_condition: None,
         source_connection_id: options.source_connection_id,
         source_database: options.source_database,
@@ -3128,6 +3173,7 @@ mod tests {
             key_columns: vec!["id".into()],
             numeric_tolerance_columns: if enabled { vec!["id".into(), "amount".into()] } else { vec![] },
             null_equals_empty: false,
+            trim_strings: false,
             source_rows: vec![vec![json!(1), json!("100")]],
             target_rows: vec![vec![json!(1), json!("100.01")]],
         };
@@ -3162,6 +3208,7 @@ mod tests {
             "",
             vec!["amount".into()],
             false,
+            false,
         )
         .unwrap();
         assert_eq!(preparation.result.modified[0].changes.len(), 1);
@@ -3181,6 +3228,7 @@ mod tests {
             key_columns: vec!["id".into()],
             numeric_tolerance_columns: vec!["amount".into()],
             null_equals_empty: false,
+            trim_strings: false,
             source_rows: vec![vec![json!(1), Value::Null, json!("100")], vec![json!(2), json!(1), json!("a")]],
             target_rows: vec![vec![json!(1), json!(0), json!("100.01")], vec![json!(3), json!(1), json!("a")]],
         })
@@ -3213,6 +3261,7 @@ mod tests {
             "",
             vec!["amount".into()],
             false,
+            false,
         )
         .unwrap();
         assert_eq!(preparation.result.modified.len(), 2);
@@ -3233,6 +3282,7 @@ mod tests {
         let options = |enabled| CompareDataRowsOptions {
             ignored_columns: Vec::new(),
             null_equals_empty: enabled,
+            trim_strings: false,
             numeric_tolerance_columns: Vec::new(),
             columns: vec!["id".into(), "text".into()],
             key_columns: vec!["id".into()],
@@ -3272,6 +3322,7 @@ mod tests {
             "",
             vec!["amount".into()],
             true,
+            false,
         )
         .unwrap();
         assert_eq!(preparation.result.null_empty_matches.len(), 1);
@@ -3281,6 +3332,113 @@ mod tests {
         assert!(preparation.sync_sql.contains("\"note\" ="));
         assert!(!preparation.sync_sql.contains("\"text\" ="));
         assert!(!preparation.sync_sql.contains("\"amount\" ="));
+    }
+
+    #[test]
+    fn trim_strings_matches_keys_and_values_while_preserving_original_sync_sql() {
+        let preparation = prepare_data_compare_where(
+            DataComparePreparationOptions {
+                ignored_columns: Vec::new(),
+                table_name: "accounts".into(),
+                schema: None,
+                database_type: Some(DatabaseType::Sqlite),
+                column_info: vec![],
+                columns: vec!["id".into(), "name".into(), "note".into()],
+                key_columns: vec!["id".into()],
+                source_rows: vec![
+                    vec![json!("A01   "), json!("  Alice  "), json!("  same\t")],
+                    vec![json!("A02   "), json!("  Bob "), json!("  updated  ")],
+                    vec![json!("A03  "), json!("  New  "), json!("raw")],
+                ],
+                target_rows: vec![
+                    vec![json!("A01"), json!("Alice"), json!("same")],
+                    vec![json!("A02"), json!("Bob"), json!("old")],
+                ],
+            },
+            "",
+            Vec::new(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(preparation.result.added.len(), 1);
+        assert_eq!(preparation.result.added[0].values["id"], json!("A03  "));
+        assert_eq!(preparation.result.added[0].values["name"], json!("  New  "));
+        assert!(preparation.result.removed.is_empty());
+        assert_eq!(preparation.result.modified.len(), 1);
+        assert_eq!(preparation.result.modified[0].key_values["id"], json!("A02"));
+        assert_eq!(preparation.result.modified[0].changes.len(), 1);
+        assert_eq!(preparation.result.modified[0].changes[0].column, "note");
+        assert_eq!(preparation.result.modified[0].changes[0].source, json!("  updated  "));
+        assert_eq!(preparation.result.modified[0].changes[0].target, json!("old"));
+        // Sync SQL preserves original source values in INSERT/UPDATE SET and matches target's raw key in WHERE.
+        assert!(preparation.sync_sql.contains("'A03  '"));
+        assert!(preparation.sync_sql.contains("'  New  '"));
+        assert!(preparation.sync_sql.contains("'  updated  '"));
+        assert!(preparation.sync_sql.contains("\"id\" = 'A02'"));
+    }
+
+    #[test]
+    fn trim_strings_combines_with_null_equals_empty_and_rejects_trimmed_duplicate_keys() {
+        let matched = compare_data_rows(CompareDataRowsOptions {
+            ignored_columns: Vec::new(),
+            null_equals_empty: true,
+            trim_strings: true,
+            numeric_tolerance_columns: Vec::new(),
+            columns: vec!["id".into(), "note".into()],
+            key_columns: vec!["id".into()],
+            source_rows: vec![vec![json!(" 1 "), json!("   ")]],
+            target_rows: vec![vec![json!("1"), Value::Null]],
+        })
+        .unwrap();
+        assert!(matched.added.is_empty());
+        assert!(matched.removed.is_empty());
+        assert!(matched.modified.is_empty());
+        assert_eq!(matched.null_empty_matches.len(), 1);
+        assert_eq!(matched.null_empty_matches[0].changes[0].source, json!("   "));
+        assert_eq!(matched.null_empty_matches[0].changes[0].target, Value::Null);
+
+        let dup = compare_data_rows(CompareDataRowsOptions {
+            ignored_columns: Vec::new(),
+            null_equals_empty: false,
+            trim_strings: true,
+            numeric_tolerance_columns: Vec::new(),
+            columns: vec!["id".into(), "note".into()],
+            key_columns: vec!["id".into()],
+            source_rows: vec![vec![json!("A"), json!("1")], vec![json!(" A "), json!("2")]],
+            target_rows: vec![],
+        });
+        assert!(dup.is_err());
+
+        let cols = vec!["id".to_string(), "name".to_string()];
+        let left = compute_column_checksums(&cols, &[vec![json!(" 1 "), json!(" Alice ")]], true);
+        let right = compute_column_checksums(&cols, &[vec![json!("1"), json!("Alice")]], true);
+        assert_eq!(left, right);
+        let untrimmed_left = compute_column_checksums(&cols, &[vec![json!(" 1 "), json!(" Alice ")]], false);
+        assert_ne!(untrimmed_left, right);
+    }
+
+    #[test]
+    fn trim_strings_option_defaults_false_in_deserialized_requests() {
+        let base = json!({
+            "sourceConnectionId": "src",
+            "sourceDatabase": "db",
+            "sourceSchema": "s",
+            "sourceTable": "t",
+            "targetConnectionId": "tgt",
+            "targetDatabase": "db",
+            "targetSchema": "s",
+            "targetTable": "t",
+            "columns": ["id"],
+            "keyColumns": ["id"]
+        });
+        let legacy: DataCompareFromTablesOptions = serde_json::from_value(base.clone()).unwrap();
+        assert!(!legacy.trim_strings);
+        let mut with_trim = base;
+        with_trim["trimStrings"] = json!(true);
+        let enabled: DataCompareFromTablesOptions = serde_json::from_value(with_trim).unwrap();
+        assert!(enabled.trim_strings);
     }
 
     #[test]
@@ -3427,6 +3585,7 @@ mod tests {
             ignored_columns: Vec::new(),
             numeric_tolerance_columns: Vec::new(),
             null_equals_empty: false,
+            trim_strings: false,
             columns,
             key_columns: keys,
             source_rows: unfiltered,
@@ -3439,6 +3598,7 @@ mod tests {
             ignored_columns: Vec::new(),
             numeric_tolerance_columns: Vec::new(),
             null_equals_empty: false,
+            trim_strings: false,
             columns: vec!["id".into(), "value".into()],
             key_columns: vec!["id".into()],
             source_rows: remaining,
@@ -3625,7 +3785,7 @@ mod tests {
         let target_rows = normalize_numeric_compare_rows(&columns, vec![vec![json!(1), json!(5.0)]], &numeric_columns);
         let indexes = column_index_map(&columns);
         let (source_rows, target_rows) = pair_sample_rows_by_key(source_rows, target_rows, 1, 1, |row| {
-            key_for_row(row, &["id".to_string()], &indexes)
+            key_for_row(row, &["id".to_string()], &indexes, false)
         });
         assert_eq!(source_rows.len(), 1);
         assert_eq!(target_rows.len(), 1);
@@ -3637,6 +3797,7 @@ mod tests {
             ignored_columns: Vec::new(),
             numeric_tolerance_columns: Vec::new(),
             null_equals_empty: false,
+            trim_strings: false,
             columns: vec!["id".to_string(), "value".to_string()],
             key_columns: vec!["id".to_string()],
             source_rows: vec![vec![json!(1), Value::Null], vec![json!(2), json!("source")]],
@@ -3663,6 +3824,7 @@ mod tests {
         let diff = compare_data_rows(CompareDataRowsOptions {
             numeric_tolerance_columns: Vec::new(),
             null_equals_empty: false,
+            trim_strings: false,
             ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string(), "active".to_string()],
             key_columns: vec!["id".to_string()],
@@ -3696,6 +3858,7 @@ mod tests {
     fn ignored_columns_do_not_mark_rows_modified_and_are_counted_separately() {
         let diff = compare_data_rows(CompareDataRowsOptions {
             null_equals_empty: false,
+            trim_strings: false,
             numeric_tolerance_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string(), "updated_at".to_string()],
             key_columns: vec!["id".to_string()],
@@ -3724,6 +3887,7 @@ mod tests {
     fn ignored_column_names_match_case_insensitively_and_keys_win_over_ignore() {
         let diff = compare_data_rows(CompareDataRowsOptions {
             null_equals_empty: false,
+            trim_strings: false,
             numeric_tolerance_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string(), "Version".to_string()],
             key_columns: vec!["id".to_string()],
@@ -3743,6 +3907,7 @@ mod tests {
     fn unknown_ignored_columns_are_dropped_without_error() {
         let diff = compare_data_rows(CompareDataRowsOptions {
             null_equals_empty: false,
+            trim_strings: false,
             numeric_tolerance_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
@@ -3761,6 +3926,7 @@ mod tests {
     fn ignored_columns_stay_in_row_values_for_display_and_sync() {
         let diff = compare_data_rows(CompareDataRowsOptions {
             null_equals_empty: false,
+            trim_strings: false,
             numeric_tolerance_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string(), "version".to_string()],
             key_columns: vec!["id".to_string()],
@@ -4628,6 +4794,7 @@ mod tests {
         let err = compare_data_rows(CompareDataRowsOptions {
             numeric_tolerance_columns: Vec::new(),
             null_equals_empty: false,
+            trim_strings: false,
             ignored_columns: Vec::new(),
             columns: vec!["id".to_string()],
             key_columns: Vec::new(),
@@ -4644,6 +4811,7 @@ mod tests {
         let err = compare_data_rows(CompareDataRowsOptions {
             numeric_tolerance_columns: Vec::new(),
             null_equals_empty: false,
+            trim_strings: false,
             ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
@@ -4660,6 +4828,7 @@ mod tests {
         let err = compare_data_rows(CompareDataRowsOptions {
             numeric_tolerance_columns: Vec::new(),
             null_equals_empty: false,
+            trim_strings: false,
             ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
@@ -4676,6 +4845,7 @@ mod tests {
         let err = compare_data_rows(CompareDataRowsOptions {
             numeric_tolerance_columns: Vec::new(),
             null_equals_empty: false,
+            trim_strings: false,
             ignored_columns: Vec::new(),
             columns: vec!["tenant_id".to_string(), "user_id".to_string(), "name".to_string()],
             key_columns: vec!["tenant_id".to_string(), "user_id".to_string()],
@@ -4706,6 +4876,7 @@ mod tests {
                     let result = compare_data_rows(CompareDataRowsOptions {
                         numeric_tolerance_columns: Vec::new(),
                         null_equals_empty: false,
+                        trim_strings: false,
                         ignored_columns: Vec::new(),
                         columns: vec!["id".to_string(), "name".to_string()],
                         key_columns: vec!["id".to_string()],
@@ -4758,6 +4929,7 @@ mod tests {
                 let diff = compare_data_rows(CompareDataRowsOptions {
                     numeric_tolerance_columns: Vec::new(),
                     null_equals_empty: false,
+                    trim_strings: false,
                     ignored_columns: Vec::new(),
                     columns: vec!["id".to_string(), "name".to_string()],
                     key_columns: vec!["id".to_string()],
@@ -4783,12 +4955,13 @@ mod tests {
         ] {
             let (source_rows, target_rows) =
                 pair_sample_rows_by_key(source, target, source_count, target_count, |row| {
-                    key_for_row(row, &keys, &indexes)
+                    key_for_row(row, &keys, &indexes, false)
                 });
             let diff = compare_data_rows(CompareDataRowsOptions {
                 ignored_columns: Vec::new(),
                 numeric_tolerance_columns: Vec::new(),
                 null_equals_empty: false,
+                trim_strings: false,
                 columns: columns.clone(),
                 key_columns: keys.clone(),
                 source_rows,
@@ -4831,6 +5004,7 @@ mod tests {
             let error = compare_data_rows(CompareDataRowsOptions {
                 numeric_tolerance_columns: Vec::new(),
                 null_equals_empty: false,
+                trim_strings: false,
                 ignored_columns: Vec::new(),
                 columns: vec!["id".to_string(), "name".to_string()],
                 key_columns: vec!["id".to_string()],
@@ -4853,6 +5027,7 @@ mod tests {
             let error = compare_data_rows(CompareDataRowsOptions {
                 numeric_tolerance_columns: Vec::new(),
                 null_equals_empty: false,
+                trim_strings: false,
                 ignored_columns: Vec::new(),
                 columns: vec!["id".to_string(), "name".to_string()],
                 key_columns: vec!["id".to_string()],
@@ -4938,6 +5113,7 @@ mod tests {
         let err = compare_data_rows(CompareDataRowsOptions {
             numeric_tolerance_columns: Vec::new(),
             null_equals_empty: false,
+            trim_strings: false,
             ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
@@ -4966,6 +5142,7 @@ mod tests {
         let diff = compare_data_rows(CompareDataRowsOptions {
             numeric_tolerance_columns: Vec::new(),
             null_equals_empty: false,
+            trim_strings: false,
             ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
@@ -4998,6 +5175,7 @@ mod tests {
         let err = compare_data_rows(CompareDataRowsOptions {
             numeric_tolerance_columns: Vec::new(),
             null_equals_empty: false,
+            trim_strings: false,
             ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
@@ -5020,6 +5198,7 @@ mod tests {
         let err = compare_data_rows(CompareDataRowsOptions {
             numeric_tolerance_columns: Vec::new(),
             null_equals_empty: false,
+            trim_strings: false,
             ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
@@ -5041,6 +5220,7 @@ mod tests {
         let no_diff = compare_data_rows(CompareDataRowsOptions {
             numeric_tolerance_columns: Vec::new(),
             null_equals_empty: false,
+            trim_strings: false,
             ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
@@ -5053,6 +5233,7 @@ mod tests {
         let diff = compare_data_rows(CompareDataRowsOptions {
             numeric_tolerance_columns: Vec::new(),
             null_equals_empty: false,
+            trim_strings: false,
             ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
@@ -5069,6 +5250,7 @@ mod tests {
         let err = compare_data_rows(CompareDataRowsOptions {
             numeric_tolerance_columns: Vec::new(),
             null_equals_empty: false,
+            trim_strings: false,
             ignored_columns: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_columns: vec!["id".to_string()],
@@ -5698,6 +5880,7 @@ mod tests {
                 ignored_columns: Vec::new(),
                 numeric_tolerance_columns: Vec::new(),
                 null_equals_empty: false,
+                trim_strings: false,
                 columns: vec!["ID".into(), "STATUS".into()],
                 key_columns: vec!["ID".into()],
                 source_rows: source,

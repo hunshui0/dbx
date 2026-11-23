@@ -546,3 +546,20 @@ test("passes the search expression when the target table is missing", async () =
   assert.equal(apiMock.prepareDataCompareMissingTarget.mock.calls[0]?.[0].whereCondition, "user_id IN (1, 2)");
   assert.equal(session.batchResults[0]?.whereCondition, "user_id IN (1, 2)");
 });
+
+test("sends per-table trimStrings choice and retains it on each table result", async () => {
+  const trimFlags = { users: true, orders: false };
+  const pending = runSession(baseConfig({ selectedSourceTables: ["users", "orders"], trimStringsByTable: trimFlags }), [
+    { sourceTable: "users", targetTable: "users" },
+    { sourceTable: "orders", targetTable: "orders" },
+  ]);
+  trimFlags.users = false;
+  const session = await pending;
+  assert.equal(session.status, "completed");
+  assert.equal(apiMock.prepareDataCompareFromTables.mock.calls[0]?.[0].trimStrings, true);
+  assert.equal(apiMock.prepareDataCompareFromTables.mock.calls[1]?.[0].trimStrings, false);
+  assert.deepEqual(
+    session.batchResults.map((table) => table.trimStrings),
+    [true, false],
+  );
+});
