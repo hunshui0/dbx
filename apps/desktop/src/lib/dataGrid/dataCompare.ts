@@ -234,6 +234,8 @@ export interface DataCompareReportTable {
     added: Array<DataCompareRow & { selected: boolean }>;
     removed: Array<DataCompareRow & { selected: boolean }>;
     modified: Array<DataCompareModifiedRow & { selected: boolean }>;
+    encodingErrors?: DataCompareEncodingError[];
+    encodingErrorCount?: number;
   };
   error?: string;
 }

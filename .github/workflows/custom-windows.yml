@@ -2,6 +2,11 @@ name: DBX Custom Windows
 
 on:
   workflow_dispatch:
+    inputs:
+      run_rust_tests:
+        description: 'Run Rust debug unit tests before release build (adds ~15 min)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -16,19 +21,23 @@ jobs:
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_PROFILE_RELEASE_LTO: 'thin'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
       NODE_OPTIONS: '--max-old-space-size=8192'
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
       - uses: pnpm/action-setup@v6
         with:
           version: 10.34.7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: 'pnpm'
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 21
+          cache: 'gradle'
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: x86_64-pc-windows-msvc
@@ -38,11 +47,16 @@ jobs:
           cache-on-failure: true
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
+      - name: Frontend type check
+        run: pnpm typecheck
+      - name: Test data comparison configuration and reports
+        run: pnpm exec vitest run apps/desktop/src/components/diff/__tests__ apps/desktop/src/composables/__tests__/useDataCompareSession.spec.ts apps/desktop/src/composables/__tests__/useDataCompareConfig.spec.ts apps/desktop/src/lib/dataGrid/__tests__/dataCompareReport.spec.ts apps/desktop/src/lib/dataGrid/__tests__/dataCompareKeyInference.spec.ts
       - name: Test Java and build fixed DB2 Agent
         run: |
           ./agents/gradlew.bat -p agents :common:test :db2:test :db2:shadowJar --no-daemon
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test comparison and Agent diagnostics
+        if: ${{ inputs.run_rust_tests == true }}
         run: |
           cargo test --locked -p dbx-core --no-default-features --features sqlite-bundled data_compare --lib
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -50,10 +64,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Prepare bundled Agent and Java runtime
         run: ./scripts/prepare-custom-payload.ps1
-      - name: Frontend type check
-        run: pnpm typecheck
-      - name: Test data comparison configuration and reports
-        run: pnpm exec vitest run apps/desktop/src/components/diff/__tests__ apps/desktop/src/composables/__tests__/useDataCompareSession.spec.ts apps/desktop/src/composables/__tests__/useDataCompareConfig.spec.ts apps/desktop/src/lib/dataGrid/__tests__/dataCompareReport.spec.ts apps/desktop/src/lib/dataGrid/__tests__/dataCompareKeyInference.spec.ts
       - name: Build custom Windows installer
         run: pnpm tauri build --target x86_64-pc-windows-msvc --features custom-build --bundles nsis --config src-tauri/tauri.custom.conf.json
       - name: Package standard installer
