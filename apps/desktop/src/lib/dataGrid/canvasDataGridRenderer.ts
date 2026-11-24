@@ -132,6 +132,7 @@ export interface DrawCanvasDataGridOptions {
   currentSearchMatch: CanvasSearchMatch | null;
   duplicateHighlightKeys?: ReadonlySet<number>;
   nullHighlightKeys?: ReadonlySet<number>;
+  encodingWarningColumns?: ReadonlySet<number>;
   formatCell: (value: CellValue, columnIndex: number, row: CanvasDataGridRow) => string;
   isNullValue?: (value: CellValue) => boolean;
   columnIsBoolean?: (columnIndex: number) => boolean;
@@ -183,6 +184,9 @@ interface CanvasRenderState {
   currentSearchBorder: string;
   duplicateHighlightFill: string;
   nullHighlightFill: string;
+  encodingWarningColumnFill: string;
+  encodingWarningCellFill: string;
+  encodingWarningText: string;
 }
 
 export interface CanvasBackingStoreMetrics {
@@ -435,6 +439,9 @@ function resolveCanvasRenderState(canvas: HTMLCanvasElement, ctx: CanvasRenderin
     currentSearchBorder: isDark ? DATA_GRID_DARK_SEARCH_COLORS.currentBorder : theme.cellCurrentSearchBorder,
     duplicateHighlightFill: isDark ? "rgba(245, 158, 11, 0.25)" : "rgb(254, 237, 204)",
     nullHighlightFill: isDark ? "rgba(14, 165, 233, 0.25)" : "rgb(224, 242, 254)",
+    encodingWarningColumnFill: isDark ? "rgba(239, 68, 68, 0.12)" : "rgba(254, 226, 226, 0.55)",
+    encodingWarningCellFill: isDark ? "rgba(239, 68, 68, 0.28)" : "rgb(254, 202, 202)",
+    encodingWarningText: isDark ? "rgb(252, 165, 165)" : "rgb(185, 28, 28)",
   };
   canvasRenderStateCache.set(canvas, state);
   return state;
@@ -464,6 +471,7 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions): boolean 
     currentSearchMatch,
     duplicateHighlightKeys,
     nullHighlightKeys,
+    encodingWarningColumns,
     formatCell,
     isNullValue,
     newRowCellPlaceholder,
@@ -519,7 +527,12 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions): boolean 
   ctx.imageSmoothingEnabled = false;
   ctx.clearRect(0, 0, width, height);
 
-  const { normalFont, tabularFont, semiboldFont, italicFont, baselineOffsets, theme, searchFill, currentSearchFill, currentSearchBorder, duplicateHighlightFill, nullHighlightFill } = resolveCanvasRenderState(canvas, ctx, isDark, styleKey);
+  const { normalFont, tabularFont, semiboldFont, italicFont, baselineOffsets, theme, searchFill, currentSearchFill, currentSearchBorder, duplicateHighlightFill, nullHighlightFill, encodingWarningColumnFill, encodingWarningCellFill, encodingWarningText } = resolveCanvasRenderState(
+    canvas,
+    ctx,
+    isDark,
+    styleKey,
+  );
   const crosshairRowBg = rawCrosshairRowBg?.trim() || theme.cellCrosshairRow;
   const crosshairColBg = rawCrosshairColBg?.trim() || theme.cellCrosshairCol;
 
@@ -664,6 +677,9 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions): boolean 
       const isCurrentSearchMatch = paintSearchMatches && currentSearchMatch?.displayRow === item.displayIndex && currentSearchMatch.col === actualColIdx;
       const isDuplicateHighlight = paintDuplicateHighlights && duplicateHighlightKeys.has(dataGridSearchMatchKey(item.displayIndex, actualColIdx));
       const isNullHighlight = !isDuplicateHighlight && paintNullHighlights && nullHighlightKeys.has(dataGridSearchMatchKey(item.displayIndex, actualColIdx));
+      const isEncodingWarningColumn = encodingWarningColumns !== undefined && encodingWarningColumns.has(actualColIdx);
+      const rawCellValue = item.data[actualColIdx];
+      const isEncodingWarningCell = typeof rawCellValue === "string" && rawCellValue.includes("\uFFFD");
       const clippedX = Math.max(drawX, rowNumberWidth);
       const cellPaintWidth = Math.min(width, drawX + colWidth) - clippedX;
       if (cellPaintWidth <= 0) return;
@@ -671,6 +687,14 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions): boolean 
       // 十字列高亮：整列覆盖，叠在行底色之上；脏格/搜索/选中格填充在其后绘制，优先级更高
       if (crosshair?.columnCrosshair && visibleColIdx === crosshair.visibleColIdx && !selectedFillVisual && !item.isDeleted) {
         ctx.fillStyle = crosshairColBg;
+        ctx.fillRect(clippedX, y, cellPaintWidth, rowHeight);
+      }
+
+      if (isEncodingWarningColumn && !selectedFillVisual && !item.isDeleted) {
+        ctx.fillStyle = isEncodingWarningCell ? encodingWarningCellFill : encodingWarningColumnFill;
+        ctx.fillRect(clippedX, y, cellPaintWidth, rowHeight);
+      } else if (isEncodingWarningCell && !selectedFillVisual && !item.isDeleted) {
+        ctx.fillStyle = encodingWarningCellFill;
         ctx.fillRect(clippedX, y, cellPaintWidth, rowHeight);
       }
 
@@ -737,7 +761,7 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions): boolean 
         isDirty: isDirtyCell,
         isDeleted: item.isDeleted,
       });
-      const cellTextColor = textRole === "muted" ? theme.mutedForeground : textRole === "type" ? dataGridTypeForeground(theme, typeKind) : theme.foreground;
+      const cellTextColor = isEncodingWarningCell && !selectedFillVisual && !isCurrentSearchMatch ? encodingWarningText : textRole === "muted" ? theme.mutedForeground : textRole === "type" ? dataGridTypeForeground(theme, typeKind) : theme.foreground;
       ctx.textAlign = isBooleanNullCell ? "center" : isRightAlign ? "right" : "left";
       ctx.fillStyle = cellTextColor;
       ctx.font = isNullCell ? italicFont : tabularFont;

@@ -1125,7 +1125,7 @@ public final class JdbcExecutor {
                             read[index] = true;
                         } catch (SQLException | RuntimeException error) {
                             if (tolerateEncoding && AgentRpcError.isCharacterConversionError(error)) {
-                                values[index] = null;
+                                values[index] = tryDecodeLossy(rs, current);
                                 read[index] = true;
                                 String colName = index < columns.size() ? columns.get(index) : null;
                                 context.recordEncodingError(zeroBasedRow, index, colName, sqlTypeByIndex[index], true, keys, error);
@@ -1144,7 +1144,7 @@ public final class JdbcExecutor {
                         values[i] = readColumn(rs, valueReader, sqlTypeByIndex, typeNameByIndex, current);
                     } catch (SQLException | RuntimeException error) {
                         if (tolerateEncoding && AgentRpcError.isCharacterConversionError(error)) {
-                            values[i] = null;
+                            values[i] = tryDecodeLossy(rs, current);
                             String colName = i < columns.size() ? columns.get(i) : null;
                             context.recordEncodingError(zeroBasedRow, i, colName, sqlTypeByIndex[i], false, keys, error);
                             continue;
@@ -1161,6 +1161,21 @@ public final class JdbcExecutor {
             throw error;
         }
         return new ArrayList<>(java.util.Arrays.asList(values));
+    }
+
+    private static Object tryDecodeLossy(ResultSet rs, int index) {
+        try {
+            byte[] raw = rs.getBytes(index);
+            if (raw == null) return "\uFFFD";
+            String decoded = java.nio.charset.StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPLACE)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPLACE)
+                .decode(java.nio.ByteBuffer.wrap(raw))
+                .toString();
+            return decoded.indexOf('\uFFFD') >= 0 ? decoded : decoded + "\uFFFD";
+        } catch (Throwable ignored) {
+            return "\uFFFD";
+        }
     }
 
     private Object readColumn(ResultSet rs, ResultValueReader valueReader, int[] sqlTypeByIndex, String[] typeNameByIndex, int i) throws SQLException {

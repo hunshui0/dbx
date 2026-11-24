@@ -532,6 +532,7 @@ const columnHeaderLabels = computed(() => ({
   formatterActive: t("grid.columnFormatterActive"),
   highlightActive: t("grid.highlightActive"),
   filterActive: t("grid.filterActive"),
+  encodingWarning: t("grid.encodingWarningColumn"),
   sort: t("grid.sort"),
   columnActions: t("grid.columnActions"),
 }));
@@ -6478,6 +6479,40 @@ const columnHighlightMatches = computed(() => {
 const duplicateHighlightKeys = computed(() => columnHighlightMatches.value.duplicateKeys);
 const nullHighlightKeys = computed(() => columnHighlightMatches.value.nullKeys);
 
+const encodingWarningColumns = computed<ReadonlySet<number>>(() => {
+  const cols = new Set<number>();
+  const rows = props.result.rows;
+  const colCount = props.result.columns.length;
+  for (let r = 0; r < rows.length && cols.size < colCount; r++) {
+    const row = rows[r];
+    if (!row) continue;
+    for (let c = 0; c < row.length; c++) {
+      if (cols.has(c)) continue;
+      const cell = row[c];
+      if (typeof cell === "string" && cell.includes("\uFFFD")) {
+        cols.add(c);
+      }
+    }
+  }
+  const messages = props.result.messages;
+  if (messages?.length) {
+    for (const msg of messages) {
+      if (msg.code !== "DBX_ENCODING_ERROR" || !msg.detail) continue;
+      try {
+        const detail = JSON.parse(msg.detail) as { columnIndex?: number };
+        if (typeof detail.columnIndex === "number" && detail.columnIndex >= 0) cols.add(detail.columnIndex);
+      } catch {
+        // Ignore malformed detail JSON.
+      }
+    }
+  }
+  return cols;
+});
+
+function cellHasEncodingWarning(value: unknown): boolean {
+  return typeof value === "string" && value.includes("\uFFFD");
+}
+
 function columnHasHighlight(colIdx: number): boolean {
   return hasColumnHighlight(columnHighlightRules.value, colIdx);
 }
@@ -9707,6 +9742,7 @@ function drawCanvasGrid() {
     currentSearchMatch: currentSearchMatch.value,
     duplicateHighlightKeys: duplicateHighlightKeys.value,
     nullHighlightKeys: nullHighlightKeys.value,
+    encodingWarningColumns: encodingWarningColumns.value,
     formatCell: (_value, columnIndex, row) => formatGridItemCell(row, columnIndex, false),
     isNullValue: (value) => value === null || (usesMongoDocumentGridValues.value && value === MONGO_DOCUMENT_GRID_NULL),
     newRowCellPlaceholder,
@@ -16666,6 +16702,8 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                             'bg-yellow-500/10 cell-dirty': displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
                             'bg-amber-200/60 dark:bg-amber-500/25': cellIsDuplicateHighlight(cell.recordIndex, cell.valueIndex),
                             'bg-sky-200/60 dark:bg-sky-500/25': cellIsNullHighlight(cell.recordIndex, cell.valueIndex),
+                            'bg-red-100/60 dark:bg-red-500/15': encodingWarningColumns.has(cell.valueIndex) && !cellHasEncodingWarning(displayItems[cell.recordIndex]?.data[cell.valueIndex]),
+                            'bg-red-200/80 text-red-700 dark:bg-red-500/30 dark:text-red-300': cellHasEncodingWarning(displayItems[cell.recordIndex]?.data[cell.valueIndex]),
                             'bg-yellow-200/60 dark:bg-yellow-500/20': cellIsSearchMatch(cell.recordIndex, cell.valueIndex),
                             'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': cellIsCurrentMatch(cell.recordIndex, cell.valueIndex),
                             'cursor-text': !isScrolling,
@@ -16866,6 +16904,8 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                     :highlight-label="columnHeaderLabels.highlightActive"
                     :filter-active="columnHasStructuredFilter(col.name)"
                     :filter-label="columnHeaderLabels.filterActive"
+                    :encoding-warning="encodingWarningColumns.has(col.actualColIdx)"
+                    :encoding-warning-label="columnHeaderLabels.encodingWarning"
                     @pointerdown="startColumnHeaderDrag(col.visibleColIdx, $event)"
                     @click-capture="onHeaderClickCapture"
                     @click="onHeaderClick(col.visibleColIdx, $event)"
@@ -17621,6 +17661,8 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                               'cell-current-search-match': cellIsCurrentMatch(item.displayIndex, col.actualColIdx),
                               'bg-amber-200/60 dark:bg-amber-500/25': cellIsDuplicateHighlight(item.displayIndex, col.actualColIdx),
                               'bg-sky-200/60 dark:bg-sky-500/25': cellIsNullHighlight(item.displayIndex, col.actualColIdx),
+                              'bg-red-100/60 dark:bg-red-500/15': encodingWarningColumns.has(col.actualColIdx) && !cellHasEncodingWarning(item.data[col.actualColIdx]),
+                              'bg-red-200/80 text-red-700 dark:bg-red-500/30 dark:text-red-300': cellHasEncodingWarning(item.data[col.actualColIdx]),
                               'bg-yellow-200/60 dark:bg-yellow-500/20': cellIsSearchMatch(item.displayIndex, col.actualColIdx),
                               'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': cellIsCurrentMatch(item.displayIndex, col.actualColIdx),
                               'tabular-nums': typeof item.data[col.actualColIdx] === 'number',

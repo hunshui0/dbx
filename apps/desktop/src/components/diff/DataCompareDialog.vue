@@ -1480,6 +1480,18 @@ function formatModifiedSummary(row: DataCompareModifiedRow): string {
   return truncateText(row.changes.map((change) => `${change.column}: ${formatValue(change.target)} -> ${formatValue(change.source)}`).join(", "), 220);
 }
 
+function valueContainsReplacementChar(value: unknown): boolean {
+  return typeof value === "string" && value.includes("\uFFFD");
+}
+
+function diffRowHasEncodingWarning(kind: "added" | "removed" | "modified", row: DataCompareRow | DataCompareModifiedRow): boolean {
+  if (Object.values(row.keyValues).some(valueContainsReplacementChar)) return true;
+  if (kind === "modified") {
+    return (row as DataCompareModifiedRow).changes.some((change) => valueContainsReplacementChar(change.source) || valueContainsReplacementChar(change.target));
+  }
+  return Object.values((row as DataCompareRow).values).some(valueContainsReplacementChar);
+}
+
 watch(sourceConnectionId, (id) => {
   if (initializingPrefill) return;
   clearResult();
@@ -2248,12 +2260,19 @@ onBeforeUnmount(() => {
                     <DynamicScroller :items="rowsForDisplay(item, kind)" :min-item-size="DIFF_ROW_MIN_HEIGHT" :key-field="diffRowKey" class="max-h-72 overflow-auto" :style="{ height: `${Math.min(rowsForDisplay(item, kind).length * DIFF_ROW_MIN_HEIGHT, DIFF_LIST_MAX_HEIGHT)}px` }">
                       <template #default="{ item: row, active, index }">
                         <DynamicScrollerItem :item="row" :index="index" :active="active" :data-index="index">
-                          <button type="button" class="flex w-full items-start gap-3 px-3 py-2 text-left text-xs hover:bg-muted/40 disabled:cursor-not-allowed disabled:opacity-60" :disabled="!item.syncEligible" @click="toggleRowSelection(item, kind, index)">
+                          <button
+                            type="button"
+                            class="flex w-full items-start gap-3 px-3 py-2 text-left text-xs hover:bg-muted/40 disabled:cursor-not-allowed disabled:opacity-60"
+                            :class="diffRowHasEncodingWarning(kind, row) ? 'bg-red-500/10 hover:bg-red-500/15' : ''"
+                            :data-encoding-warning="diffRowHasEncodingWarning(kind, row) ? 'true' : undefined"
+                            :disabled="!item.syncEligible"
+                            @click="toggleRowSelection(item, kind, index)"
+                          >
                             <CheckSquare v-if="isCompareRowSelected(item.selection[kind], index)" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
                             <Square v-else class="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground/40" />
                             <div class="min-w-0 flex-1">
-                              <div class="font-mono">{{ formatKeyValues(row.keyValues) }}</div>
-                              <div class="mt-1 text-muted-foreground break-words">
+                              <div class="font-mono" :class="Object.values(row.keyValues).some(valueContainsReplacementChar) ? 'text-red-600 dark:text-red-400' : ''">{{ formatKeyValues(row.keyValues) }}</div>
+                              <div class="mt-1 break-words" :class="diffRowHasEncodingWarning(kind, row) ? 'text-red-600 dark:text-red-400 font-medium' : 'text-muted-foreground'">
                                 {{ kind === "modified" ? formatModifiedSummary(row as DataCompareModifiedRow) : formatRowValues((row as DataCompareRow).values) }}
                               </div>
                             </div>

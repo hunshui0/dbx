@@ -3687,6 +3687,7 @@ export default {
     highlightNulls: "Highlight NULL Values",
     clearHighlight: "Clear Highlights",
     highlightActive: "Highlight Active",
+    encodingWarningColumn: "Column contains garbled characters (invalid bytes replaced with \uFFFD)",
     filterActive: "Filtered",
     structuredFiltersActive: "{count} condition filters",
     highlightDuplicatesFound: "Highlighted {count} duplicate values",

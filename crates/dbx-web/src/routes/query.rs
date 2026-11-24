@@ -709,6 +709,7 @@ pub async fn execute_multi(
             execution_mode: req.execution_mode.unwrap_or_default(),
             preserve_explicit_transaction: req.preserve_explicit_transaction,
             report_compilation_errors: req.report_compilation_errors,
+            ..Default::default()
         },
     )
     .await;

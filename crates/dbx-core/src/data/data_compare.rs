@@ -194,6 +194,8 @@ const ENCODING_ERROR_MESSAGE_CODE: &str = "DBX_ENCODING_ERROR";
 const ENCODING_ERROR_OVERFLOW_MESSAGE_CODE: &str = "DBX_ENCODING_ERROR_OVERFLOW";
 const INTERNAL_ENCODING_ERROR_SENTINEL_KEY: &str = "__dbx_internal_encoding_error__";
 const MAX_REPORTED_ENCODING_ERRORS: usize = 500;
+const REPLACEMENT_CHAR_ENCODING_MESSAGE: &str =
+    "Decoded text contains replacement character (U+FFFD) from invalid character bytes";
 
 fn is_zero_usize(value: &usize) -> bool {
     *value == 0
@@ -796,11 +798,12 @@ pub async fn prepare_data_compare_from_tables(
     )?;
 
     let has_corrupted_added = !preparation.result.added.is_empty()
-        && preparation
+        && (preparation
             .result
             .encoding_errors
             .iter()
-            .any(|err| err.side == "source" && err.other_side_value.is_none() && !err.is_key_column);
+            .any(|err| err.side == "source" && err.other_side_value.is_none() && !err.is_key_column)
+            || preparation.result.added.iter().any(|row| !is_writable_added_row(row)));
     let sync_eligible = sync_eligible && !has_corrupted_added;
     let (sync_statements, sync_sql) =
         if sync_eligible { (preparation.sync_statements, preparation.sync_sql) } else { (Vec::new(), String::new()) };
@@ -1074,9 +1077,9 @@ fn build_data_compare_sync_plan_from_refs(tables: &[DataCompareSyncPlanTableRef<
             // sync-plan request must not produce executable statements.
             continue;
         };
-        insert_count += table.diff.added.len();
+        insert_count += table.diff.added.iter().filter(|row| is_writable_added_row(row)).count();
         update_count += table.diff.modified.iter().filter(|row| has_writable_changes(row, table.column_info)).count();
-        delete_count += table.diff.removed.len();
+        delete_count += table.diff.removed.iter().filter(|row| is_writable_removed_row(row)).count();
         sync_statements.extend(table.pre_sync_statements.iter().cloned());
         sync_statements.extend(generate_data_sync_statements(&GenerateDataSyncSqlOptions {
             table_name: table.table_name,
@@ -1124,6 +1127,23 @@ fn missing_target_diff(columns: &[String], key_columns: &[String], source_rows: 
                         keys_complete: err.keys_complete && !has_key_error,
                         other_side_value: None,
                         message: err.message,
+                    },
+                );
+            } else if contains_replacement_char(cell) {
+                let col_name = columns.get(col_idx).cloned().unwrap_or_default();
+                let is_key = key_columns.iter().any(|k| k.eq_ignore_ascii_case(&col_name));
+                push_encoding_error(
+                    &mut encoding_errors,
+                    &mut encoding_error_count,
+                    DataCompareEncodingError {
+                        side: "source".to_string(),
+                        row_index: index + 1,
+                        column: col_name,
+                        is_key_column: is_key,
+                        key_values: row_key_values.clone(),
+                        keys_complete: !has_key_error,
+                        other_side_value: None,
+                        message: REPLACEMENT_CHAR_ENCODING_MESSAGE.to_string(),
                     },
                 );
             }
@@ -1187,8 +1207,8 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
     let mut ignored_only_count = 0usize;
 
     for key in &source_order {
-        let source_values = source.get(key).expect("source key should exist");
-        let Some(target_values) = target.get(key) else {
+        let (source_row_index, source_values) = source.get(key).expect("source key should exist");
+        let Some((target_row_index, target_values)) = target.get(key) else {
             let row_keys = key_values_for_row(source_values, &options.key_columns, &column_indexes);
             for (col_idx, cell) in source_values.iter().enumerate() {
                 if let Some(err) = extract_encoding_error_sentinel(cell) {
@@ -1207,6 +1227,24 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
                             message: err.message,
                         },
                     );
+                } else if contains_replacement_char(cell) {
+                    let col_name = options.columns.get(col_idx).cloned().unwrap_or_default();
+                    if !key_columns.contains(col_name.as_str()) {
+                        push_encoding_error(
+                            &mut encoding_errors,
+                            &mut encoding_error_count,
+                            DataCompareEncodingError {
+                                side: "source".to_string(),
+                                row_index: *source_row_index,
+                                column: col_name,
+                                is_key_column: false,
+                                key_values: row_keys.clone(),
+                                keys_complete: true,
+                                other_side_value: None,
+                                message: REPLACEMENT_CHAR_ENCODING_MESSAGE.to_string(),
+                            },
+                        );
+                    }
                 }
             }
             added.push(DataCompareRow {
@@ -1271,6 +1309,38 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
                     );
                 }
                 continue;
+            }
+            if contains_replacement_char(source_value) {
+                push_encoding_error(
+                    &mut encoding_errors,
+                    &mut encoding_error_count,
+                    DataCompareEncodingError {
+                        side: "source".to_string(),
+                        row_index: *source_row_index,
+                        column: column.clone(),
+                        is_key_column: false,
+                        key_values: matched_key_values.clone(),
+                        keys_complete: true,
+                        other_side_value: Some(target_value.clone()),
+                        message: REPLACEMENT_CHAR_ENCODING_MESSAGE.to_string(),
+                    },
+                );
+            }
+            if contains_replacement_char(target_value) {
+                push_encoding_error(
+                    &mut encoding_errors,
+                    &mut encoding_error_count,
+                    DataCompareEncodingError {
+                        side: "target".to_string(),
+                        row_index: *target_row_index,
+                        column: column.clone(),
+                        is_key_column: false,
+                        key_values: matched_key_values.clone(),
+                        keys_complete: true,
+                        other_side_value: Some(source_value.clone()),
+                        message: REPLACEMENT_CHAR_ENCODING_MESSAGE.to_string(),
+                    },
+                );
             }
             let source_cmp = compare_value_for_trim(source_value, options.trim_strings);
             let target_cmp = compare_value_for_trim(target_value, options.trim_strings);
@@ -1348,7 +1418,7 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
 
     let mut removed = Vec::new();
     for key in &target_order {
-        if let Some(target_values) = target.get(key).filter(|_| !source.contains_key(key)) {
+        if let Some((target_row_index, target_values)) = target.get(key).filter(|_| !source.contains_key(key)) {
             let row_keys = key_values_for_row(target_values, &options.key_columns, &column_indexes);
             for (col_idx, cell) in target_values.iter().enumerate() {
                 if let Some(err) = extract_encoding_error_sentinel(cell) {
@@ -1367,6 +1437,24 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
                             message: err.message,
                         },
                     );
+                } else if contains_replacement_char(cell) {
+                    let col_name = options.columns.get(col_idx).cloned().unwrap_or_default();
+                    if !key_columns.contains(col_name.as_str()) {
+                        push_encoding_error(
+                            &mut encoding_errors,
+                            &mut encoding_error_count,
+                            DataCompareEncodingError {
+                                side: "target".to_string(),
+                                row_index: *target_row_index,
+                                column: col_name,
+                                is_key_column: false,
+                                key_values: row_keys.clone(),
+                                keys_complete: true,
+                                other_side_value: None,
+                                message: REPLACEMENT_CHAR_ENCODING_MESSAGE.to_string(),
+                            },
+                        );
+                    }
                 }
             }
             removed.push(DataCompareRow {
@@ -1414,7 +1502,7 @@ const DEFAULT_FETCH_BATCH_SIZE: usize = 10_000;
 static NULL_VALUE: Value = Value::Null;
 
 type CompareRowValues = Vec<Value>;
-type CompareRowMap = HashMap<String, CompareRowValues>;
+type CompareRowMap = HashMap<String, (usize, CompareRowValues)>;
 
 fn column_index_map(columns: &[String]) -> HashMap<&str, usize> {
     let mut indexes = HashMap::with_capacity(columns.len());
@@ -1438,7 +1526,7 @@ fn collect_compare_rows(
     let mut items = HashMap::with_capacity(rows.len());
     let mut order = Vec::with_capacity(rows.len());
 
-    for row in rows {
+    for (row_idx, row) in rows.into_iter().enumerate() {
         let has_key_error = key_columns.iter().any(|key| {
             column_indexes
                 .get(key.as_str())
@@ -1468,12 +1556,38 @@ fn collect_compare_rows(
             }
             continue;
         }
+        let mut has_replacement_key = false;
+        let readable_keys = key_values_for_row(&row, key_columns, column_indexes);
+        for key_col in key_columns {
+            if let Some(col_idx) = column_indexes.get(key_col.as_str()).copied() {
+                if contains_replacement_char(row_value(&row, col_idx)) {
+                    has_replacement_key = true;
+                    push_encoding_error(
+                        encoding_errors,
+                        encoding_error_count,
+                        DataCompareEncodingError {
+                            side: label.to_string(),
+                            row_index: row_idx + 1,
+                            column: key_col.clone(),
+                            is_key_column: true,
+                            key_values: readable_keys.clone(),
+                            keys_complete: true,
+                            other_side_value: None,
+                            message: REPLACEMENT_CHAR_ENCODING_MESSAGE.to_string(),
+                        },
+                    );
+                }
+            }
+        }
         let key = key_for_row(&row, key_columns, column_indexes, trim_strings);
         if items.contains_key(&key) {
+            if has_replacement_key {
+                continue;
+            }
             return Err(duplicate_key_error(label, key_columns, &key));
         }
         order.push(key.clone());
-        items.insert(key, normalize_row_len(row, columns.len()));
+        items.insert(key, (row_idx + 1, normalize_row_len(row, columns.len())));
     }
 
     Ok((items, order))
@@ -1797,6 +1911,10 @@ fn generate_insert_sync_statements(
     table: &str,
     column_info: &[DataGridColumnInfo],
 ) -> Vec<String> {
+    let writable_added = options.diff.added.iter().filter(|row| is_writable_added_row(row)).collect::<Vec<_>>();
+    if writable_added.is_empty() {
+        return Vec::new();
+    }
     let writable_columns = options
         .columns
         .iter()
@@ -1808,7 +1926,7 @@ fn generate_insert_sync_statements(
         .collect::<Vec<_>>()
         .join(", ");
     if writable_columns.is_empty() {
-        return options.diff.added.par_iter().map(|_| format!("INSERT INTO {table} DEFAULT VALUES;")).collect();
+        return writable_added.par_iter().map(|_| format!("INSERT INTO {table} DEFAULT VALUES;")).collect();
     }
     let writes_identity = |is_identity: fn(Option<&str>) -> bool| {
         writable_columns
@@ -1827,9 +1945,7 @@ fn generate_insert_sync_statements(
     } else {
         ""
     };
-    options
-        .diff
-        .added
+    writable_added
         .par_chunks(sync_insert_batch_size(options.database_type))
         .map(|chunk| {
             let values = chunk
@@ -1872,7 +1988,7 @@ fn generate_sequence_reset_statements(
     table: &str,
     column_info: &[DataGridColumnInfo],
 ) -> Vec<String> {
-    if options.database_type != Some(DatabaseType::Postgres) || options.diff.added.is_empty() {
+    if options.database_type != Some(DatabaseType::Postgres) || !options.diff.added.iter().any(is_writable_added_row) {
         return Vec::new();
     }
     options
@@ -1920,7 +2036,13 @@ fn generate_update_sync_statements(
                 .columns
                 .iter()
                 .filter(|column| !is_non_identity_generated_column(column_info_for(column_info, column)))
-                .filter(|column| chunk.iter().any(|row| row.changes.iter().any(|change| change.column == **column)))
+                .filter(|column| {
+                    chunk.iter().any(|row| {
+                        row.changes
+                            .iter()
+                            .any(|change| change.column == **column && is_writable_change(change, column_info))
+                    })
+                })
                 .collect::<Vec<_>>();
             if changed_columns.is_empty() {
                 return Vec::new();
@@ -1932,7 +2054,10 @@ fn generate_update_sync_statements(
                     let cases = chunk
                         .iter()
                         .filter_map(|row| {
-                            let change = row.changes.iter().find(|change| change.column == **column)?;
+                            let change = row
+                                .changes
+                                .iter()
+                                .find(|change| change.column == **column && is_writable_change(change, column_info))?;
                             Some(format!(
                                 "WHEN {} THEN {}",
                                 sync_where_by_key(options, column_info, &row.key_values),
@@ -1968,7 +2093,7 @@ fn generate_single_update_statement(
     let assignments = row
         .changes
         .iter()
-        .filter(|change| !is_non_identity_generated_column(column_info_for(column_info, &change.column)))
+        .filter(|change| is_writable_change(change, column_info))
         .map(|change| {
             format!(
                 "{} = {}",
@@ -1990,9 +2115,8 @@ fn generate_delete_sync_statements(
     table: &str,
     column_info: &[DataGridColumnInfo],
 ) -> Vec<String> {
-    options
-        .diff
-        .removed
+    let writable_removed = options.diff.removed.iter().filter(|row| is_writable_removed_row(row)).collect::<Vec<_>>();
+    writable_removed
         .par_chunks(DATA_SYNC_CONDITION_BATCH_SIZE)
         .map(|chunk| {
             if chunk.len() == 1 {
@@ -2784,8 +2908,30 @@ fn is_non_identity_generated_column(column_info: Option<&DataGridColumnInfo>) ->
     extra.contains("generated always as") && !extra.contains("identity")
 }
 
+fn contains_replacement_char(value: &Value) -> bool {
+    matches!(value, Value::String(text) if text.contains('\u{FFFD}'))
+}
+
+fn key_values_have_replacement_char(key_values: &HashMap<String, Value>) -> bool {
+    key_values.values().any(contains_replacement_char)
+}
+
+fn is_writable_change(change: &DataCompareChangedCell, column_info: &[DataGridColumnInfo]) -> bool {
+    !is_non_identity_generated_column(column_info_for(column_info, &change.column))
+        && !contains_replacement_char(&change.source)
+}
+
+fn is_writable_added_row(row: &DataCompareRow) -> bool {
+    !key_values_have_replacement_char(&row.key_values) && !row.values.values().any(contains_replacement_char)
+}
+
+fn is_writable_removed_row(row: &DataCompareRow) -> bool {
+    !key_values_have_replacement_char(&row.key_values)
+}
+
 fn has_writable_changes(row: &DataCompareModifiedRow, column_info: &[DataGridColumnInfo]) -> bool {
-    row.changes.iter().any(|change| !is_non_identity_generated_column(column_info_for(column_info, &change.column)))
+    !key_values_have_replacement_char(&row.key_values)
+        && row.changes.iter().any(|change| is_writable_change(change, column_info))
 }
 
 fn data_grid_column_info(column: crate::types::ColumnInfo) -> DataGridColumnInfo {
@@ -3911,6 +4057,84 @@ mod tests {
         assert_eq!(diff.added.len(), 1);
         assert_eq!(diff.added[0].key_values["id"], json!("K3"));
         assert!(diff.removed.is_empty());
+    }
+
+    #[test]
+    fn replacement_char_cells_keep_decoded_text_in_diff_flag_encoding_errors_and_never_write_to_sync_sql() {
+        let columns = vec!["id".to_string(), "addr".to_string(), "note".to_string()];
+        let preparation = prepare_data_compare_where(
+            DataComparePreparationOptions {
+                ignored_columns: Vec::new(),
+                table_name: "users".into(),
+                schema: None,
+                database_type: Some(DatabaseType::Sqlite),
+                column_info: vec![],
+                columns: columns.clone(),
+                key_columns: vec!["id".into()],
+                source_rows: vec![
+                    vec![json!(1), json!("张三\u{FFFD}李四"), json!("new-note-1")],
+                    vec![json!(2), json!("王五\u{FFFD}赵六"), json!("new-note-2")],
+                    vec![json!(3), json!("只改乱码\u{FFFD}列"), json!("same-note")],
+                    vec![json!(4), json!("两边乱码\u{FFFD}一致"), json!("same-note")],
+                    vec![json!(5), json!("新增乱码\u{FFFD}行"), json!("added-note")],
+                ],
+                target_rows: vec![
+                    vec![json!(1), json!("张三李四"), json!("old-note-1")],
+                    vec![json!(2), json!("王五赵六"), json!("old-note-2")],
+                    vec![json!(3), json!("正常值"), json!("same-note")],
+                    vec![json!(4), json!("两边乱码\u{FFFD}一致"), json!("same-note")],
+                ],
+            },
+            "",
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+
+        // Rows 1, 2, 3 source addr (3) + Row 4 source & target addr (2) + Row 5 added source addr (1) = 6
+        assert_eq!(preparation.result.encoding_error_count, 6);
+        assert!(preparation
+            .result
+            .encoding_errors
+            .iter()
+            .any(|err| err.side == "source" && err.key_values["id"] == json!(4) && err.column == "addr"));
+        assert!(preparation
+            .result
+            .encoding_errors
+            .iter()
+            .any(|err| err.side == "target" && err.key_values["id"] == json!(4) && err.column == "addr"));
+
+        // Full decoded text with replacement character is preserved in modified & added for visual inspection.
+        let row1 = preparation.result.modified.iter().find(|r| r.key_values["id"] == json!(1)).unwrap();
+        let addr_change = row1.changes.iter().find(|c| c.column == "addr").unwrap();
+        assert_eq!(addr_change.source, json!("张三\u{FFFD}李四"));
+        assert_eq!(addr_change.target, json!("张三李四"));
+        assert_eq!(preparation.result.added.len(), 1);
+        assert_eq!(preparation.result.added[0].values["addr"], json!("新增乱码\u{FFFD}行"));
+
+        // Sync SQL updates clean `note` on rows 1 & 2, never writes `addr` with U+FFFD, never inserts row 5.
+        assert!(preparation.sync_sql.contains("new-note-1"));
+        assert!(preparation.sync_sql.contains("new-note-2"));
+        assert!(!preparation.sync_sql.contains('\u{FFFD}'));
+        assert!(!preparation.sync_sql.contains("\"addr\""));
+        assert!(!preparation.sync_sql.contains("INSERT INTO"));
+        assert!(!preparation.sync_sql.contains("id\" = 3"));
+    }
+
+    #[test]
+    fn missing_target_diff_records_encoding_errors_for_replacement_chars() {
+        let columns = vec!["id".to_string(), "addr".to_string()];
+        let diff = missing_target_diff(
+            &columns,
+            &["id".to_string()],
+            vec![vec![json!(1), json!("北京\u{FFFD}上海")], vec![json!(2), json!("正常文本")]],
+        );
+        assert_eq!(diff.added.len(), 2);
+        assert_eq!(diff.added[0].values["addr"], json!("北京\u{FFFD}上海"));
+        assert_eq!(diff.encoding_error_count, 1);
+        assert_eq!(diff.encoding_errors[0].column, "addr");
+        assert_eq!(diff.encoding_errors[0].side, "source");
     }
 
     #[test]

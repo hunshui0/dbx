@@ -63,4 +63,19 @@ describe("DataGridColumnHeader highlight indicator", () => {
     expect(indicator?.getAttribute("title")).toBe("Highlight Active");
     expect(indicator?.getAttribute("aria-label")).toBe("Highlight Active");
   });
+
+  it("renders encoding warning class and indicator when encodingWarning is true", async () => {
+    const host = mountHeader({
+      encodingWarning: true,
+      encodingWarningLabel: "Invalid character bytes decoded with replacement character",
+    });
+    await nextTick();
+    const header = host.querySelector("[data-column-encoding-warning='true']");
+    expect(header).not.toBeNull();
+    expect(header?.classList.contains("data-grid-header-cell--encoding-warning")).toBe(true);
+    const indicator = host.querySelector("[data-column-encoding-warning-indicator]");
+    expect(indicator).not.toBeNull();
+    expect(indicator?.getAttribute("title")).toBe("Invalid character bytes decoded with replacement character");
+    expect(indicator?.getAttribute("aria-label")).toBe("Invalid character bytes decoded with replacement character");
+  });
 });

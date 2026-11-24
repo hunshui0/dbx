@@ -319,6 +319,7 @@ pub async fn execute_multi(
                     preserve_explicit_transaction: preserve_explicit_transaction.unwrap_or(false),
                     defer_lobs: defer_lobs.unwrap_or(false),
                     report_compilation_errors: report_compilation_errors.unwrap_or(false),
+                    ..Default::default()
                 },
                 progress,
             )

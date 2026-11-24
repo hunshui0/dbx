@@ -44,11 +44,12 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 
 class Db2AgentTest extends JdbcFakeExecutionBehaviorTest {
     @Test
-    void keepsStrictDriverDefaultsAndConnectionCredentials() {
+    void configuresJccReplacementDecoderAndKeepsConnectionCredentials() {
         ConnectParams params = new ConnectParams();
         params.setUsername("reader");
         params.setPassword("test-only");
         var properties = new Db2Agent().buildConnectionProperties(params);
+        assertEquals("3", System.getProperty("db2.jcc.charsetDecoderEncoder"));
         assertFalse(properties.containsKey("db2.jcc.charsetDecoderEncoder"));
         assertEquals("reader", properties.getProperty("user"));
         assertEquals("test-only", properties.getProperty("password"));

@@ -34,6 +34,17 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class Db2Agent extends AbstractJdbcAgent {
+    static {
+        // Match DbVisualizer: tell IBM JCC to replace malformed byte sequences with
+        // U+FFFD instead of throwing SQLCODE=-4220 so valid characters before and
+        // after garbled bytes remain visible in queries and comparisons. Columns and
+        // cells containing U+FFFD are highlighted in red in the UI and flagged in
+        // Data Compare without writing replacement characters into Sync SQL.
+        if (System.getProperty("db2.jcc.charsetDecoderEncoder") == null) {
+            System.setProperty("db2.jcc.charsetDecoderEncoder", "3");
+        }
+    }
+
     private static final String LARGE_VALUE_BYTES_COLUMN_PREFIX = "__DBX_LARGE_VALUE_BYTES_";
     private static final String DEFERRED_LOB_MARKER = "D:1";
     private static final Set<String> NUMERIC_PRECISION_TYPES = Set.of(
@@ -61,8 +72,8 @@ public final class Db2Agent extends AbstractJdbcAgent {
 
     @Override
     protected Properties buildConnectionProperties(ConnectParams params) {
-        // Keep JCC's strict decoder: replacement characters can fabricate matches
-        // and differences. Connection encoding is negotiated by JCC, not guessed.
+        // JCC reads db2.jcc.charsetDecoderEncoder from JVM system properties (set in
+        // Db2Agent's static initializer) rather than per-connection Properties.
         return super.buildConnectionProperties(params);
     }
 

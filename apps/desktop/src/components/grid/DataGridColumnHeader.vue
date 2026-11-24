@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { CSSProperties, HTMLAttributes } from "vue";
-import { Copy, KeyRound, Hash, Highlighter, Filter } from "@lucide/vue";
+import { Copy, KeyRound, Hash, Highlighter, Filter, AlertTriangle } from "@lucide/vue";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
 import { columnIndexColorClass, type ColumnIndexKind } from "@/lib/dataGrid/dataGridColumnIndexIcon";
 
@@ -51,6 +51,9 @@ const props = defineProps<{
   /** 该列存在生效中的结构化筛选规则（#14969）。 */
   filterActive?: boolean;
   filterLabel?: string;
+  /** 该列包含字符编码异常/乱码（如包含 U+FFFD 替代字符）。 */
+  encodingWarning?: boolean;
+  encodingWarningLabel?: string;
 }>();
 
 function columnIndexText(kind: ColumnIndexKind): string {
@@ -75,10 +78,19 @@ const emit = defineEmits<{
 <template>
   <div
     class="data-grid-header-cell shrink-0 px-2 py-1.5 border-r border-border whitespace-nowrap hover:bg-gray-200 dark:hover:bg-gray-800 select-none relative overflow-hidden"
-    :class="[dark && 'data-grid-header-cell--dark', selected && 'data-grid-header-cell--selected', searchMatch && 'bg-amber-500/20 ring-1 ring-inset ring-amber-500/40', frozen && 'data-grid-header-cell--frozen', frozenSeparator && 'data-grid-header-cell--frozen-separator', dragClass]"
+    :class="[
+      dark && 'data-grid-header-cell--dark',
+      selected && 'data-grid-header-cell--selected',
+      encodingWarning && 'data-grid-header-cell--encoding-warning',
+      searchMatch && 'bg-amber-500/20 ring-1 ring-inset ring-amber-500/40',
+      frozen && 'data-grid-header-cell--frozen',
+      frozenSeparator && 'data-grid-header-cell--frozen-separator',
+      dragClass,
+    ]"
     :style="columnStyle"
     :data-grid-column-index="actualColumnIndex"
     :data-visible-col-index="visibleColumnIndex"
+    :data-column-encoding-warning="encodingWarning ? 'true' : undefined"
     @pointerdown="emit('pointerdown', $event)"
     @click.capture="emit('clickCapture', $event)"
     @click="emit('click', $event)"
@@ -139,6 +151,9 @@ const emit = defineEmits<{
           </div>
         </template>
       </LightTooltip>
+      <span v-if="encodingWarning" data-column-encoding-warning-indicator class="inline-flex h-4 w-4 shrink-0 items-center justify-center text-red-600 dark:text-red-400" :title="encodingWarningLabel" :aria-label="encodingWarningLabel">
+        <AlertTriangle class="h-3 w-3" />
+      </span>
       <span v-if="formatterActive" data-column-formatter-indicator class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm bg-violet-600 text-[10px] font-bold leading-none text-white shadow-sm dark:bg-violet-500" :title="formatterLabel" :aria-label="formatterLabel">F</span>
       <span v-if="highlightActive" data-column-highlight-indicator class="inline-flex h-4 w-4 shrink-0 items-center justify-center text-amber-500 dark:text-amber-400" :title="highlightLabel" :aria-label="highlightLabel">
         <Highlighter class="h-3 w-3" />
@@ -172,6 +187,16 @@ const emit = defineEmits<{
 .data-grid-header-cell--dark.data-grid-header-cell--selected {
   background-color: var(--data-grid-cell-selected-single-bg, rgb(30, 64, 96)) !important;
   color: rgb(244, 244, 245) !important;
+}
+
+.data-grid-header-cell--encoding-warning {
+  background-color: rgb(254, 226, 226) !important;
+  color: rgb(185, 28, 28) !important;
+}
+
+.data-grid-header-cell--dark.data-grid-header-cell--encoding-warning {
+  background-color: rgba(239, 68, 68, 0.24) !important;
+  color: rgb(252, 165, 165) !important;
 }
 
 .data-grid-header-cell--frozen {

@@ -3614,6 +3614,7 @@ export default withEnglishFallback({
     highlightNulls: "高亮空值",
     clearHighlight: "清除高亮",
     highlightActive: "已启用高亮",
+    encodingWarningColumn: "该列包含字符编码异常/乱码（非法字节已用 \uFFFD 替代显示）",
     filterActive: "已应用筛选",
     structuredFiltersActive: "{count} 个条件筛选",
     highlightDuplicatesFound: "已高亮 {count} 个重复值",

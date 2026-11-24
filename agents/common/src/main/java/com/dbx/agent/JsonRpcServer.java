@@ -400,7 +400,7 @@ public final class JsonRpcServer {
         if (AgentProtocol.METHOD_EXECUTE_QUERY.equals(method)) {
             try (ResultRowReadContext rowContext = ResultRowReadContext.open(
                 params.get("resultKeyColumns"),
-                booleanOrDefault(params, "tolerateEncodingErrors", false)
+                booleanOrDefault(params, "tolerateEncodingErrors", true)
             )) {
                 ExecuteQueryOptions options = new ExecuteQueryOptions(
                     intOrDefault(params, "maxRows", JdbcExecutor.DEFAULT_MAX_ROWS),
@@ -413,23 +413,33 @@ public final class JsonRpcServer {
             }
         }
         if (AgentProtocol.METHOD_EXECUTE_QUERY_PAGE.equals(method)) {
-            return agent.executeQueryPage(
-                params.get("sql").getAsString(),
-                stringOrNull(params, "schema"),
-                new QueryPageOptions(
-                    intOrDefault(params, "pageSize", 100),
-                    intOrNull(params, "fetchSize"),
-                    intOrDefault(params, "maxRows", JdbcExecutor.DEFAULT_MAX_ROWS),
-                    intOrDefault(params, "timeoutSecs", 0),
-                    booleanOrDefault(params, "deferLobs", false)
-                )
-            );
+            try (ResultRowReadContext rowContext = ResultRowReadContext.open(
+                null,
+                booleanOrDefault(params, "tolerateEncodingErrors", true)
+            )) {
+                return agent.executeQueryPage(
+                    params.get("sql").getAsString(),
+                    stringOrNull(params, "schema"),
+                    new QueryPageOptions(
+                        intOrDefault(params, "pageSize", 100),
+                        intOrNull(params, "fetchSize"),
+                        intOrDefault(params, "maxRows", JdbcExecutor.DEFAULT_MAX_ROWS),
+                        intOrDefault(params, "timeoutSecs", 0),
+                        booleanOrDefault(params, "deferLobs", false)
+                    )
+                );
+            }
         }
         if (AgentProtocol.METHOD_FETCH_QUERY_PAGE.equals(method)) {
-            return agent.fetchQueryPage(
-                params.get("sessionId").getAsString(),
-                intOrDefault(params, "pageSize", 100)
-            );
+            try (ResultRowReadContext rowContext = ResultRowReadContext.open(
+                null,
+                booleanOrDefault(params, "tolerateEncodingErrors", true)
+            )) {
+                return agent.fetchQueryPage(
+                    params.get("sessionId").getAsString(),
+                    intOrDefault(params, "pageSize", 100)
+                );
+            }
         }
         if (AgentProtocol.METHOD_CLOSE_QUERY_SESSION.equals(method)) {
             return agent.closeQuerySession(params.get("sessionId").getAsString());

@@ -468,4 +468,43 @@ describe("drawCanvasDataGrid with frozen columns", () => {
     });
     expect(() => drawCanvasDataGrid(optionsWithCustomCrosshairColors)).not.toThrow();
   });
+
+  it("paints red column tint and red text for encoding-warning columns and replacement-char cells", () => {
+    const fills: { fillStyle: string; x: number; width: number }[] = [];
+    const texts: { fillStyle: string; text: string }[] = [];
+    let fillStyle = "";
+    const context = new Proxy(
+      {},
+      {
+        get: (_target, key) => {
+          if (key === "fillRect") return (x: number, _y: number, width: number) => fills.push({ fillStyle, x, width });
+          if (key === "fillText") return (text: string) => texts.push({ fillStyle, text });
+          if (key === "measureText") return () => ({ width: 20 });
+          return () => {};
+        },
+        set: (_target, key, value) => {
+          if (key === "fillStyle") fillStyle = String(value);
+          return true;
+        },
+      },
+    ) as unknown as CanvasRenderingContext2D;
+
+    const canvas = createMockCanvas();
+    vi.spyOn(canvas, "getContext").mockReturnValue(context);
+    drawCanvasDataGrid(
+      createBaseOptions({
+        canvas,
+        rowCount: 2,
+        rowAt: (index: number) => (index === 0 ? createMockRow(0, 0, ["ok", "张三\uFFFD李四", "clean"]) : index === 1 ? createMockRow(1, 1, ["ok2", "normal", "clean2"]) : undefined),
+        encodingWarningColumns: new Set([1]),
+      }),
+    );
+
+    const col1Fills = fills.filter((fill) => fill.x === 160 && fill.width === 120).map((fill) => fill.fillStyle);
+    expect(col1Fills).toContain("rgba(254, 226, 226, 0.55)");
+    expect(col1Fills).toContain("rgb(254, 202, 202)");
+    const garbledText = texts.find((entry) => entry.text.includes("\uFFFD"));
+    expect(garbledText).toBeDefined();
+    expect(garbledText?.fillStyle).toBe("rgb(185, 28, 28)");
+  });
 });

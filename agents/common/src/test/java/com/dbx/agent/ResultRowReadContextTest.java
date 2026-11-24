@@ -138,7 +138,7 @@ class ResultRowReadContextTest {
             }, 0, 1, false, reads);
             QueryResult result = new JdbcExecutor().readResultSet(rs, 0, 100, (r, index, type) -> r.getObject(index));
             assertEquals(2, result.getRows().size());
-            assertNull(result.getRows().get(0).get(0));
+            assertEquals("\uFFFD", result.getRows().get(0).get(0));
             assertEquals("20261015", result.getRows().get(0).get(1));
             assertEquals("0000123", result.getRows().get(0).get(2));
             assertEquals(List.of("healthy", "20261016", "0000124"), result.getRows().get(1));
@@ -163,7 +163,7 @@ class ResultRowReadContextTest {
             QueryResult result = new JdbcExecutor().readResultSet(rs, 0, 100, (r, index, type) -> r.getObject(index));
             assertEquals(2, result.getRows().size());
             assertEquals("addr1", result.getRows().get(0).get(0));
-            assertNull(result.getRows().get(0).get(2));
+            assertEquals("\uFFFD", result.getRows().get(0).get(2));
             assertEquals(List.of("addr2", "20261016", "0000124"), result.getRows().get(1));
             assertEquals(1, result.getMessages().size());
             JsonObject detail = JsonParser.parseString((String) result.getMessages().get(0).get("detail")).getAsJsonObject();
