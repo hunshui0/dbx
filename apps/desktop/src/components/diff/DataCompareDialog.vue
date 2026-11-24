@@ -24,6 +24,7 @@ import {
   buildDataCompareReportMarkdown,
   buildDataCompareToleranceWorksheets,
   buildDataCompareDifferenceWorksheets,
+  buildDataCompareEncodingErrorWorksheets,
   buildDataCompareNullEmptyWorksheets,
   ignoredColumnsWithoutMatch,
   inferCompareKeyColumns,
@@ -307,6 +308,7 @@ const totalModified = computed(() => batchResults.value.reduce((sum, item) => su
 const toleranceTotals = computed(() => batchResults.value.reduce((total, item) => ({ rows: total.rows + (item.diff.toleranceMatches?.length ?? 0), cells: total.cells + (item.diff.toleranceMatches?.reduce((count, row) => count + row.changes.length, 0) ?? 0) }), { rows: 0, cells: 0 }));
 const nullEmptyTotals = computed(() => batchResults.value.reduce((total, item) => ({ rows: total.rows + (item.diff.nullEmptyMatches?.length ?? 0), cells: total.cells + (item.diff.nullEmptyMatches?.reduce((count, row) => count + row.changes.length, 0) ?? 0) }), { rows: 0, cells: 0 }));
 const totalIgnoredOnlyCount = computed(() => batchResults.value.reduce((sum, item) => sum + item.ignoredOnlyCount, 0));
+const totalEncodingErrorCount = computed(() => batchResults.value.reduce((sum, item) => sum + (item.encodingErrorCount ?? item.diff.encodingErrorCount ?? item.diff.encodingErrors?.length ?? 0), 0));
 // An ignored name that matches no compared table is almost certainly a typo:
 // the compare would silently run with the ignore doing nothing. A name missing
 // from a single table stays silent, as required by multi-table compares.
@@ -1008,7 +1010,13 @@ function toggleShowAll(table: DataCompareTableResult, kind: DiffKind) {
 
 /** Real differences and explicit rule-based equivalences both have exportable audit records. */
 const canExportDiffs = computed(() =>
-  batchResults.value.some((item) => (item.diff.nullEmptyMatches?.length ?? 0) > 0 || (item.diff.toleranceMatches?.length ?? 0) > 0 || (item.status === "different" && item.columns.length > 0 && (item.diff.added.length > 0 || item.diff.removed.length > 0 || item.diff.modified.length > 0))),
+  batchResults.value.some(
+    (item) =>
+      (item.diff.encodingErrors?.length ?? 0) > 0 ||
+      (item.diff.nullEmptyMatches?.length ?? 0) > 0 ||
+      (item.diff.toleranceMatches?.length ?? 0) > 0 ||
+      (item.status === "different" && item.columns.length > 0 && (item.diff.added.length > 0 || item.diff.removed.length > 0 || item.diff.modified.length > 0)),
+  ),
 );
 
 /**
@@ -1046,7 +1054,17 @@ async function exportDiffResultsXlsx() {
     present: t("dataCompare.rowPresent"),
     absent: t("dataCompare.rowAbsent"),
   });
-  worksheets.push(...toleranceWorksheets, ...nullWorksheets);
+  const encodingErrorWorksheets = buildDataCompareEncodingErrorWorksheets(batchResults.value, {
+    suffix: t("dataCompare.encodingErrorSheetSuffix"),
+    side: t("dataCompare.encodingErrorSide"),
+    source: t("dataCompare.toleranceSource"),
+    target: t("dataCompare.toleranceTarget"),
+    rowIndex: t("dataCompare.encodingErrorRow"),
+    field: t("dataCompare.toleranceField"),
+    otherSide: t("dataCompare.encodingErrorOtherSide"),
+    reason: t("dataCompare.encodingErrorReason"),
+  });
+  worksheets.push(...toleranceWorksheets, ...nullWorksheets, ...encodingErrorWorksheets);
   if (worksheets.length === 0) return;
 
   exportingDiffs.value = true;
@@ -2011,6 +2029,9 @@ onBeforeUnmount(() => {
                   <div>{{ summary }}</div>
                   <div v-if="toleranceTotals.rows" class="text-xs text-amber-700 dark:text-amber-400">{{ t("dataCompare.toleranceMatchedSummary", toleranceTotals) }}</div>
                   <div v-if="nullEmptyTotals.rows" class="text-xs text-amber-700 dark:text-amber-400">{{ t("dataCompare.nullEmptyMatchedSummary", nullEmptyTotals) }}</div>
+                  <div v-if="totalEncodingErrorCount > 0" class="text-xs text-amber-700 dark:text-amber-400" data-testid="data-compare-encoding-error-summary">
+                    {{ t("dataCompare.encodingErrorSummary", { count: totalEncodingErrorCount }) }}
+                  </div>
                   <div v-if="inconclusiveTableCount" class="text-xs text-amber-700 dark:text-amber-400">{{ t("dataCompare.inconclusiveSummary", { count: inconclusiveTableCount }) }}</div>
                   <div class="text-xs text-muted-foreground">{{ selectedSummary }}</div>
                   <div v-if="totalIgnoredOnlyCount > 0" class="text-xs text-muted-foreground" data-ignored-only-summary>
@@ -2136,6 +2157,9 @@ onBeforeUnmount(() => {
                           <div v-if="item.diff.toleranceMatches?.length" class="mt-1 font-medium text-amber-700 dark:text-amber-400">
                             {{ t("dataCompare.toleranceMatchedSummary", { rows: item.diff.toleranceMatches.length, cells: item.diff.toleranceMatches.reduce((count, row) => count + row.changes.length, 0) }) }}
                           </div>
+                          <div v-if="(item.encodingErrorCount ?? item.diff.encodingErrorCount ?? item.diff.encodingErrors?.length ?? 0) > 0" class="mt-1 font-medium text-amber-700 dark:text-amber-400">
+                            {{ t("dataCompare.encodingErrorTableSummary", { count: item.encodingErrorCount ?? item.diff.encodingErrorCount ?? item.diff.encodingErrors?.length ?? 0 }) }}
+                          </div>
                           <div v-if="item.whereCondition" class="mt-1 break-all font-mono">WHERE {{ item.whereCondition }}</div>
                           <div v-if="item.keyExclusions?.length" class="mt-1 break-all">{{ t("dataCompare.filteredRowsHint") }} {{ keyExclusionsSummary(item.keyExclusions) }}</div>
                           <div v-if="item.status === 'different'" class="mt-1">
@@ -2155,6 +2179,23 @@ onBeforeUnmount(() => {
             </div>
 
             <div class="space-y-3">
+              <details v-for="item in batchResults.filter((entry) => entry.diff.encodingErrors?.length)" :key="`encoding-error-${item.sourceTable}:${item.targetTable}`" class="rounded-lg border border-amber-500/40" data-testid="data-compare-encoding-error-details">
+                <summary class="cursor-pointer px-3 py-2 text-xs font-medium">{{ item.sourceTable }} · {{ t("dataCompare.encodingErrors") }} ({{ item.encodingErrorCount ?? item.diff.encodingErrorCount ?? item.diff.encodingErrors!.length }})</summary>
+                <div class="max-h-72 overflow-auto border-t">
+                  <div v-for="(err, idx) in item.diff.encodingErrors!.slice(0, detailPreviewLimitNumber)" :key="`${err.side}-${err.rowIndex}-${err.column}-${idx}`" class="border-b px-3 py-2 text-xs last:border-b-0">
+                    <div class="font-mono break-all">
+                      [{{ err.side === "source" ? t("dataCompare.toleranceSource") : t("dataCompare.toleranceTarget") }} #{{ err.rowIndex }}]
+                      <template v-if="err.keyValues && Object.keys(err.keyValues).length">{{ formatKeyValues(err.keyValues) }}</template>
+                      <span v-if="err.isKeyColumn" class="ml-1 text-amber-700 dark:text-amber-400">{{ t("dataCompare.encodingErrorKeySkipped") }}</span>
+                    </div>
+                    <div class="mt-1 break-all font-mono text-muted-foreground">
+                      {{ err.column }}
+                      <template v-if="err.otherSideValue !== undefined"> · {{ t("dataCompare.encodingErrorOtherSide") }}: {{ err.otherSideValue === null ? "NULL" : formatValue(err.otherSideValue) }}</template>
+                      · {{ err.message }}
+                    </div>
+                  </div>
+                </div>
+              </details>
               <details v-for="item in batchResults.filter((entry) => entry.diff.nullEmptyMatches?.length)" :key="`null-empty-${item.sourceTable}:${item.targetTable}`" class="rounded-lg border border-amber-500/40" data-testid="data-compare-null-empty-details">
                 <summary class="cursor-pointer px-3 py-2 text-xs font-medium">{{ item.sourceTable }} · {{ t("dataCompare.nullEmptyMatches") }} ({{ item.diff.nullEmptyMatches!.length }})</summary>
                 <div class="max-h-72 overflow-auto border-t">

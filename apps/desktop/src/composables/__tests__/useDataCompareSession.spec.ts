@@ -563,3 +563,27 @@ test("sends per-table trimStrings choice and retains it on each table result", a
     [true, false],
   );
 });
+
+test("carries skipped encoding errors without failing the table and marks zero-diff tables inconclusive", async () => {
+  apiMock.prepareDataCompareFromTables.mockImplementation((options: { targetTable: string }) =>
+    Promise.resolve({
+      ...preparationFor(options.targetTable),
+      sourceRowCount: 5,
+      targetRowCount: 5,
+      result: {
+        added: [],
+        removed: [],
+        modified: [],
+        encodingErrorCount: 2,
+        encodingErrors: [{ side: "source", rowIndex: 1, column: "addr", keyValues: { user_id: 1 }, keysComplete: true, otherSideValue: "ok", message: "SQLCODE=-4220" }],
+      },
+    }),
+  );
+
+  const session = await runSession(baseConfig({ selectedSourceTables: ["users"], targetTable: "users" }), [{ sourceTable: "users", targetTable: "users" }]);
+
+  assert.equal(session.status, "completed");
+  assert.equal(session.batchResults[0]?.status, "inconclusive");
+  assert.equal(session.batchResults[0]?.encodingErrorCount, 2);
+  assert.equal(session.batchResults[0]?.diff.encodingErrors?.length, 1);
+});

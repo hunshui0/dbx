@@ -1331,6 +1331,11 @@ pub struct QueryExecutionOptions {
     /// Agent reads also use these explicit keys for bounded current-row
     /// character-conversion diagnostics; ordinary query fields are not captured.
     pub result_key_columns: Vec<String>,
+    /// When `true`, JDBC agent reads recover from per-cell character encoding
+    /// conversion errors (e.g. DB2 SQLCODE=-4220 / CharConversionException) by
+    /// recording structured warnings in `QueryResult.messages` and continuing
+    /// to read remaining columns and rows.
+    pub tolerate_encoding_errors: bool,
     /// Enables extraction of hidden server-side preview metadata. This must be
     /// set only for generated table-data preview SQL, never arbitrary queries.
     pub table_data_preview: bool,
@@ -1421,6 +1426,9 @@ pub fn agent_execute_query_params(
     });
     if !options.result_key_columns.is_empty() {
         params["resultKeyColumns"] = serde_json::json!(options.result_key_columns);
+    }
+    if options.tolerate_encoding_errors {
+        params["tolerateEncodingErrors"] = serde_json::json!(true);
     }
     if let Some(database) = database.map(str::trim).filter(|database| !database.is_empty()) {
         params["database"] = serde_json::json!(database);

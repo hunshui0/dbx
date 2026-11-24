@@ -41,6 +41,12 @@ public final class QueryResult {
         messages.add(entry);
     }
 
+    public void addMessages(List<Map<String, Object>> extra) {
+        if (extra == null || extra.isEmpty()) return;
+        if (messages == null) messages = new ArrayList<>(extra.size());
+        messages.addAll(extra);
+    }
+
     public QueryResult() {
         this(Collections.emptyList(), Collections.emptyList(), 0L, 0L, false);
     }

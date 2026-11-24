@@ -58,6 +58,8 @@ export interface DataCompareTableResult {
   modified: number;
   /** Rows differing only in ignored columns; identical for diff and sync purposes. */
   ignoredOnlyCount: number;
+  /** Number of cells/rows skipped due to character encoding errors while continuing the comparison. */
+  encodingErrorCount?: number;
   sourceRowCount: number;
   targetRowCount: number;
   sourceTruncated: boolean;
@@ -299,9 +301,10 @@ function buildTableResult(task: DataCompareTableTask, preparation: DataCompareFr
   const added = preparation.result.added.length;
   const removed = preparation.result.removed.length;
   const modified = preparation.result.modified.length;
+  const encodingErrorCount = preparation.result.encodingErrorCount ?? preparation.result.encodingErrors?.length ?? 0;
   // Paired-key sampling can have no shared rows even when filtered totals differ.
   // Empty diff arrays therefore cannot override a definite count mismatch.
-  const status: DataCompareTableStatus = added || removed || modified || preparation.sourceRowCount !== preparation.targetRowCount ? "different" : preparation.sourceTruncated || preparation.targetTruncated ? "inconclusive" : "same";
+  const status: DataCompareTableStatus = added || removed || modified || preparation.sourceRowCount !== preparation.targetRowCount ? "different" : preparation.sourceTruncated || preparation.targetTruncated || encodingErrorCount > 0 ? "inconclusive" : "same";
   return tableResult({
     sourceTable: task.sourceTable,
     targetTable: task.targetTable,
@@ -314,6 +317,7 @@ function buildTableResult(task: DataCompareTableTask, preparation: DataCompareFr
     removed,
     modified,
     ignoredOnlyCount: preparation.result.ignoredOnlyCount ?? 0,
+    encodingErrorCount,
     sourceRowCount: preparation.sourceRowCount,
     targetRowCount: preparation.targetRowCount,
     sourceTruncated: preparation.sourceTruncated,
@@ -341,6 +345,7 @@ function buildMissingTargetResult(task: DataCompareTableTask, preparation: DataC
     removed: 0,
     modified: 0,
     ignoredOnlyCount: 0,
+    encodingErrorCount: preparation.result.encodingErrorCount ?? preparation.result.encodingErrors?.length ?? 0,
     sourceRowCount: preparation.sourceRowCount,
     targetRowCount: 0,
     sourceTruncated: preparation.sourceTruncated,
@@ -367,6 +372,7 @@ function buildErrorResult(task: DataCompareTableTask, keyColumns: string[], data
     removed: 0,
     modified: 0,
     ignoredOnlyCount: 0,
+    encodingErrorCount: 0,
     sourceRowCount: 0,
     targetRowCount: 0,
     sourceTruncated: false,

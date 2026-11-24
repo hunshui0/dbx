@@ -398,7 +398,10 @@ public final class JsonRpcServer {
             return agent.listSubpartitions(params.get("schema").getAsString(), params.get("table").getAsString());
         }
         if (AgentProtocol.METHOD_EXECUTE_QUERY.equals(method)) {
-            try (ResultRowReadContext rowContext = ResultRowReadContext.open(params.get("resultKeyColumns"))) {
+            try (ResultRowReadContext rowContext = ResultRowReadContext.open(
+                params.get("resultKeyColumns"),
+                booleanOrDefault(params, "tolerateEncodingErrors", false)
+            )) {
                 ExecuteQueryOptions options = new ExecuteQueryOptions(
                     intOrDefault(params, "maxRows", JdbcExecutor.DEFAULT_MAX_ROWS),
                     intOrNull(params, "fetchSize"), intOrDefault(params, "timeoutSecs", 0),

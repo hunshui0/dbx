@@ -178,4 +178,45 @@ describe("buildDataCompareReportMarkdown", () => {
     expect(report).toContain("````json\n");
     expect(report).toContain("````sql\nUPDATE t SET note = '```' WHERE id = 1;\n````");
   });
+
+  it("includes skipped encoding errors in markdown reports and builds an encoding-error worksheet", () => {
+    const encodingTable = {
+      ...table,
+      status: "inconclusive" as const,
+      sourceRowCount: 2,
+      targetRowCount: 2,
+      sourceTruncated: false,
+      targetTruncated: false,
+      diff: {
+        added: [],
+        removed: [],
+        modified: [],
+        encodingErrorCount: 1,
+        encodingErrors: [
+          {
+            side: "source",
+            rowIndex: 2,
+            column: "note",
+            keyValues: { id: 10 },
+            keysComplete: true,
+            otherSideValue: "clean-target",
+            message: "SQLCODE=-4220: CharConversionException",
+          },
+        ],
+      },
+    };
+    const report = buildDataCompareReportMarkdown({
+      source: "source",
+      target: "target",
+      compareMode: "full",
+      compareModeLabel: "Full compare",
+      sampleSize: 100,
+      generatedAt: new Date("2026-10-22T12:34:56.000Z"),
+      tables: [encodingTable],
+      syncSql: "",
+      labels,
+    });
+    expect(report).toContain('"encodingErrorCount": 1');
+    expect(report).toContain("SQLCODE=-4220: CharConversionException");
+  });
 });

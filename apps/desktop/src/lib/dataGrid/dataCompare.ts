@@ -85,6 +85,17 @@ export interface DataCompareModifiedRow {
   changes: DataCompareChangedCell[];
 }
 
+export interface DataCompareEncodingError {
+  side: "source" | "target" | string;
+  rowIndex: number;
+  column: string;
+  isKeyColumn?: boolean;
+  keyValues?: Record<string, DataCompareCellValue>;
+  keysComplete?: boolean;
+  otherSideValue?: DataCompareCellValue;
+  message: string;
+}
+
 export interface DataCompareResult {
   nullEmptyMatches?: DataCompareNullEmptyMatch[];
   toleranceMatches?: DataCompareToleranceMatch[];
@@ -93,6 +104,8 @@ export interface DataCompareResult {
   modified: DataCompareModifiedRow[];
   /** Rows matching on key columns whose differences all fall in ignored columns; identical for diff and sync purposes. */
   ignoredOnlyCount?: number;
+  encodingErrors?: DataCompareEncodingError[];
+  encodingErrorCount?: number;
 }
 
 export interface DataCompareToleranceMatch {
@@ -172,6 +185,27 @@ export function buildDataCompareToleranceWorksheets(tables: ReadonlyArray<{ sour
       sheetName: `${table.sourceTable}-${labels.suffix}`,
       columns: [...table.keyColumns, labels.field, labels.source, labels.target, labels.difference, labels.threshold],
       rows: table.diff.toleranceMatches!.flatMap((row) => row.changes.map((change) => [...table.keyColumns.map((key) => row.keyValues[key] ?? null), change.column, change.source, change.target, change.absoluteDifference, DATA_COMPARE_AMOUNT_TOLERANCE])),
+      autoFilter: false,
+    }));
+}
+
+export function buildDataCompareEncodingErrorWorksheets(
+  tables: ReadonlyArray<{ sourceTable: string; keyColumns: string[]; diff: Pick<DataCompareResult, "encodingErrors"> }>,
+  labels: { suffix: string; side: string; source: string; target: string; rowIndex: string; field: string; otherSide: string; reason: string },
+) {
+  return tables
+    .filter((table) => table.diff.encodingErrors?.length)
+    .map((table) => ({
+      sheetName: `${table.sourceTable}-${labels.suffix}`,
+      columns: [labels.side, labels.rowIndex, ...table.keyColumns, labels.field, labels.otherSide, labels.reason],
+      rows: table.diff.encodingErrors!.map((err) => [
+        err.side === "source" ? labels.source : labels.target,
+        err.rowIndex,
+        ...table.keyColumns.map((key) => dataCompareReportCell(err.keyValues?.[key] ?? null)),
+        err.column,
+        err.otherSideValue === undefined ? "" : dataCompareReportCell(err.otherSideValue),
+        err.message,
+      ]),
       autoFilter: false,
     }));
 }
@@ -269,9 +303,21 @@ export function buildDataCompareReportMarkdown(options: DataCompareReportOptions
     totals,
   };
   const tableSections = tables
-    .filter((table) => table.status !== "same" || table.sourceRowCount !== table.targetRowCount || table.diff.added.length || table.diff.removed.length || table.diff.modified.length || table.diff.toleranceMatches?.length || table.diff.nullEmptyMatches?.length)
+    .filter(
+      (table) =>
+        table.status !== "same" ||
+        table.sourceRowCount !== table.targetRowCount ||
+        table.diff.added.length ||
+        table.diff.removed.length ||
+        table.diff.modified.length ||
+        table.diff.toleranceMatches?.length ||
+        table.diff.nullEmptyMatches?.length ||
+        table.diff.encodingErrors?.length ||
+        (table.diff.encodingErrorCount ?? 0) > 0,
+    )
     .map((table, index) => {
       const differences = dataCompareDifferenceEntries(table);
+      const encodingErrorCount = table.diff.encodingErrorCount ?? table.diff.encodingErrors?.length ?? 0;
       const summary = {
         sourceTable: table.sourceTable,
         targetTable: table.targetTable,
@@ -296,6 +342,7 @@ export function buildDataCompareReportMarkdown(options: DataCompareReportOptions
         trimStrings: table.trimStrings === true,
         nullEmptyMatchedRows: table.diff.nullEmptyMatches?.length ?? 0,
         toleranceMatchedRows: table.diff.toleranceMatches?.length ?? 0,
+        ...(encodingErrorCount > 0 ? { encodingErrorCount, encodingErrors: table.diff.encodingErrors ?? [] } : {}),
         ...(table.error ? { error: table.error } : {}),
       };
       return [

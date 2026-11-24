@@ -503,6 +503,8 @@ mod tests {
                     }],
                 }],
                 ignored_only_count: 0,
+                encoding_errors: Vec::new(),
+                encoding_error_count: 0,
             },
             sync_statements: vec![
                 "INSERT INTO \"public\".\"users\" (\"id\", \"name\") VALUES (1, 'Ada');".to_string(),

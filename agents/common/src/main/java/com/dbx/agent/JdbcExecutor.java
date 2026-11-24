@@ -369,7 +369,12 @@ public final class JdbcExecutor {
             }
 
             QueryTiming.record("fetch", phaseStarted);
-            return new QueryResult(columns, columnTypes, rows, 0L, executionTimeMs, truncated);
+            QueryResult result = new QueryResult(columns, columnTypes, rows, 0L, executionTimeMs, truncated);
+            ResultRowReadContext context = ResultRowReadContext.current();
+            if (context != null) {
+                result.addMessages(context.drainEncodingErrorMessages());
+            }
+            return result;
         });
     }
 
@@ -1101,10 +1106,12 @@ public final class JdbcExecutor {
     ) throws SQLException {
         int colCount = sqlTypeByIndex.length;
         ResultRowReadContext context = ResultRowReadContext.current();
+        boolean tolerateEncoding = context != null && context.tolerateEncodingErrors();
         Object[] values = new Object[colCount];
         boolean[] read = new boolean[colCount];
         java.util.Map<String, Object> keys = new java.util.LinkedHashMap<>();
         int current = 1;
+        int zeroBasedRow = (int) Math.max(0L, rowIndex - 1L);
         try {
             if (context != null) {
                 int[] indexes = context.indexes(columns);
@@ -1113,15 +1120,38 @@ public final class JdbcExecutor {
                     if (index < 0) continue;
                     current = index + 1;
                     if (!read[index]) {
-                        values[index] = readColumn(rs, valueReader, sqlTypeByIndex, typeNameByIndex, current);
-                        read[index] = true;
+                        try {
+                            values[index] = readColumn(rs, valueReader, sqlTypeByIndex, typeNameByIndex, current);
+                            read[index] = true;
+                        } catch (SQLException | RuntimeException error) {
+                            if (tolerateEncoding && AgentRpcError.isCharacterConversionError(error)) {
+                                values[index] = null;
+                                read[index] = true;
+                                String colName = index < columns.size() ? columns.get(index) : null;
+                                context.recordEncodingError(zeroBasedRow, index, colName, sqlTypeByIndex[index], true, keys, error);
+                                continue;
+                            }
+                            throw error;
+                        }
                     }
                     keys.put(context.keys().get(k), values[index]);
                 }
             }
             for (int i = 0; i < colCount; i++) {
                 current = i + 1;
-                if (!read[i]) values[i] = readColumn(rs, valueReader, sqlTypeByIndex, typeNameByIndex, current);
+                if (!read[i]) {
+                    try {
+                        values[i] = readColumn(rs, valueReader, sqlTypeByIndex, typeNameByIndex, current);
+                    } catch (SQLException | RuntimeException error) {
+                        if (tolerateEncoding && AgentRpcError.isCharacterConversionError(error)) {
+                            values[i] = null;
+                            String colName = i < columns.size() ? columns.get(i) : null;
+                            context.recordEncodingError(zeroBasedRow, i, colName, sqlTypeByIndex[i], false, keys, error);
+                            continue;
+                        }
+                        throw error;
+                    }
+                }
             }
         } catch (SQLException | RuntimeException error) {
             if (error instanceof ResultColumnReadException column) throw column.withRowContext(rowIndex, context, keys);

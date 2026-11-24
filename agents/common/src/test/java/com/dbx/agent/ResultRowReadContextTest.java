@@ -2,6 +2,7 @@ package com.dbx.agent;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import org.junit.jupiter.api.Test;
 import java.lang.reflect.Proxy;
 import java.nio.charset.MalformedInputException;
@@ -125,6 +126,60 @@ class ResultRowReadContextTest {
             JsonObject conversion = error(rows(new Object[][]{{"bad", "20261015", null}}, 0, 1, false, new ArrayList<>())).getAsJsonObject("data").getAsJsonObject("conversion");
             assertTrue(conversion.getAsJsonObject("keyValues").get("JRNL_NO").isJsonNull());
             assertTrue(conversion.get("keysComplete").getAsBoolean());
+        }
+    }
+
+    @Test void tolerateEncodingErrorsContinuesReadingOtherColumnsAndLaterRows() {
+        List<Integer> reads = new ArrayList<>();
+        try (var context = ResultRowReadContext.open(keys(), true)) {
+            ResultSet rs = rows(new Object[][]{
+                {"broken", "20261015", "0000123"},
+                {"healthy", "20261016", "0000124"}
+            }, 0, 1, false, reads);
+            QueryResult result = new JdbcExecutor().readResultSet(rs, 0, 100, (r, index, type) -> r.getObject(index));
+            assertEquals(2, result.getRows().size());
+            assertNull(result.getRows().get(0).get(0));
+            assertEquals("20261015", result.getRows().get(0).get(1));
+            assertEquals("0000123", result.getRows().get(0).get(2));
+            assertEquals(List.of("healthy", "20261016", "0000124"), result.getRows().get(1));
+            assertEquals(1, result.getMessages().size());
+            assertEquals(ResultRowReadContext.ENCODING_ERROR_CODE, result.getMessages().get(0).get("code"));
+            JsonObject detail = JsonParser.parseString((String) result.getMessages().get(0).get("detail")).getAsJsonObject();
+            assertEquals(0, detail.get("rowIndex").getAsInt());
+            assertEquals(0, detail.get("columnIndex").getAsInt());
+            assertEquals("ADDR", detail.get("columnName").getAsString());
+            assertFalse(detail.get("isKeyColumn").getAsBoolean());
+            assertTrue(detail.get("keysComplete").getAsBoolean());
+            assertEquals("0000123", detail.getAsJsonObject("keyValues").get("JRNL_NO").getAsString());
+        }
+    }
+
+    @Test void tolerateEncodingErrorsMarksKeyColumnFailureAndContinuesNextRows() {
+        try (var context = ResultRowReadContext.open(keys(), true)) {
+            ResultSet rs = rows(new Object[][]{
+                {"addr1", "20261015", "broken-key"},
+                {"addr2", "20261016", "0000124"}
+            }, 0, 3, false, new ArrayList<>());
+            QueryResult result = new JdbcExecutor().readResultSet(rs, 0, 100, (r, index, type) -> r.getObject(index));
+            assertEquals(2, result.getRows().size());
+            assertEquals("addr1", result.getRows().get(0).get(0));
+            assertNull(result.getRows().get(0).get(2));
+            assertEquals(List.of("addr2", "20261016", "0000124"), result.getRows().get(1));
+            assertEquals(1, result.getMessages().size());
+            JsonObject detail = JsonParser.parseString((String) result.getMessages().get(0).get("detail")).getAsJsonObject();
+            assertTrue(detail.get("isKeyColumn").getAsBoolean());
+            assertFalse(detail.get("keysComplete").getAsBoolean());
+            assertEquals("JRNL_NO", detail.get("columnName").getAsString());
+        }
+    }
+
+    @Test void tolerateEncodingErrorsStillThrowsNonEncodingSqlErrors() {
+        try (var context = ResultRowReadContext.open(keys(), true)) {
+            ResultSet rs = rows(new Object[][]{{"ok", "20261015", "0000123"}}, -1, -1, false, new ArrayList<>());
+            assertThrows(RuntimeException.class, () -> new JdbcExecutor().readResultSet(rs, 0, 100, (r, index, type) -> {
+                if (index == 1) throw new SQLException("permission denied", "42501", -551);
+                return r.getObject(index);
+            }));
         }
     }
 }

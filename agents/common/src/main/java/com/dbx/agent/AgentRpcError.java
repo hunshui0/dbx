@@ -273,6 +273,53 @@ public final class AgentRpcError extends RuntimeException {
         return null;
     }
 
+    static boolean isCharacterConversionError(Throwable error) {
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        ArrayDeque<Throwable> pending = new ArrayDeque<>();
+        pending.add(error);
+        while (!pending.isEmpty() && seen.size() < 16) {
+            Throwable current = pending.removeFirst();
+            if (!seen.add(current)) continue;
+            if (current instanceof CharConversionException
+                || current instanceof CharacterCodingException
+                || current instanceof UnsupportedEncodingException
+                || (current instanceof SQLException && ((SQLException) current).getErrorCode() == -4220)) {
+                return true;
+            }
+            String msg = current.getMessage();
+            if (msg != null && (msg.contains("CharConversionException")
+                || msg.contains("MalformedInputException")
+                || msg.contains("UnmappableCharacterException")
+                || msg.contains("ERRORCODE=-4220")
+                || msg.contains("SQLCODE=-4220"))) {
+                return true;
+            }
+            if (current.getCause() != null) pending.addLast(current.getCause());
+            if (current instanceof SQLException sql && sql.getNextException() != null) {
+                pending.addLast(sql.getNextException());
+            }
+        }
+        return false;
+    }
+
+    static String conversionShortMessage(Throwable error) {
+        JsonObject data = conversionDiagnostics(error);
+        String base = message(error);
+        if (base != null && base.length() > 300) {
+            base = base.substring(0, 300) + "...";
+        }
+        if (data == null) {
+            return base == null || base.isBlank() ? "Character encoding conversion error" : base;
+        }
+        StringBuilder out = new StringBuilder();
+        if (base != null && !base.isBlank()) out.append(base);
+        else out.append("Character encoding conversion error");
+        if (data.has("inputLength")) {
+            out.append(" (inputLength=").append(data.get("inputLength").getAsInt()).append(')');
+        }
+        return out.toString();
+    }
+
     private static JsonObject conversionDiagnostics(Throwable error) {
         JsonObject data = new JsonObject();
         JsonArray classes = new JsonArray();

@@ -190,6 +190,32 @@ pub struct DataCompareModifiedRow {
     pub changes: Vec<DataCompareChangedCell>,
 }
 
+const ENCODING_ERROR_MESSAGE_CODE: &str = "DBX_ENCODING_ERROR";
+const ENCODING_ERROR_OVERFLOW_MESSAGE_CODE: &str = "DBX_ENCODING_ERROR_OVERFLOW";
+const INTERNAL_ENCODING_ERROR_SENTINEL_KEY: &str = "__dbx_internal_encoding_error__";
+const MAX_REPORTED_ENCODING_ERRORS: usize = 500;
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataCompareEncodingError {
+    pub side: String,
+    pub row_index: usize,
+    pub column: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_key_column: bool,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub key_values: HashMap<String, Value>,
+    #[serde(default)]
+    pub keys_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_side_value: Option<Value>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataCompareResult {
@@ -205,6 +231,10 @@ pub struct DataCompareResult {
     /// is surfaced so an ignore list cannot silently hide real divergence.
     #[serde(default)]
     pub ignored_only_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub encoding_errors: Vec<DataCompareEncodingError>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub encoding_error_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -765,6 +795,13 @@ pub async fn prepare_data_compare_from_tables(
         options.trim_strings,
     )?;
 
+    let has_corrupted_added = !preparation.result.added.is_empty()
+        && preparation
+            .result
+            .encoding_errors
+            .iter()
+            .any(|err| err.side == "source" && err.other_side_value.is_none() && !err.is_key_column);
+    let sync_eligible = sync_eligible && !has_corrupted_added;
     let (sync_statements, sync_sql) =
         if sync_eligible { (preparation.sync_statements, preparation.sync_sql) } else { (Vec::new(), String::new()) };
 
@@ -924,9 +961,11 @@ pub async fn prepare_data_compare_missing_target(
         }
     };
     let skipped_binary_columns = column_names.len() != source_columns.len();
-    let sync_eligible =
-        !skipped_binary_columns && !source_truncated && !matches!(&options.compare_mode, Some(DataCompareMode::Sample));
     let result = missing_target_diff(&column_names, &options.key_columns, source_rows);
+    let sync_eligible = !skipped_binary_columns
+        && !source_truncated
+        && !matches!(&options.compare_mode, Some(DataCompareMode::Sample))
+        && result.encoding_error_count == 0;
     let mut pre_sync_statements = Vec::new();
     pre_sync_statements.push(format!(
         "{};",
@@ -1057,15 +1096,45 @@ fn build_data_compare_sync_plan_from_refs(tables: &[DataCompareSyncPlanTableRef<
 }
 
 fn missing_target_diff(columns: &[String], key_columns: &[String], source_rows: Vec<Vec<Value>>) -> DataCompareResult {
-    let added = source_rows
-        .into_iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let values = row_object_owned(columns, row);
-            let key = if key_columns.is_empty() { index.to_string() } else { key_for(&values, key_columns) };
-            DataCompareRow { key, key_values: key_values(&values, key_columns), values }
-        })
-        .collect();
+    let mut added = Vec::new();
+    let mut encoding_errors = Vec::new();
+    let mut encoding_error_count = 0usize;
+    let column_indexes = column_index_map(columns);
+
+    for (index, row) in source_rows.into_iter().enumerate() {
+        let has_key_error = key_columns.iter().any(|key| {
+            column_indexes
+                .get(key.as_str())
+                .is_some_and(|col_idx| extract_encoding_error_sentinel(row_value(&row, *col_idx)).is_some())
+        });
+        let row_key_values = sanitize_key_values_for_row(&row, key_columns, &column_indexes);
+        for (col_idx, cell) in row.iter().enumerate() {
+            if let Some(err) = extract_encoding_error_sentinel(cell) {
+                let col_name = columns.get(col_idx).cloned().unwrap_or_else(|| err.column.clone());
+                let is_key = err.is_key_column || key_columns.iter().any(|k| k.eq_ignore_ascii_case(&col_name));
+                push_encoding_error(
+                    &mut encoding_errors,
+                    &mut encoding_error_count,
+                    DataCompareEncodingError {
+                        side: "source".to_string(),
+                        row_index: err.row_index,
+                        column: col_name,
+                        is_key_column: is_key,
+                        key_values: if err.key_values.is_empty() { row_key_values.clone() } else { err.key_values },
+                        keys_complete: err.keys_complete && !has_key_error,
+                        other_side_value: None,
+                        message: err.message,
+                    },
+                );
+            }
+        }
+        if has_key_error {
+            continue;
+        }
+        let values = sanitize_row_object_owned(columns, row);
+        let key = if key_columns.is_empty() { index.to_string() } else { key_for(&values, key_columns) };
+        added.push(DataCompareRow { key, key_values: key_values(&values, key_columns), values });
+    }
 
     DataCompareResult {
         tolerance_matches: Vec::new(),
@@ -1074,6 +1143,8 @@ fn missing_target_diff(columns: &[String], key_columns: &[String], source_rows: 
         removed: Vec::new(),
         modified: Vec::new(),
         ignored_only_count: 0,
+        encoding_errors,
+        encoding_error_count,
     }
 }
 
@@ -1083,6 +1154,8 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
     }
 
     let column_indexes = column_index_map(&options.columns);
+    let mut encoding_errors = Vec::new();
+    let mut encoding_error_count = 0usize;
     let (source, source_order) = collect_compare_rows(
         &options.columns,
         &options.key_columns,
@@ -1090,6 +1163,8 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
         options.source_rows,
         "source",
         options.trim_strings,
+        &mut encoding_errors,
+        &mut encoding_error_count,
     )?;
     let (target, target_order) = collect_compare_rows(
         &options.columns,
@@ -1098,6 +1173,8 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
         options.target_rows,
         "target",
         options.trim_strings,
+        &mut encoding_errors,
+        &mut encoding_error_count,
     )?;
     let key_columns: HashSet<&str> = options.key_columns.iter().map(String::as_str).collect();
     let ignored_columns = resolve_ignored_columns(&options.columns, &options.ignored_columns, &options.key_columns);
@@ -1112,12 +1189,38 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
     for key in &source_order {
         let source_values = source.get(key).expect("source key should exist");
         let Some(target_values) = target.get(key) else {
+            let row_keys = key_values_for_row(source_values, &options.key_columns, &column_indexes);
+            for (col_idx, cell) in source_values.iter().enumerate() {
+                if let Some(err) = extract_encoding_error_sentinel(cell) {
+                    let col_name = options.columns.get(col_idx).cloned().unwrap_or(err.column);
+                    push_encoding_error(
+                        &mut encoding_errors,
+                        &mut encoding_error_count,
+                        DataCompareEncodingError {
+                            side: "source".to_string(),
+                            row_index: err.row_index,
+                            column: col_name,
+                            is_key_column: false,
+                            key_values: row_keys.clone(),
+                            keys_complete: true,
+                            other_side_value: None,
+                            message: err.message,
+                        },
+                    );
+                }
+            }
             added.push(DataCompareRow {
                 key: key.clone(),
-                key_values: key_values_for_row(source_values, &options.key_columns, &column_indexes),
-                values: row_object(&options.columns, source_values),
+                key_values: row_keys,
+                values: sanitize_row_object(&options.columns, source_values),
             });
             continue;
+        };
+
+        let matched_key_values = if options.trim_strings {
+            key_values_for_row(target_values, &options.key_columns, &column_indexes)
+        } else {
+            key_values_for_row(source_values, &options.key_columns, &column_indexes)
         };
 
         let mut changes = Vec::new();
@@ -1128,6 +1231,47 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
             let Some(index) = column_indexes.get(column.as_str()).copied() else { continue };
             let source_value = row_value(source_values, index);
             let target_value = row_value(target_values, index);
+            let src_err = extract_encoding_error_sentinel(source_value);
+            let tgt_err = extract_encoding_error_sentinel(target_value);
+            if src_err.is_some() || tgt_err.is_some() {
+                if let Some(err) = src_err {
+                    push_encoding_error(
+                        &mut encoding_errors,
+                        &mut encoding_error_count,
+                        DataCompareEncodingError {
+                            side: "source".to_string(),
+                            row_index: err.row_index,
+                            column: column.clone(),
+                            is_key_column: false,
+                            key_values: matched_key_values.clone(),
+                            keys_complete: true,
+                            other_side_value: if tgt_err.is_none() { Some(target_value.clone()) } else { None },
+                            message: err.message,
+                        },
+                    );
+                }
+                if let Some(err) = tgt_err {
+                    push_encoding_error(
+                        &mut encoding_errors,
+                        &mut encoding_error_count,
+                        DataCompareEncodingError {
+                            side: "target".to_string(),
+                            row_index: err.row_index,
+                            column: column.clone(),
+                            is_key_column: false,
+                            key_values: matched_key_values.clone(),
+                            keys_complete: true,
+                            other_side_value: if extract_encoding_error_sentinel(source_value).is_none() {
+                                Some(source_value.clone())
+                            } else {
+                                None
+                            },
+                            message: err.message,
+                        },
+                    );
+                }
+                continue;
+            }
             let source_cmp = compare_value_for_trim(source_value, options.trim_strings);
             let target_cmp = compare_value_for_trim(target_value, options.trim_strings);
             if source_cmp == target_cmp {
@@ -1167,17 +1311,12 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
                 });
             }
         }
-        let matched_key_values = if options.trim_strings {
-            key_values_for_row(target_values, &options.key_columns, &column_indexes)
-        } else {
-            key_values_for_row(source_values, &options.key_columns, &column_indexes)
-        };
         if !tolerated.is_empty() {
             tolerance_matches.push(DataCompareToleranceMatch {
                 key: key.clone(),
                 key_values: matched_key_values.clone(),
-                source_values: row_object(&options.columns, source_values),
-                target_values: row_object(&options.columns, target_values),
+                source_values: sanitize_row_object(&options.columns, source_values),
+                target_values: sanitize_row_object(&options.columns, target_values),
                 changes: tolerated,
             });
         }
@@ -1200,8 +1339,8 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
             modified.push(DataCompareModifiedRow {
                 key: key.clone(),
                 key_values: matched_key_values,
-                source_values: row_object(&options.columns, source_values),
-                target_values: row_object(&options.columns, target_values),
+                source_values: sanitize_row_object(&options.columns, source_values),
+                target_values: sanitize_row_object(&options.columns, target_values),
                 changes,
             });
         }
@@ -1210,15 +1349,44 @@ pub fn compare_data_rows(options: CompareDataRowsOptions) -> Result<DataCompareR
     let mut removed = Vec::new();
     for key in &target_order {
         if let Some(target_values) = target.get(key).filter(|_| !source.contains_key(key)) {
+            let row_keys = key_values_for_row(target_values, &options.key_columns, &column_indexes);
+            for (col_idx, cell) in target_values.iter().enumerate() {
+                if let Some(err) = extract_encoding_error_sentinel(cell) {
+                    let col_name = options.columns.get(col_idx).cloned().unwrap_or(err.column);
+                    push_encoding_error(
+                        &mut encoding_errors,
+                        &mut encoding_error_count,
+                        DataCompareEncodingError {
+                            side: "target".to_string(),
+                            row_index: err.row_index,
+                            column: col_name,
+                            is_key_column: false,
+                            key_values: row_keys.clone(),
+                            keys_complete: true,
+                            other_side_value: None,
+                            message: err.message,
+                        },
+                    );
+                }
+            }
             removed.push(DataCompareRow {
                 key: key.clone(),
-                key_values: key_values_for_row(target_values, &options.key_columns, &column_indexes),
-                values: row_object(&options.columns, target_values),
+                key_values: row_keys,
+                values: sanitize_row_object(&options.columns, target_values),
             });
         }
     }
 
-    Ok(DataCompareResult { null_empty_matches, tolerance_matches, added, removed, modified, ignored_only_count })
+    Ok(DataCompareResult {
+        null_empty_matches,
+        tolerance_matches,
+        added,
+        removed,
+        modified,
+        ignored_only_count,
+        encoding_errors,
+        encoding_error_count,
+    })
 }
 
 /// Resolves user-supplied ignored column names against the columns being compared.
@@ -1256,6 +1424,7 @@ fn column_index_map(columns: &[String]) -> HashMap<&str, usize> {
     indexes
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_compare_rows(
     columns: &[String],
     key_columns: &[String],
@@ -1263,11 +1432,42 @@ fn collect_compare_rows(
     rows: Vec<Vec<Value>>,
     label: &str,
     trim_strings: bool,
+    encoding_errors: &mut Vec<DataCompareEncodingError>,
+    encoding_error_count: &mut usize,
 ) -> Result<(CompareRowMap, Vec<String>), String> {
     let mut items = HashMap::with_capacity(rows.len());
     let mut order = Vec::with_capacity(rows.len());
 
     for row in rows {
+        let has_key_error = key_columns.iter().any(|key| {
+            column_indexes
+                .get(key.as_str())
+                .is_some_and(|col_idx| extract_encoding_error_sentinel(row_value(&row, *col_idx)).is_some())
+        });
+        if has_key_error {
+            let readable_keys = sanitize_key_values_for_row(&row, key_columns, column_indexes);
+            for (col_idx, cell) in row.iter().enumerate() {
+                if let Some(err) = extract_encoding_error_sentinel(cell) {
+                    let col_name = columns.get(col_idx).cloned().unwrap_or(err.column);
+                    let is_key = err.is_key_column || key_columns.iter().any(|k| k.eq_ignore_ascii_case(&col_name));
+                    push_encoding_error(
+                        encoding_errors,
+                        encoding_error_count,
+                        DataCompareEncodingError {
+                            side: label.to_string(),
+                            row_index: err.row_index,
+                            column: col_name,
+                            is_key_column: is_key,
+                            key_values: if err.key_values.is_empty() { readable_keys.clone() } else { err.key_values },
+                            keys_complete: false,
+                            other_side_value: None,
+                            message: err.message,
+                        },
+                    );
+                }
+            }
+            continue;
+        }
         let key = key_for_row(&row, key_columns, column_indexes, trim_strings);
         if items.contains_key(&key) {
             return Err(duplicate_key_error(label, key_columns, &key));
@@ -1277,6 +1477,168 @@ fn collect_compare_rows(
     }
 
     Ok((items, order))
+}
+
+struct EncodingErrorSentinel {
+    row_index: usize,
+    column: String,
+    is_key_column: bool,
+    key_values: HashMap<String, Value>,
+    keys_complete: bool,
+    message: String,
+}
+
+fn push_encoding_error(list: &mut Vec<DataCompareEncodingError>, total: &mut usize, entry: DataCompareEncodingError) {
+    *total += 1;
+    if list.len() < MAX_REPORTED_ENCODING_ERRORS {
+        list.push(entry);
+    }
+}
+
+fn make_encoding_error_sentinel(
+    row_index: usize,
+    column: String,
+    is_key_column: bool,
+    key_values: HashMap<String, Value>,
+    keys_complete: bool,
+    message: String,
+) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert(INTERNAL_ENCODING_ERROR_SENTINEL_KEY.to_string(), Value::Bool(true));
+    map.insert("rowIndex".to_string(), Value::Number((row_index as u64).into()));
+    map.insert("column".to_string(), Value::String(column));
+    map.insert("isKeyColumn".to_string(), Value::Bool(is_key_column));
+    map.insert("keyValues".to_string(), serde_json::to_value(key_values).unwrap_or(Value::Object(Default::default())));
+    map.insert("keysComplete".to_string(), Value::Bool(keys_complete));
+    map.insert("message".to_string(), Value::String(message));
+    Value::Object(map)
+}
+
+fn extract_encoding_error_sentinel(value: &Value) -> Option<EncodingErrorSentinel> {
+    let Value::Object(map) = value else { return None };
+    if map.get(INTERNAL_ENCODING_ERROR_SENTINEL_KEY).and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let row_index = map.get("rowIndex").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let column = map.get("column").and_then(Value::as_str).unwrap_or("").to_string();
+    let is_key_column = map.get("isKeyColumn").and_then(Value::as_bool).unwrap_or(false);
+    let keys_complete = map.get("keysComplete").and_then(Value::as_bool).unwrap_or(false);
+    let message = map.get("message").and_then(Value::as_str).unwrap_or("Character encoding error").to_string();
+    let key_values = map
+        .get("keyValues")
+        .and_then(Value::as_object)
+        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    Some(EncodingErrorSentinel { row_index, column, is_key_column, key_values, keys_complete, message })
+}
+
+fn apply_query_encoding_error_sentinels(
+    rows: &mut [Vec<Value>],
+    messages: &[crate::types::QueryMessage],
+    columns: &[String],
+    row_offset: usize,
+) -> usize {
+    let mut tagged = 0usize;
+    for msg in messages {
+        let Some(code) = msg.code.as_deref() else { continue };
+        let Some(detail_str) = msg.detail.as_deref() else { continue };
+        if code == ENCODING_ERROR_MESSAGE_CODE {
+            let Ok(detail) = serde_json::from_str::<Value>(detail_str) else { continue };
+            let Some(row_idx) = detail.get("rowIndex").and_then(Value::as_u64).map(|n| n as usize) else { continue };
+            let Some(col_idx) = detail.get("columnIndex").and_then(Value::as_u64).map(|n| n as usize) else { continue };
+            let Some(row) = rows.get_mut(row_idx) else { continue };
+            if col_idx >= row.len() {
+                continue;
+            }
+            let column = detail
+                .get("columnName")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .or_else(|| columns.get(col_idx).cloned())
+                .unwrap_or_default();
+            let is_key_column = detail.get("isKeyColumn").and_then(Value::as_bool).unwrap_or(false);
+            let keys_complete = detail.get("keysComplete").and_then(Value::as_bool).unwrap_or(false);
+            let key_values = detail
+                .get("keyValues")
+                .and_then(Value::as_object)
+                .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default();
+            row[col_idx] = make_encoding_error_sentinel(
+                row_offset + row_idx + 1,
+                column,
+                is_key_column,
+                key_values,
+                keys_complete,
+                msg.message.clone(),
+            );
+            tagged += 1;
+        } else if code == ENCODING_ERROR_OVERFLOW_MESSAGE_CODE {
+            let Ok(detail) = serde_json::from_str::<Value>(detail_str) else { continue };
+            let Some(cells) = detail.get("cells").and_then(Value::as_array) else { continue };
+            for cell in cells {
+                let Some(arr) = cell.as_array() else { continue };
+                let Some(row_idx) = arr.first().and_then(Value::as_u64).map(|n| n as usize) else { continue };
+                let Some(col_idx) = arr.get(1).and_then(Value::as_u64).map(|n| n as usize) else { continue };
+                let is_key_column = arr.get(2).and_then(Value::as_bool).unwrap_or(false);
+                let Some(row) = rows.get_mut(row_idx) else { continue };
+                if col_idx >= row.len() {
+                    continue;
+                }
+                let column = columns.get(col_idx).cloned().unwrap_or_default();
+                row[col_idx] = make_encoding_error_sentinel(
+                    row_offset + row_idx + 1,
+                    column,
+                    is_key_column,
+                    HashMap::new(),
+                    false,
+                    msg.message.clone(),
+                );
+                tagged += 1;
+            }
+        }
+    }
+    tagged
+}
+
+fn sanitize_row_object(columns: &[String], row: &[Value]) -> HashMap<String, Value> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let value = row.get(index).unwrap_or(&NULL_VALUE);
+            let clean = if extract_encoding_error_sentinel(value).is_some() { Value::Null } else { value.clone() };
+            (column.clone(), clean)
+        })
+        .collect()
+}
+
+fn sanitize_row_object_owned(columns: &[String], row: Vec<Value>) -> HashMap<String, Value> {
+    let mut values = HashMap::with_capacity(columns.len());
+    let mut row_values = row.into_iter();
+    for column in columns {
+        let value = row_values.next().unwrap_or(Value::Null);
+        let clean = if extract_encoding_error_sentinel(&value).is_some() { Value::Null } else { value };
+        values.insert(column.clone(), clean);
+    }
+    values
+}
+
+fn sanitize_key_values_for_row(
+    row: &[Value],
+    key_columns: &[String],
+    column_indexes: &HashMap<&str, usize>,
+) -> HashMap<String, Value> {
+    let mut map = HashMap::new();
+    for column in key_columns {
+        if let Some(index) = column_indexes.get(column.as_str()) {
+            let value = row_value(row, *index);
+            if extract_encoding_error_sentinel(value).is_none() {
+                map.insert(column.clone(), value.clone());
+            }
+        }
+    }
+    map
 }
 
 /// Formats a duplicate-key error so the user can tell which side (source or
@@ -1307,14 +1669,6 @@ struct GenerateDataSyncSqlOptions<'a> {
     database_type: Option<DatabaseType>,
 }
 
-fn row_object(columns: &[String], row: &[Value]) -> HashMap<String, Value> {
-    columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| (column.clone(), row.get(index).cloned().unwrap_or(Value::Null)))
-        .collect()
-}
-
 fn select_compare_columns(
     columns: &[String],
     source_columns: Option<&Vec<String>>,
@@ -1334,15 +1688,6 @@ fn select_compare_columns(
         }
     }
     Ok(selected)
-}
-
-fn row_object_owned(columns: &[String], row: Vec<Value>) -> HashMap<String, Value> {
-    let mut values = HashMap::with_capacity(columns.len());
-    let mut row_values = row.into_iter();
-    for column in columns {
-        values.insert(column.clone(), row_values.next().unwrap_or(Value::Null));
-    }
-    values
 }
 
 fn key_for(row: &HashMap<String, Value>, key_columns: &[String]) -> String {
@@ -2085,7 +2430,7 @@ async fn fetch_compare_rows_by_offset(
             offset,
             filter,
         );
-        let result = execute_sql_statement_with_options(
+        let mut result = execute_sql_statement_with_options(
             state,
             connection_id,
             database,
@@ -2094,6 +2439,7 @@ async fn fetch_compare_rows_by_offset(
             None,
             QueryExecutionOptions {
                 result_key_columns: key_columns.to_vec(),
+                tolerate_encoding_errors: true,
                 ..compare_query_options(state, connection_id, Some(batch_size)).await
             },
         )
@@ -2107,6 +2453,7 @@ async fn fetch_compare_rows_by_offset(
         if fetched == 0 {
             break;
         }
+        apply_query_encoding_error_sentinels(&mut result.rows, &result.messages, columns, rows.len());
         rows.extend(result.rows);
         if fetched < batch_size {
             break;
@@ -2147,7 +2494,7 @@ async fn fetch_compare_rows_by_key(
             batch_size,
             after.as_deref(),
         );
-        let result = execute_sql_statement_with_options(
+        let mut result = execute_sql_statement_with_options(
             state,
             connection_id,
             database,
@@ -2156,6 +2503,7 @@ async fn fetch_compare_rows_by_key(
             None,
             QueryExecutionOptions {
                 result_key_columns: key_columns.to_vec(),
+                tolerate_encoding_errors: true,
                 ..compare_query_options(state, connection_id, Some(batch_size)).await
             },
         )
@@ -2164,6 +2512,7 @@ async fn fetch_compare_rows_by_key(
         if fetched == 0 {
             break;
         }
+        apply_query_encoding_error_sentinels(&mut result.rows, &result.messages, columns, rows.len());
         rows.extend(result.rows);
         if fetched < batch_size {
             break;
@@ -2956,7 +3305,7 @@ async fn fetch_sampled_compare_rows(
         filter,
     );
 
-    let result = execute_sql_statement_with_options(
+    let mut result = execute_sql_statement_with_options(
         state,
         connection_id,
         database,
@@ -2965,10 +3314,12 @@ async fn fetch_sampled_compare_rows(
         None,
         QueryExecutionOptions {
             result_key_columns: key_columns.to_vec(),
+            tolerate_encoding_errors: true,
             ..compare_query_options(state, connection_id, Some(sample_size)).await
         },
     )
     .await?;
+    apply_query_encoding_error_sentinels(&mut result.rows, &result.messages, columns, 0);
 
     if key_columns.is_empty() {
         Ok(result.rows)
@@ -2985,9 +3336,14 @@ fn compute_column_checksums(columns: &[String], rows: &[Vec<Value>], trim_string
     for row in rows {
         for (column_name, index) in &column_indexes {
             if let Some(hasher) = column_hashers.get_mut(*column_name) {
-                let value_str = json_stringify(&compare_value_for_trim(row_value(row, *index), trim_strings));
-                hasher.update(value_str.as_bytes());
-                hasher.update(b"\n");
+                let cell = row_value(row, *index);
+                if extract_encoding_error_sentinel(cell).is_some() {
+                    hasher.update(b"__DBX_ENCODING_ERROR__\n");
+                } else {
+                    let value_str = json_stringify(&compare_value_for_trim(cell, trim_strings));
+                    hasher.update(value_str.as_bytes());
+                    hasher.update(b"\n");
+                }
             }
         }
     }
@@ -3439,6 +3795,136 @@ mod tests {
         with_trim["trimStrings"] = json!(true);
         let enabled: DataCompareFromTablesOptions = serde_json::from_value(with_trim).unwrap();
         assert!(enabled.trim_strings);
+    }
+
+    #[test]
+    fn encoding_error_on_non_key_cell_continues_comparing_other_columns_and_rows_without_polluting_sync_sql() {
+        let columns = vec!["id".to_string(), "addr".to_string(), "note".to_string()];
+        let mut source_rows =
+            vec![vec![json!(1), Value::Null, json!("new-note")], vec![json!(2), json!("ok-addr"), json!("same")]];
+        let messages = vec![crate::types::QueryMessage {
+            severity: "WARNING".to_string(),
+            message: "SQLCODE=-4220: CharConversionException".to_string(),
+            code: Some(ENCODING_ERROR_MESSAGE_CODE.to_string()),
+            detail: Some(
+                json!({
+                    "rowIndex": 0,
+                    "columnIndex": 1,
+                    "columnName": "addr",
+                    "jdbcType": 12,
+                    "isKeyColumn": false,
+                    "keyValues": { "id": 1 },
+                    "keysComplete": true
+                })
+                .to_string(),
+            ),
+            hint: None,
+        }];
+        assert_eq!(apply_query_encoding_error_sentinels(&mut source_rows, &messages, &columns, 0), 1);
+
+        let preparation = prepare_data_compare_where(
+            DataComparePreparationOptions {
+                ignored_columns: Vec::new(),
+                table_name: "users".into(),
+                schema: None,
+                database_type: Some(DatabaseType::Sqlite),
+                column_info: vec![],
+                columns,
+                key_columns: vec!["id".into()],
+                source_rows,
+                target_rows: vec![
+                    vec![json!(1), json!("target-addr"), json!("old-note")],
+                    vec![json!(2), json!("ok-addr"), json!("same")],
+                ],
+            },
+            "",
+            Vec::new(),
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(preparation.result.encoding_error_count, 1);
+        assert_eq!(preparation.result.encoding_errors.len(), 1);
+        let err = &preparation.result.encoding_errors[0];
+        assert_eq!(err.side, "source");
+        assert_eq!(err.column, "addr");
+        assert!(!err.is_key_column);
+        assert_eq!(err.key_values["id"], json!(1));
+        assert_eq!(err.other_side_value, Some(json!("target-addr")));
+
+        // Row 1's other column (`note`) is still compared and synced; broken `addr` is NOT in modified or sync SQL.
+        assert_eq!(preparation.result.modified.len(), 1);
+        assert_eq!(preparation.result.modified[0].changes.len(), 1);
+        assert_eq!(preparation.result.modified[0].changes[0].column, "note");
+        assert!(preparation.sync_sql.contains("\"note\" = 'new-note'"));
+        assert!(!preparation.sync_sql.contains("\"addr\" ="));
+        // Clean row 2 matched without error.
+        assert!(preparation.result.added.is_empty());
+        assert!(preparation.result.removed.is_empty());
+    }
+
+    #[test]
+    fn encoding_error_on_key_column_skips_only_that_row_and_continues_comparing_remaining_rows() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let mut source_rows = vec![
+            vec![Value::Null, json!("corrupted-key-row")],
+            vec![json!("K2"), json!("Alice-new")],
+            vec![json!("K3"), json!("Only-in-source")],
+        ];
+        let messages = vec![crate::types::QueryMessage {
+            severity: "WARNING".to_string(),
+            message: "SQLCODE=-4220".to_string(),
+            code: Some(ENCODING_ERROR_MESSAGE_CODE.to_string()),
+            detail: Some(
+                json!({
+                    "rowIndex": 0,
+                    "columnIndex": 0,
+                    "columnName": "id",
+                    "jdbcType": 1,
+                    "isKeyColumn": true,
+                    "keyValues": {},
+                    "keysComplete": false
+                })
+                .to_string(),
+            ),
+            hint: None,
+        }];
+        apply_query_encoding_error_sentinels(&mut source_rows, &messages, &columns, 0);
+
+        let diff = compare_data_rows(CompareDataRowsOptions {
+            null_equals_empty: false,
+            trim_strings: false,
+            numeric_tolerance_columns: Vec::new(),
+            ignored_columns: Vec::new(),
+            columns,
+            key_columns: vec!["id".into()],
+            source_rows,
+            target_rows: vec![vec![json!("K2"), json!("Alice-old")]],
+        })
+        .unwrap();
+
+        assert_eq!(diff.encoding_error_count, 1);
+        assert!(diff.encoding_errors[0].is_key_column);
+        assert_eq!(diff.modified.len(), 1);
+        assert_eq!(diff.modified[0].key_values["id"], json!("K2"));
+        assert_eq!(diff.added.len(), 1);
+        assert_eq!(diff.added[0].key_values["id"], json!("K3"));
+        assert!(diff.removed.is_empty());
+    }
+
+    #[test]
+    fn tolerate_encoding_errors_flag_is_forwarded_in_agent_query_params_only_when_enabled() {
+        let enabled = crate::query::agent_execute_query_params(
+            "SELECT * FROM T",
+            None,
+            None,
+            QueryExecutionOptions { tolerate_encoding_errors: true, ..Default::default() },
+        );
+        assert_eq!(enabled["tolerateEncodingErrors"], json!(true));
+        let default =
+            crate::query::agent_execute_query_params("SELECT * FROM T", None, None, QueryExecutionOptions::default());
+        assert!(default.get("tolerateEncodingErrors").is_none());
     }
 
     #[test]
@@ -4224,6 +4710,8 @@ mod tests {
                     "generated always as (base_value + 1) stored",
                 )],
                 diff: DataCompareResult {
+                    encoding_errors: Vec::new(),
+                    encoding_error_count: 0,
                     tolerance_matches: Vec::new(),
                     null_empty_matches: Vec::new(),
                     ignored_only_count: 0,
@@ -4277,6 +4765,8 @@ mod tests {
                     ),
                 ],
                 diff: DataCompareResult {
+                    encoding_errors: Vec::new(),
+                    encoding_error_count: 0,
                     tolerance_matches: Vec::new(),
                     null_empty_matches: Vec::new(),
                     ignored_only_count: 0,
@@ -4354,6 +4844,8 @@ mod tests {
                     removed: Vec::new(),
                     modified,
                     ignored_only_count: 0,
+                    encoding_errors: Vec::new(),
+                    encoding_error_count: 0,
                 },
                 database_type: Some(DatabaseType::Postgres),
                 pre_sync_statements: Vec::new(),
@@ -4419,6 +4911,8 @@ mod tests {
                 key_columns: vec!["id".to_string()],
                 column_info: Vec::new(),
                 diff: DataCompareResult {
+                    encoding_errors: Vec::new(),
+                    encoding_error_count: 0,
                     tolerance_matches: Vec::new(),
                     null_empty_matches: Vec::new(),
                     ignored_only_count: 0,
@@ -4469,6 +4963,8 @@ mod tests {
                 key_columns: vec!["id".to_string()],
                 column_info: Vec::new(),
                 diff: DataCompareResult {
+                    encoding_errors: Vec::new(),
+                    encoding_error_count: 0,
                     tolerance_matches: Vec::new(),
                     null_empty_matches: Vec::new(),
                     ignored_only_count: 0,
@@ -4502,6 +4998,8 @@ mod tests {
                 key_columns: vec!["id".to_string()],
                 column_info: Vec::new(),
                 diff: DataCompareResult {
+                    encoding_errors: Vec::new(),
+                    encoding_error_count: 0,
                     tolerance_matches: Vec::new(),
                     null_empty_matches: Vec::new(),
                     ignored_only_count: 0,
@@ -4548,6 +5046,8 @@ mod tests {
                 key_columns: vec!["id".to_string()],
                 column_info: Vec::new(),
                 diff: DataCompareResult {
+                    encoding_errors: Vec::new(),
+                    encoding_error_count: 0,
                     tolerance_matches: Vec::new(),
                     null_empty_matches: Vec::new(),
                     ignored_only_count: 0,
@@ -4610,6 +5110,8 @@ mod tests {
                 key_columns: vec!["id".to_string()],
                 column_info: Vec::new(),
                 diff: DataCompareResult {
+                    encoding_errors: Vec::new(),
+                    encoding_error_count: 0,
                     tolerance_matches: Vec::new(),
                     null_empty_matches: Vec::new(),
                     ignored_only_count: 0,
@@ -4646,6 +5148,8 @@ mod tests {
         let column_info = Vec::new();
         let pre_sync_statements = vec!["CREATE TABLE \"public\".\"users\" (\"id\" integer);".to_string()];
         let diff = DataCompareResult {
+            encoding_errors: Vec::new(),
+            encoding_error_count: 0,
             tolerance_matches: Vec::new(),
             null_empty_matches: Vec::new(),
             ignored_only_count: 0,
@@ -4717,6 +5221,8 @@ mod tests {
                 key_columns: Vec::new(),
                 column_info: Vec::new(),
                 diff: DataCompareResult {
+                    encoding_errors: Vec::new(),
+                    encoding_error_count: 0,
                     tolerance_matches: Vec::new(),
                     null_empty_matches: Vec::new(),
                     ignored_only_count: 0,
@@ -4759,6 +5265,8 @@ mod tests {
                     ),
                 ],
                 diff: DataCompareResult {
+                    encoding_errors: Vec::new(),
+                    encoding_error_count: 0,
                     tolerance_matches: Vec::new(),
                     null_empty_matches: Vec::new(),
                     ignored_only_count: 0,
