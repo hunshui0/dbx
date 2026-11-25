@@ -2381,13 +2381,17 @@ fn is_informix_clause_keyword(column: &str) -> bool {
     )
 }
 
-fn quote_compare_column(database_type: DatabaseType, table: &str, column: &str) -> String {
+fn quote_compare_column(database_type: DatabaseType, table_name: &str, column: &str) -> String {
     if database_type == DatabaseType::Iris {
         quote_iris_identifier(column, None)
     } else if matches!(database_type, DatabaseType::Informix | DatabaseType::Gbase8s)
         && is_informix_clause_keyword(column)
     {
-        format!("{table}.{}", quote_table_identifier(Some(database_type), column))
+        format!(
+            "{}.{}",
+            quote_table_identifier(Some(database_type), table_name),
+            quote_table_identifier(Some(database_type), column)
+        )
     } else {
         quote_table_identifier(Some(database_type), column)
     }
@@ -2404,9 +2408,15 @@ fn annotate_sql_syntax_error(error: String, sql: &str) -> String {
         return error;
     }
     log::warn!("[data-compare:sql-syntax-error] sql={sql} error={error}");
-    let preview: String = sql.chars().take(300).collect();
-    let ellipsis = if sql.chars().count() > 300 { "..." } else { "" };
-    format!("{error} [SQL: {preview}{ellipsis}]")
+    let total_chars = sql.chars().count();
+    let preview = if total_chars <= 1200 {
+        sql.to_string()
+    } else {
+        let head: String = sql.chars().take(750).collect();
+        let tail: String = sql.chars().skip(total_chars - 400).collect();
+        format!("{head} ... {tail}")
+    };
+    format!("{error} [SQL: {preview}]")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2425,7 +2435,7 @@ fn build_filtered_data_compare_select_sql(
     } else {
         qualified_table_name(Some(database_type), Some(schema), table_name)
     };
-    let quote_column = |column: &str| quote_compare_column(database_type, &table, column);
+    let quote_column = |column: &str| quote_compare_column(database_type, table_name, column);
     let select_columns = if columns.is_empty() {
         "*".to_string()
     } else {
@@ -2762,9 +2772,12 @@ async fn fetch_informix_compare_rows_by_key_fallback(
 ) -> Result<Option<Vec<Vec<Value>>>, String> {
     let table = qualified_table_name(Some(database_type), Some(schema), table_name);
     let quoted_keys =
-        key_columns.iter().map(|column| quote_compare_column(database_type, &table, column)).collect::<Vec<_>>();
-    let select_columns =
-        columns.iter().map(|column| quote_compare_column(database_type, &table, column)).collect::<Vec<_>>().join(", ");
+        key_columns.iter().map(|column| quote_compare_column(database_type, table_name, column)).collect::<Vec<_>>();
+    let select_columns = columns
+        .iter()
+        .map(|column| quote_compare_column(database_type, table_name, column))
+        .collect::<Vec<_>>()
+        .join(", ");
     let order_by = quoted_keys.iter().map(|column| format!("{column} ASC")).collect::<Vec<_>>().join(", ");
 
     while rows.len() < row_budget {
@@ -3665,7 +3678,11 @@ fn build_informix_sampling_branch_queries(
     let select_columns = if columns.is_empty() {
         "*".to_string()
     } else {
-        columns.iter().map(|column| quote_compare_column(database_type, &table, column)).collect::<Vec<_>>().join(", ")
+        columns
+            .iter()
+            .map(|column| quote_compare_column(database_type, table_name, column))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     let where_sql = if filter.is_empty() { String::new() } else { format!(" WHERE {filter}") };
     let plain_query = |limit: usize, order_by: Option<&str>| {
@@ -3679,12 +3696,12 @@ fn build_informix_sampling_branch_queries(
 
     let asc_order = key_columns
         .iter()
-        .map(|column| format!("{} ASC", quote_compare_column(database_type, &table, column)))
+        .map(|column| format!("{} ASC", quote_compare_column(database_type, table_name, column)))
         .collect::<Vec<_>>()
         .join(", ");
     let desc_order = key_columns
         .iter()
-        .map(|column| format!("{} DESC", quote_compare_column(database_type, &table, column)))
+        .map(|column| format!("{} DESC", quote_compare_column(database_type, table_name, column)))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -6828,21 +6845,21 @@ mod tests {
             branches[0],
             (
                 5,
-                "SELECT FIRST 5 htbh, easymis.crd_ht_jkht.status, easymis.crd_ht_jkht.first FROM easymis.crd_ht_jkht WHERE htbh IS NOT NULL".to_string()
+                "SELECT FIRST 5 htbh, crd_ht_jkht.status, crd_ht_jkht.first FROM easymis.crd_ht_jkht WHERE htbh IS NOT NULL".to_string()
             )
         );
         assert_eq!(
             branches[1],
             (
                 2,
-                "SELECT FIRST 2 htbh, easymis.crd_ht_jkht.status, easymis.crd_ht_jkht.first FROM easymis.crd_ht_jkht WHERE htbh IS NOT NULL ORDER BY htbh ASC".to_string()
+                "SELECT FIRST 2 htbh, crd_ht_jkht.status, crd_ht_jkht.first FROM easymis.crd_ht_jkht WHERE htbh IS NOT NULL ORDER BY htbh ASC".to_string()
             )
         );
         assert_eq!(
             branches[2],
             (
                 3,
-                "SELECT FIRST 3 htbh, easymis.crd_ht_jkht.status, easymis.crd_ht_jkht.first FROM easymis.crd_ht_jkht WHERE htbh IS NOT NULL ORDER BY htbh DESC".to_string()
+                "SELECT FIRST 3 htbh, crd_ht_jkht.status, crd_ht_jkht.first FROM easymis.crd_ht_jkht WHERE htbh IS NOT NULL ORDER BY htbh DESC".to_string()
             )
         );
         for (_, sql) in &branches {
@@ -6866,7 +6883,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT FIRST 10000 htbh, easymis.crd_ht_jkht.skip, easymis.crd_ht_jkht.desc, khh FROM easymis.crd_ht_jkht ORDER BY htbh ASC"
+            "SELECT FIRST 10000 htbh, crd_ht_jkht.skip, crd_ht_jkht.desc, khh FROM easymis.crd_ht_jkht ORDER BY htbh ASC"
         );
         assert!(!sql.contains('"'));
     }
