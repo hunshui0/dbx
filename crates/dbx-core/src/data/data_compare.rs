@@ -2286,6 +2286,129 @@ fn build_data_compare_select_sql(
     )
 }
 
+fn is_informix_clause_keyword(column: &str) -> bool {
+    matches!(
+        column.trim().to_ascii_lowercase().as_str(),
+        "first"
+            | "skip"
+            | "limit"
+            | "middle"
+            | "distinct"
+            | "unique"
+            | "all"
+            | "desc"
+            | "asc"
+            | "order"
+            | "group"
+            | "where"
+            | "from"
+            | "select"
+            | "into"
+            | "union"
+            | "check"
+            | "index"
+            | "key"
+            | "match"
+            | "matches"
+            | "outer"
+            | "inner"
+            | "left"
+            | "right"
+            | "join"
+            | "cross"
+            | "full"
+            | "table"
+            | "view"
+            | "values"
+            | "default"
+            | "current"
+            | "interval"
+            | "today"
+            | "user"
+            | "case"
+            | "when"
+            | "then"
+            | "else"
+            | "end"
+            | "and"
+            | "or"
+            | "not"
+            | "in"
+            | "is"
+            | "null"
+            | "like"
+            | "between"
+            | "exists"
+            | "as"
+            | "on"
+            | "to"
+            | "by"
+            | "for"
+            | "of"
+            | "set"
+            | "update"
+            | "insert"
+            | "delete"
+            | "create"
+            | "alter"
+            | "drop"
+            | "begin"
+            | "commit"
+            | "rollback"
+            | "work"
+            | "temp"
+            | "row"
+            | "role"
+            | "lock"
+            | "mode"
+            | "option"
+            | "public"
+            | "range"
+            | "unit"
+            | "units"
+            | "date"
+            | "year"
+            | "month"
+            | "day"
+            | "hour"
+            | "minute"
+            | "second"
+            | "fraction"
+            | "type"
+            | "value"
+            | "level"
+            | "status"
+    )
+}
+
+fn quote_compare_column(database_type: DatabaseType, table: &str, column: &str) -> String {
+    if database_type == DatabaseType::Iris {
+        quote_iris_identifier(column, None)
+    } else if matches!(database_type, DatabaseType::Informix | DatabaseType::Gbase8s)
+        && is_informix_clause_keyword(column)
+    {
+        format!("{table}.{}", quote_table_identifier(Some(database_type), column))
+    } else {
+        quote_table_identifier(Some(database_type), column)
+    }
+}
+
+fn is_sql_syntax_error(error: &str) -> bool {
+    error.contains("-201")
+        || error.contains("SQLSyntaxErrorException")
+        || error.to_ascii_lowercase().contains("syntax error")
+}
+
+fn annotate_sql_syntax_error(error: String, sql: &str) -> String {
+    if !is_sql_syntax_error(&error) {
+        return error;
+    }
+    log::warn!("[data-compare:sql-syntax-error] sql={sql} error={error}");
+    let preview: String = sql.chars().take(300).collect();
+    let ellipsis = if sql.chars().count() > 300 { "..." } else { "" };
+    format!("{error} [SQL: {preview}{ellipsis}]")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_filtered_data_compare_select_sql(
     database_type: DatabaseType,
@@ -2302,13 +2425,7 @@ fn build_filtered_data_compare_select_sql(
     } else {
         qualified_table_name(Some(database_type), Some(schema), table_name)
     };
-    let quote_column = |column: &str| {
-        if database_type == DatabaseType::Iris {
-            quote_iris_identifier(column, None)
-        } else {
-            quote_table_identifier(Some(database_type), column)
-        }
-    };
+    let quote_column = |column: &str| quote_compare_column(database_type, &table, column);
     let select_columns = if columns.is_empty() {
         "*".to_string()
     } else {
@@ -2554,7 +2671,7 @@ async fn fetch_compare_rows_by_offset(
             offset,
             filter,
         );
-        let mut result = execute_sql_statement_with_options(
+        let mut result = match execute_sql_statement_with_options(
             state,
             connection_id,
             database,
@@ -2567,7 +2684,44 @@ async fn fetch_compare_rows_by_offset(
                 ..compare_query_options(state, connection_id, Some(batch_size)).await
             },
         )
-        .await?;
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if matches!(database_type, DatabaseType::Informix | DatabaseType::Gbase8s)
+                    && offset > 0
+                    && is_sql_syntax_error(&error)
+                    && !key_columns.is_empty()
+                {
+                    if let Some(key_indexes) = key_columns
+                        .iter()
+                        .map(|key| columns.iter().position(|column| column == key))
+                        .collect::<Option<Vec<usize>>>()
+                    {
+                        if let Some(fallback_rows) = fetch_informix_compare_rows_by_key_fallback(
+                            state,
+                            connection_id,
+                            database,
+                            schema,
+                            table_name,
+                            columns,
+                            key_columns,
+                            &key_indexes,
+                            database_type,
+                            fetch_batch_size,
+                            row_budget,
+                            rows,
+                            filter,
+                        )
+                        .await?
+                        {
+                            return Ok(fallback_rows);
+                        }
+                    }
+                }
+                return Err(annotate_sql_syntax_error(error, &sql));
+            }
+        };
         let fetched = result.rows.len();
         if result.truncated && fetched < batch_size {
             return Err(format!(
@@ -2586,6 +2740,73 @@ async fn fetch_compare_rows_by_offset(
     }
 
     Ok(rows)
+}
+
+/// Fallback for Informix servers that reject `SELECT SKIP <offset> FIRST <limit>` with `-201`.
+/// Continues from the already-fetched prefix using keyset paging with `SELECT FIRST <limit>`.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_informix_compare_rows_by_key_fallback(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table_name: &str,
+    columns: &[String],
+    key_columns: &[String],
+    key_indexes: &[usize],
+    database_type: DatabaseType,
+    fetch_batch_size: usize,
+    row_budget: usize,
+    mut rows: Vec<Vec<Value>>,
+    filter: &str,
+) -> Result<Option<Vec<Vec<Value>>>, String> {
+    let table = qualified_table_name(Some(database_type), Some(schema), table_name);
+    let quoted_keys =
+        key_columns.iter().map(|column| quote_compare_column(database_type, &table, column)).collect::<Vec<_>>();
+    let select_columns =
+        columns.iter().map(|column| quote_compare_column(database_type, &table, column)).collect::<Vec<_>>().join(", ");
+    let order_by = quoted_keys.iter().map(|column| format!("{column} ASC")).collect::<Vec<_>>().join(", ");
+
+    while rows.len() < row_budget {
+        let Some(last_row) = rows.last() else {
+            return Ok(None);
+        };
+        let Some(boundary) = keyset_boundary_literals(database_type, last_row, key_indexes) else {
+            return Ok(None);
+        };
+        let batch_size = fetch_batch_size.min(row_budget - rows.len());
+        let after_pred = keyset_after_predicate(database_type, &quoted_keys, &boundary);
+        let combined_filter = combine_compare_filters(filter, &after_pred);
+        let sql = format!(
+            "SELECT FIRST {batch_size} {select_columns} FROM {table} WHERE {combined_filter} ORDER BY {order_by}"
+        );
+        let mut result = execute_sql_statement_with_options(
+            state,
+            connection_id,
+            database,
+            &sql,
+            Some(schema),
+            None,
+            QueryExecutionOptions {
+                result_key_columns: key_columns.to_vec(),
+                tolerate_encoding_errors: true,
+                ..compare_query_options(state, connection_id, Some(batch_size)).await
+            },
+        )
+        .await
+        .map_err(|error| annotate_sql_syntax_error(error, &sql))?;
+        let fetched = result.rows.len();
+        if fetched == 0 {
+            break;
+        }
+        apply_query_encoding_error_sentinels(&mut result.rows, &result.messages, columns, rows.len());
+        rows.extend(result.rows);
+        if fetched < batch_size {
+            break;
+        }
+    }
+
+    Ok(Some(rows))
 }
 
 /// Reads pages by key. Returns `None` when a page boundary cannot be expressed as a key
@@ -3289,7 +3510,7 @@ fn build_filtered_sampling_select_sql(
                 format!("SELECT {select_columns} FROM {table} ORDER BY RAND() LIMIT {sample_size}")
             }
             DatabaseType::Informix | DatabaseType::Gbase8s => {
-                format!("SELECT FIRST {sample_size} {select_columns} FROM {table} ORDER BY RAND()")
+                format!("SELECT FIRST {sample_size} {select_columns} FROM {table}")
             }
             _ => {
                 if key_columns.is_empty() {
@@ -3401,7 +3622,7 @@ fn build_filtered_sampling_select_sql(
                     format!("SELECT {select_columns} FROM {table} ORDER BY RAND() LIMIT {random_count}")
                 }
                 DatabaseType::Informix | DatabaseType::Gbase8s => {
-                    format!("SELECT FIRST {random_count} {select_columns} FROM {table} ORDER BY RAND()")
+                    format!("SELECT FIRST {random_count} {select_columns} FROM {table}")
                 }
                 _ => {
                     format!("SELECT {select_columns} FROM {table} LIMIT {random_count}")
@@ -3422,6 +3643,82 @@ fn build_filtered_sampling_select_sql(
     }
 }
 
+/// Informix and GBase 8s reject `ORDER BY RAND()` and forbid `FIRST` / `ORDER BY`
+/// inside derived-table subqueries (`FROM (SELECT FIRST ... ORDER BY ...) dbx_sample`),
+/// returning `-201: A syntax error has occurred`. Run each sampling branch as a plain
+/// top-level `SELECT FIRST <n>` statement instead and merge/deduplicate in Rust.
+#[allow(clippy::too_many_arguments)]
+fn build_informix_sampling_branch_queries(
+    database_type: DatabaseType,
+    schema: &str,
+    table_name: &str,
+    columns: &[String],
+    key_columns: &[String],
+    strategy: &SamplingStrategy,
+    sample_size: usize,
+    filter: &str,
+) -> Vec<(usize, String)> {
+    if sample_size == 0 {
+        return Vec::new();
+    }
+    let table = qualified_table_name(Some(database_type), Some(schema), table_name);
+    let select_columns = if columns.is_empty() {
+        "*".to_string()
+    } else {
+        columns.iter().map(|column| quote_compare_column(database_type, &table, column)).collect::<Vec<_>>().join(", ")
+    };
+    let where_sql = if filter.is_empty() { String::new() } else { format!(" WHERE {filter}") };
+    let plain_query = |limit: usize, order_by: Option<&str>| {
+        let order = order_by.map(|clause| format!(" ORDER BY {clause}")).unwrap_or_default();
+        format!("SELECT FIRST {limit} {select_columns} FROM {table}{where_sql}{order}")
+    };
+
+    if matches!(strategy, SamplingStrategy::Random) || key_columns.is_empty() {
+        return vec![(sample_size, plain_query(sample_size, None))];
+    }
+
+    let asc_order = key_columns
+        .iter()
+        .map(|column| format!("{} ASC", quote_compare_column(database_type, &table, column)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let desc_order = key_columns
+        .iter()
+        .map(|column| format!("{} DESC", quote_compare_column(database_type, &table, column)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut branches = Vec::new();
+    match strategy {
+        SamplingStrategy::Random => unreachable!(),
+        SamplingStrategy::ExtremeValues => {
+            let head_count = sample_size / 2;
+            let tail_count = sample_size - head_count;
+            if head_count > 0 {
+                branches.push((head_count, plain_query(head_count, Some(&asc_order))));
+            }
+            if tail_count > 0 {
+                branches.push((tail_count, plain_query(tail_count, Some(&desc_order))));
+            }
+        }
+        SamplingStrategy::Hybrid => {
+            let random_count = sample_size / 2;
+            let head_count = (sample_size - random_count) / 2;
+            let tail_count = sample_size - random_count - head_count;
+            if random_count > 0 {
+                branches.push((random_count, plain_query(random_count, None)));
+            }
+            if head_count > 0 {
+                branches.push((head_count, plain_query(head_count, Some(&asc_order))));
+            }
+            if tail_count > 0 {
+                branches.push((tail_count, plain_query(tail_count, Some(&desc_order))));
+            }
+        }
+    }
+    branches
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fetch_sampled_compare_rows(
     state: &AppState,
@@ -3438,6 +3735,49 @@ async fn fetch_sampled_compare_rows(
 ) -> Result<Vec<Vec<Value>>, String> {
     if sample_size == 0 {
         return Ok(Vec::new());
+    }
+
+    if matches!(database_type, DatabaseType::Informix | DatabaseType::Gbase8s) {
+        let branches = build_informix_sampling_branch_queries(
+            database_type,
+            schema,
+            table_name,
+            columns,
+            key_columns,
+            strategy,
+            sample_size,
+            filter,
+        );
+        let multi_branch = branches.len() > 1;
+        let mut combined = Vec::new();
+        for (branch_index, (branch_limit, branch_sql)) in branches.into_iter().enumerate() {
+            let mut result = execute_sql_statement_with_options(
+                state,
+                connection_id,
+                database,
+                &branch_sql,
+                Some(schema),
+                None,
+                QueryExecutionOptions {
+                    result_key_columns: key_columns.to_vec(),
+                    tolerate_encoding_errors: true,
+                    ..compare_query_options(state, connection_id, Some(branch_limit)).await
+                },
+            )
+            .await
+            .map_err(|error| annotate_sql_syntax_error(error, &branch_sql))?;
+            apply_query_encoding_error_sentinels(&mut result.rows, &result.messages, columns, combined.len());
+            if multi_branch {
+                let marker = Value::String(branch_index.to_string());
+                for mut row in result.rows {
+                    row.push(marker.clone());
+                    combined.push(row);
+                }
+            } else {
+                combined.extend(result.rows);
+            }
+        }
+        return Ok(if multi_branch { dedupe_sampled_rows(combined) } else { combined });
     }
 
     let sql = build_filtered_sampling_select_sql(
@@ -3464,7 +3804,8 @@ async fn fetch_sampled_compare_rows(
             ..compare_query_options(state, connection_id, Some(sample_size)).await
         },
     )
-    .await?;
+    .await
+    .map_err(|error| annotate_sql_syntax_error(error, &sql))?;
     apply_query_encoding_error_sentinels(&mut result.rows, &result.messages, columns, 0);
 
     if key_columns.is_empty() {
@@ -6466,7 +6807,68 @@ mod tests {
             assert!(sql.contains("SELECT FIRST 2 id, name FROM"));
             assert!(sql.contains("SELECT FIRST 3 id, name FROM"));
             assert!(!sql.contains(" LIMIT "));
+            assert!(!sql.contains("ORDER BY RAND()"));
         }
+    }
+
+    #[test]
+    fn informix_sampling_uses_separate_top_level_first_queries_without_rand_or_subqueries() {
+        let branches = build_informix_sampling_branch_queries(
+            DatabaseType::Informix,
+            "easymis",
+            "crd_ht_jkht",
+            &["htbh".to_string(), "status".to_string(), "first".to_string()],
+            &["htbh".to_string()],
+            &SamplingStrategy::Hybrid,
+            10,
+            "htbh IS NOT NULL",
+        );
+        assert_eq!(branches.len(), 3);
+        assert_eq!(
+            branches[0],
+            (
+                5,
+                "SELECT FIRST 5 htbh, easymis.crd_ht_jkht.status, easymis.crd_ht_jkht.first FROM easymis.crd_ht_jkht WHERE htbh IS NOT NULL".to_string()
+            )
+        );
+        assert_eq!(
+            branches[1],
+            (
+                2,
+                "SELECT FIRST 2 htbh, easymis.crd_ht_jkht.status, easymis.crd_ht_jkht.first FROM easymis.crd_ht_jkht WHERE htbh IS NOT NULL ORDER BY htbh ASC".to_string()
+            )
+        );
+        assert_eq!(
+            branches[2],
+            (
+                3,
+                "SELECT FIRST 3 htbh, easymis.crd_ht_jkht.status, easymis.crd_ht_jkht.first FROM easymis.crd_ht_jkht WHERE htbh IS NOT NULL ORDER BY htbh DESC".to_string()
+            )
+        );
+        for (_, sql) in &branches {
+            assert!(!sql.contains("RAND()"), "{sql}");
+            assert!(!sql.contains("UNION ALL"), "{sql}");
+            assert!(!sql.contains("FROM (SELECT"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn informix_full_compare_qualifies_keyword_columns_without_double_quotes() {
+        let sql = build_filtered_data_compare_select_sql(
+            DatabaseType::Informix,
+            "easymis",
+            "crd_ht_jkht",
+            &["htbh".to_string(), "skip".to_string(), "desc".to_string(), "khh".to_string()],
+            &["htbh".to_string()],
+            10_000,
+            0,
+            "",
+        );
+        assert_eq!(
+            sql,
+            "SELECT FIRST 10000 htbh, easymis.crd_ht_jkht.skip, easymis.crd_ht_jkht.desc, khh FROM easymis.crd_ht_jkht ORDER BY htbh ASC"
+        );
+        assert!(!sql.contains('"'));
     }
 
     #[test]
