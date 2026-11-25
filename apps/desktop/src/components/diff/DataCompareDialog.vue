@@ -589,16 +589,26 @@ function buildSessionIgnoredColumnsByTable(): Record<string, string[]> {
   return overrides;
 }
 
-function buildCompareTasks(): DataCompareTableTask[] {
+function canCompareTable(table: string): boolean {
+  if (!canCompare.value || comparing.value || executionLocked.value) return false;
+  const row = keyColumnRows.value.find((entry) => entry.table === table);
+  if (row && row.matched && isTableColumnsKnown(table) && row.columns.length === 0) return false;
+  return true;
+}
+
+function buildCompareTasks(onlySourceTables?: string[]): DataCompareTableTask[] {
   if (!selectedSourceTableNames.value.length) return [];
   if (!isBatchCompare.value) {
     const table = selectedSourceTableNames.value[0];
     return table ? [{ sourceTable: table, targetTable: targetTable.value || table }] : [];
   }
-  return selectedSourceTableNames.value.map((table) => ({
-    sourceTable: table,
-    targetTable: table,
-  }));
+  const filter = Array.isArray(onlySourceTables) && onlySourceTables.length > 0 ? new Set(onlySourceTables) : null;
+  return selectedSourceTableNames.value
+    .filter((table) => !filter || filter.has(table))
+    .map((table) => ({
+      sourceTable: table,
+      targetTable: table,
+    }));
 }
 
 function clearResult() {
@@ -1213,9 +1223,11 @@ async function rebuildSyncPlan() {
   }
 }
 
-function startCompare(): void {
+function startCompare(onlySourceTables?: string[]): void {
+  const selectedOnly = Array.isArray(onlySourceTables) && onlySourceTables.length > 0 ? onlySourceTables : undefined;
   if (!canCompare.value || comparing.value || executionLocked.value) return;
-  const tasks = buildCompareTasks();
+  if (selectedOnly && selectedOnly.length === 1 && !canCompareTable(selectedOnly[0]!)) return;
+  const tasks = buildCompareTasks(selectedOnly);
   if (tasks.length === 0) {
     toast(t("dataCompare.noComparableTables"), 5000);
     return;
@@ -1812,11 +1824,23 @@ onBeforeUnmount(() => {
                 </div>
                 <div v-if="compareTasksPreview.length" class="max-h-36 overflow-auto rounded border bg-muted/20">
                   <div v-for="task in compareTasksPreview" :key="`${task.sourceTable}:${task.targetTable}`" class="flex items-center justify-between gap-2 border-b px-2 py-1 last:border-b-0">
-                    <span class="truncate font-mono">{{ task.sourceTable }}</span>
-                    <span class="text-muted-foreground">→</span>
-                    <span class="truncate font-mono" :class="task.matched ? '' : 'text-destructive'">
+                    <span class="min-w-0 flex-1 truncate font-mono">{{ task.sourceTable }}</span>
+                    <span class="shrink-0 text-muted-foreground">→</span>
+                    <span class="min-w-0 flex-1 truncate font-mono" :class="task.matched ? '' : 'text-destructive'">
                       {{ task.targetTable || t("dataCompare.targetTableMissing", { table: task.sourceTable }) }}
                     </span>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      class="h-5 shrink-0 px-1.5 text-[11px]"
+                      :disabled="!canCompareTable(task.sourceTable)"
+                      :data-preview-compare-single-table="task.sourceTable"
+                      :title="t('dataCompare.compareSingleTableHint', { table: task.sourceTable })"
+                      @click="startCompare([task.sourceTable])"
+                    >
+                      {{ t("dataCompare.compareSingleTable") }}
+                    </Button>
                   </div>
                 </div>
               </div>
@@ -1882,19 +1906,25 @@ onBeforeUnmount(() => {
                 </div>
                 <div class="max-h-56 divide-y overflow-auto">
                   <div v-for="row in keyColumnRows" :key="row.table">
-                    <button type="button" class="dbx-compare-key-table-row flex w-full items-center gap-2 px-2 py-1.5 text-left text-xs hover:bg-muted/40" :data-key-column-table="row.table" @click="toggleKeyColumnTable(row.table)">
-                      <ChevronDown v-if="expandedKeyColumnTable === row.table" class="h-3.5 w-3.5 shrink-0" />
-                      <ChevronRight v-else class="h-3.5 w-3.5 shrink-0" />
-                      <span class="min-w-0 flex-1 truncate font-mono">{{ row.table }}</span>
-                      <span v-if="whereConditionOverrides[row.table]?.trim()" class="shrink-0 text-[10px] text-primary" :title="whereConditionOverrides[row.table]">{{ t("dataCompare.whereConditionActive") }}</span>
-                      <span v-if="trimStringsOverrides[row.table]" class="shrink-0 text-[10px] text-primary">{{ t("dataCompare.trimStringsActive") }}</span>
-                      <span class="min-w-0 max-w-[45%] shrink-0 truncate font-mono" :class="row.columns.length > 0 ? (row.manual ? 'text-foreground' : 'text-muted-foreground') : 'text-destructive'">
-                        {{ row.loading ? t("dataCompare.keyColumnsLoading") : row.columns.length > 0 ? row.columns.join(", ") : t("dataCompare.keyColumnsNeedsSelection") }}
-                      </span>
-                      <span class="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium" :class="row.status === 'manual' ? 'bg-primary/15 text-primary' : row.status === 'auto' ? 'bg-muted text-muted-foreground' : 'bg-destructive/15 text-destructive'">
-                        {{ row.status === "manual" ? t("dataCompare.keyColumnsStatusManual") : row.status === "auto" ? t("dataCompare.keyColumnsStatusAuto") : t("dataCompare.keyColumnsNeedsSelection") }}
-                      </span>
-                    </button>
+                    <div class="flex items-center gap-1 pr-2">
+                      <button type="button" class="dbx-compare-key-table-row flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left text-xs hover:bg-muted/40" :data-key-column-table="row.table" @click="toggleKeyColumnTable(row.table)">
+                        <ChevronDown v-if="expandedKeyColumnTable === row.table" class="h-3.5 w-3.5 shrink-0" />
+                        <ChevronRight v-else class="h-3.5 w-3.5 shrink-0" />
+                        <span class="min-w-0 flex-1 truncate font-mono">{{ row.table }}</span>
+                        <span v-if="whereConditionOverrides[row.table]?.trim()" class="shrink-0 text-[10px] text-primary" :title="whereConditionOverrides[row.table]">{{ t("dataCompare.whereConditionActive") }}</span>
+                        <span v-if="trimStringsOverrides[row.table]" class="shrink-0 text-[10px] text-primary">{{ t("dataCompare.trimStringsActive") }}</span>
+                        <span class="min-w-0 max-w-[40%] shrink-0 truncate font-mono" :class="row.columns.length > 0 ? (row.manual ? 'text-foreground' : 'text-muted-foreground') : 'text-destructive'">
+                          {{ row.loading ? t("dataCompare.keyColumnsLoading") : row.columns.length > 0 ? row.columns.join(", ") : t("dataCompare.keyColumnsNeedsSelection") }}
+                        </span>
+                        <span class="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium" :class="row.status === 'manual' ? 'bg-primary/15 text-primary' : row.status === 'auto' ? 'bg-muted text-muted-foreground' : 'bg-destructive/15 text-destructive'">
+                          {{ row.status === "manual" ? t("dataCompare.keyColumnsStatusManual") : row.status === "auto" ? t("dataCompare.keyColumnsStatusAuto") : t("dataCompare.keyColumnsNeedsSelection") }}
+                        </span>
+                      </button>
+                      <Button type="button" size="sm" variant="outline" class="h-6 shrink-0 px-2 text-[11px]" :disabled="!canCompareTable(row.table)" :data-compare-single-table="row.table" :title="t('dataCompare.compareSingleTableHint', { table: row.table })" @click="startCompare([row.table])">
+                        <GitCompareArrows class="h-3 w-3 mr-1" />
+                        {{ t("dataCompare.compareSingleTable") }}
+                      </Button>
+                    </div>
                     <div v-if="expandedKeyColumnTable === row.table" class="space-y-1 border-t bg-muted/10 px-2 py-2">
                       <CompareKeyColumnsSelect :model-value="row.columns" :columns="columnsForTable(row.table)" :loading="row.loading" :disabled="comparing || executionLocked" @update:model-value="(columns) => setTableKeyColumns(row.table, columns)" />
                       <CompareTableCondition v-model="whereConditionOverrides[row.table]" :table="row.table" :disabled="comparing || executionLocked" />
@@ -2130,6 +2160,21 @@ onBeforeUnmount(() => {
                         <span class="inline-flex rounded px-2 py-0.5 text-[11px]" :class="resultStatusClass(item.status)">
                           {{ resultStatusLabel(item.status, !!item.diff.toleranceMatches?.length || !!item.diff.nullEmptyMatches?.length) }}
                         </span>
+                        <div v-if="isBatchCompare" class="mt-1">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            class="h-6 px-1.5 text-[11px]"
+                            :disabled="!canCompareTable(item.sourceTable)"
+                            :data-recompare-single-table="item.sourceTable"
+                            :title="t('dataCompare.compareSingleTableHint', { table: item.sourceTable })"
+                            @click="startCompare([item.sourceTable])"
+                          >
+                            <RotateCcw class="h-3 w-3 mr-1" />
+                            {{ t("dataCompare.compareSingleTable") }}
+                          </Button>
+                        </div>
                       </td>
                       <td class="px-3 py-2 align-top text-muted-foreground">
                         <div v-if="item.status === 'error'" class="text-destructive">{{ item.error }}</div>
@@ -2322,7 +2367,7 @@ onBeforeUnmount(() => {
       <DialogFooter v-if="!hasResults">
         <Button variant="outline" size="sm" @click="handleOpenChange(false)">{{ t("common.close") }}</Button>
         <span v-if="compareProgressLabel" class="text-xs text-muted-foreground self-center">{{ compareProgressLabel }}</span>
-        <Button size="sm" :disabled="!canCompare || comparing" @click="startCompare">
+        <Button size="sm" :disabled="!canCompare || comparing" @click="startCompare()">
           <Loader2 v-if="comparing" class="w-3.5 h-3.5 animate-spin mr-1" />
           <GitCompareArrows v-else class="w-3.5 h-3.5 mr-1" />
           {{ t("dataCompare.compare") }}
@@ -2331,7 +2376,7 @@ onBeforeUnmount(() => {
 
       <DialogFooter v-else class="flex items-center gap-2">
         <Button variant="outline" size="sm" :disabled="(executing && manualTransaction) || resolvingTransaction" @click="handleOpenChange(false)">{{ t("common.close") }}</Button>
-        <Button variant="outline" size="sm" :disabled="comparing || executionLocked || !canCompare" @click="startCompare">
+        <Button variant="outline" size="sm" :disabled="comparing || executionLocked || !canCompare" @click="startCompare()">
           <Loader2 v-if="comparing" class="w-3 h-3 animate-spin mr-1" />
           <RotateCcw v-else class="w-3 h-3 mr-1" />
           {{ t("dataCompare.recompare") }}

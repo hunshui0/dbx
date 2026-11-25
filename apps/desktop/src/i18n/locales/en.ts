@@ -10360,6 +10360,8 @@ export default {
     previewLimitOption: "Preview {count}",
     compare: "Compare Data",
     recompare: "Compare Again",
+    compareSingleTable: "Compare Only",
+    compareSingleTableHint: "Compare only {table} without changing the selected table list",
     summary: "Added {added}, removed {removed}, modified {modified}",
     batchSummary: "Compared {tables} tables: {different} different, {same} identical, {failed} failed; added {added}, removed {removed}, modified {modified}",
     comparingTable: "Comparing {current}/{total}: {table}",

@@ -676,4 +676,100 @@ describe("DataCompareDialog match columns", () => {
     expect(mocks.prepareDataCompareFromTables.mock.calls[0]?.[0]).toMatchObject({ sourceTable: "USERS", trimStrings: true });
     expect(mocks.prepareDataCompareFromTables.mock.calls[1]?.[0]).toMatchObject({ sourceTable: "ORDERS", trimStrings: false });
   });
+
+  it("compares a single configured table without altering the multi-table selection", async () => {
+    setupMocks();
+    await openWithPrefilledSource("USERS");
+
+    const singleCheckbox = document.querySelector<HTMLInputElement>('[data-trim-strings-checkbox="USERS"]');
+    singleCheckbox!.checked = true;
+    singleCheckbox!.dispatchEvent(new Event("change", { bubbles: true }));
+    await flushAsyncSetup();
+
+    tableSelectionRow("ORDERS")?.click();
+    await flushAsyncSetup();
+
+    const singleCompareBtn = document.querySelector<HTMLButtonElement>('[data-compare-single-table="ORDERS"]');
+    expect(singleCompareBtn).not.toBeNull();
+    expect(singleCompareBtn?.disabled).toBe(false);
+    singleCompareBtn!.click();
+    await flushAsyncSetup();
+
+    expect(mocks.prepareDataCompareFromTables).toHaveBeenCalledTimes(1);
+    expect(mocks.prepareDataCompareFromTables.mock.calls[0]?.[0]).toMatchObject({
+      sourceTable: "ORDERS",
+      targetTable: "ORDERS",
+      trimStrings: false,
+    });
+    // Both configured tables stay selected so the multi-table config is preserved.
+    expect(keyColumnRow("USERS")).not.toBeNull();
+    expect(keyColumnRow("ORDERS")).not.toBeNull();
+  });
+
+  it("compares a single table from the target matched preview list using its per-table trim option", async () => {
+    setupMocks();
+    await openWithPrefilledSource("USERS");
+
+    const singleCheckbox = document.querySelector<HTMLInputElement>('[data-trim-strings-checkbox="USERS"]');
+    singleCheckbox!.checked = true;
+    singleCheckbox!.dispatchEvent(new Event("change", { bubbles: true }));
+    await flushAsyncSetup();
+
+    tableSelectionRow("ORDERS")?.click();
+    await flushAsyncSetup();
+
+    const previewSingleBtn = document.querySelector<HTMLButtonElement>('[data-preview-compare-single-table="USERS"]');
+    expect(previewSingleBtn).not.toBeNull();
+    expect(previewSingleBtn?.disabled).toBe(false);
+    previewSingleBtn!.click();
+    await flushAsyncSetup();
+
+    expect(mocks.prepareDataCompareFromTables).toHaveBeenCalledTimes(1);
+    expect(mocks.prepareDataCompareFromTables.mock.calls[0]?.[0]).toMatchObject({
+      sourceTable: "USERS",
+      targetTable: "USERS",
+      trimStrings: true,
+    });
+  });
+
+  it("offers per-table single recompare buttons in batch comparison results", async () => {
+    setupMocks();
+    const session = configuredSession();
+    session.batchResults = [
+      {
+        sourceTable: "USERS",
+        targetTable: "USERS",
+        status: "same",
+        added: 0,
+        removed: 0,
+        modified: 0,
+        ignoredOnlyCount: 0,
+        sourceRowCount: 5,
+        targetRowCount: 5,
+        sourceTruncated: false,
+        targetTruncated: false,
+        rowBudget: 10000,
+        syncEligible: true,
+        columns: ["USER_ID", "EMAIL", "NAME"],
+        keyColumns: ["USER_ID"],
+        columnInfo: [],
+        diff: { added: [], removed: [], modified: [], ignoredOnlyCount: 0, toleranceMatches: [], nullEmptyMatches: [] },
+        selection: { added: createDataCompareSelection(0), removed: createDataCompareSelection(0), modified: createDataCompareSelection(0) },
+        expanded: false,
+        showAll: { added: false, removed: false, modified: false },
+        preSyncStatements: [],
+      },
+    ];
+    sessionMocks.session = session;
+    mountDialog({ sessionId: "compare-session" });
+    await flushAsyncSetup();
+
+    const recompareSingleBtn = document.querySelector<HTMLButtonElement>('[data-recompare-single-table="USERS"]');
+    expect(recompareSingleBtn).not.toBeNull();
+    recompareSingleBtn!.click();
+    await flushAsyncSetup();
+
+    expect(mocks.prepareDataCompareFromTables).toHaveBeenCalledTimes(1);
+    expect(mocks.prepareDataCompareFromTables.mock.calls[0]?.[0]).toMatchObject({ sourceTable: "USERS" });
+  });
 });
