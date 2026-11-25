@@ -332,7 +332,7 @@ describe("DataCompareDialog ignored columns", () => {
     // Per-table addition on NOTES, via the picker inside its expanded match-column row.
     keyColumnRow("NOTES")?.click();
     await flushAsyncSetup();
-    const expandedPanel = keyColumnRow("NOTES")?.nextElementSibling;
+    const expandedPanel = document.querySelector<HTMLElement>('[data-key-column-panel="NOTES"]');
     const perTableIgnoreTrigger = expandedPanel?.querySelectorAll<HTMLButtonElement>("button.dbx-compare-key-columns-trigger")[1];
     await toggleColumnInPicker(perTableIgnoreTrigger, "BODY");
 
@@ -366,7 +366,7 @@ describe("DataCompareDialog ignored columns", () => {
 
     keyColumnRow("NOTES")?.click();
     await flushAsyncSetup();
-    const expandedPanel = keyColumnRow("NOTES")?.nextElementSibling;
+    const expandedPanel = document.querySelector<HTMLElement>('[data-key-column-panel="NOTES"]');
     const perTableIgnoreTrigger = expandedPanel?.querySelectorAll<HTMLButtonElement>("button.dbx-compare-key-columns-trigger")[1];
     expect(perTableIgnoreTrigger?.textContent?.trim()).toContain("BODY");
   });

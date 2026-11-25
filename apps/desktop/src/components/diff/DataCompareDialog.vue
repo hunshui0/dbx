@@ -1925,7 +1925,7 @@ onBeforeUnmount(() => {
                         {{ t("dataCompare.compareSingleTable") }}
                       </Button>
                     </div>
-                    <div v-if="expandedKeyColumnTable === row.table" class="space-y-1 border-t bg-muted/10 px-2 py-2">
+                    <div v-if="expandedKeyColumnTable === row.table" :data-key-column-panel="row.table" class="space-y-1 border-t bg-muted/10 px-2 py-2">
                       <CompareKeyColumnsSelect :model-value="row.columns" :columns="columnsForTable(row.table)" :loading="row.loading" :disabled="comparing || executionLocked" @update:model-value="(columns) => setTableKeyColumns(row.table, columns)" />
                       <CompareTableCondition v-model="whereConditionOverrides[row.table]" :table="row.table" :disabled="comparing || executionLocked" />
                       <CompareKeyExclusions :model-value="keyExclusionOverrides[row.table] ?? []" :columns="row.columns" :column-info="columnsForTable(row.table)" :disabled="comparing || executionLocked" @update:model-value="(rules) => setKeyExclusions(row.table, rules)" />
