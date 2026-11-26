@@ -59,7 +59,7 @@ import CompareKeyColumnsSelect from "@/components/diff/CompareKeyColumnsSelect.v
 import CompareTableCondition from "@/components/diff/CompareTableCondition.vue";
 import CompareKeyExclusions from "@/components/diff/CompareKeyExclusions.vue";
 import DataCompareConfigSelector from "@/components/diff/DataCompareConfigSelector.vue";
-import { useDataCompareConfig, type DataCompareConfig, type DataCompareConfigSnapshot } from "@/composables/useDataCompareConfig";
+import { serializeDataCompareConfigs, useDataCompareConfig, type DataCompareConfig, type DataCompareConfigSnapshot, type DataCompareConnectionResolver } from "@/composables/useDataCompareConfig";
 import * as api from "@/lib/backend/api";
 import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { supportsTransaction } from "@/lib/database/databaseFeatureSupport";
@@ -67,7 +67,7 @@ import { formatError, isManualTransactionSessionExpired } from "@/lib/backend/er
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { promptExportSavePath } from "@/lib/export/exportPath";
 import TableMultiSelect from "@/components/diff/TableMultiSelect.vue";
-import { compactLocalTimestamp, saveTextFile } from "@/lib/export/saveTextFile";
+import { compactLocalTimestamp, sanitizeExportBaseName, saveTextFile } from "@/lib/export/saveTextFile";
 import { ArrowLeftRight, CheckSquare, ChevronDown, ChevronRight, Copy, Download, GitCompareArrows, Loader2, Play, RotateCcw, Square } from "@lucide/vue";
 
 const PREVIEW_LIMIT_OPTIONS = [50, 100, 200, 500];
@@ -89,6 +89,7 @@ const {
   renameConfig: renameDataCompareConfig,
   deleteConfig: deleteDataCompareConfig,
   duplicateConfig: duplicateDataCompareConfig,
+  importConfigs: importDataCompareConfigs,
 } = useDataCompareConfig();
 const open = defineModel<boolean>("open", { default: false });
 
@@ -798,6 +799,67 @@ function handleDeleteDataCompareConfig() {
   // The form keeps the current selection; only the saved entry is removed so a
   // delete can never clear what the user is looking at.
   if (id) deleteDataCompareConfig(id);
+}
+
+function configConnectionResolver(): DataCompareConnectionResolver {
+  return {
+    getNameById: (id) => store.getConfig(id)?.name,
+    hasId: (id) => Boolean(id && store.getConfig(id)),
+    findIdByName: (name) => {
+      const normalized = name.trim().toLowerCase();
+      if (!normalized) return undefined;
+      return store.connections.find((connection) => connection.name.trim().toLowerCase() === normalized)?.id;
+    },
+  };
+}
+
+async function handleExportDataCompareConfig(config: DataCompareConfig | null) {
+  try {
+    const now = Date.now();
+    const target: DataCompareConfig = config
+      ? { ...config, ...dataCompareConfigSnapshot() }
+      : {
+          ...dataCompareConfigSnapshot(),
+          id: "current",
+          name: t("dataCompare.defaultConfigName"),
+          createdAt: now,
+          updatedAt: now,
+        };
+    const json = serializeDataCompareConfigs([target], configConnectionResolver());
+    const baseName = sanitizeExportBaseName(target.name) || "data-compare-config";
+    const defaultFileName = `dbx-data-compare-${baseName}-${compactLocalTimestamp()}.json`;
+    const saved = await saveTextFile(json, defaultFileName, "JSON", "json", { operation: "data-compare-config-export" });
+    if (saved) {
+      toast(t("dataCompare.configExportSuccess", { path: typeof saved === "string" ? saved : defaultFileName }), 4000);
+    }
+  } catch (error: unknown) {
+    toast(formatError(error), 5000);
+  }
+}
+
+async function handleExportAllDataCompareConfigs(allConfigs: DataCompareConfig[]) {
+  if (!allConfigs.length) return;
+  try {
+    const json = serializeDataCompareConfigs(allConfigs, configConnectionResolver());
+    const defaultFileName = `dbx-data-compare-configs-${compactLocalTimestamp()}.json`;
+    const saved = await saveTextFile(json, defaultFileName, "JSON", "json", { operation: "data-compare-config-export-all" });
+    if (saved) {
+      toast(t("dataCompare.configExportSuccess", { path: typeof saved === "string" ? saved : defaultFileName }), 4000);
+    }
+  } catch (error: unknown) {
+    toast(formatError(error), 5000);
+  }
+}
+
+function handleImportDataCompareConfigs(jsonText: string) {
+  const result = importDataCompareConfigs(jsonText, configConnectionResolver());
+  if (result.error || result.imported.length === 0) {
+    toast(t("dataCompare.configImportInvalid"), 5000);
+    return;
+  }
+  const first = result.imported[0];
+  if (first) void applyDataCompareConfig(first);
+  toast(t("dataCompare.configImportSuccess", { count: result.imported.length }), 4000);
 }
 
 function applyDataCompareSession(session: DataCompareSession | undefined): void {
@@ -1718,6 +1780,9 @@ onBeforeUnmount(() => {
           @rename="handleRenameDataCompareConfig"
           @duplicate="handleDuplicateDataCompareConfig"
           @delete="handleDeleteDataCompareConfig"
+          @export="handleExportDataCompareConfig"
+          @export-all="handleExportAllDataCompareConfigs"
+          @import="handleImportDataCompareConfigs"
         />
       </div>
 

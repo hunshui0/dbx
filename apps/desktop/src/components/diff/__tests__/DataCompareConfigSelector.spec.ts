@@ -27,6 +27,13 @@ function createTestI18n() {
           configDuplicate: "复制配置",
           configDelete: "删除配置",
           configName: "配置名称",
+          configExport: "导出当前配置",
+          configExportAll: "导出全部配置",
+          configImport: "导入配置",
+          configImportPlaceholder: "粘贴 JSON",
+          configImportSelectFile: "选择 JSON 文件",
+          configImportAction: "导入",
+          configImportInvalid: "配置 JSON 无效",
         },
         common: {
           cancel: "取消",
@@ -65,6 +72,15 @@ function mountSelector(props: { configs: DataCompareConfig[]; activeConfigId: st
           },
           onDelete: (...args: unknown[]) => {
             (emitted.delete ??= []).push(args);
+          },
+          onExport: (...args: unknown[]) => {
+            (emitted.export ??= []).push(args);
+          },
+          onExportAll: (...args: unknown[]) => {
+            (emitted.exportAll ??= []).push(args);
+          },
+          onImport: (...args: unknown[]) => {
+            (emitted.import ??= []).push(args);
           },
         });
     },
@@ -183,5 +199,41 @@ describe("DataCompareConfigSelector", () => {
     createBtn.click();
 
     expect(emitted.create).toHaveLength(1);
+  });
+
+  it("emits export, exportAll, and validates/emits import JSON", async () => {
+    const { host, emitted } = mountSelector({
+      configs: [sampleConfig],
+      activeConfigId: "cfg-1",
+    });
+
+    (host.querySelector('[data-testid="data-compare-config-export"]') as HTMLButtonElement).click();
+    expect(emitted.export).toEqual([[sampleConfig]]);
+
+    (host.querySelector('[data-testid="data-compare-config-export-all"]') as HTMLButtonElement).click();
+    expect(emitted.exportAll).toEqual([[[sampleConfig]]]);
+
+    (host.querySelector('[data-testid="data-compare-config-import"]') as HTMLButtonElement).click();
+    await nextTick();
+
+    const textarea = document.body.querySelector('[data-testid="data-compare-config-import-input"]') as HTMLTextAreaElement;
+    const confirmBtn = document.body.querySelector('[data-testid="data-compare-config-import-confirm"]') as HTMLButtonElement;
+    expect(textarea).not.toBeNull();
+
+    textarea.value = "{invalid";
+    textarea.dispatchEvent(new Event("input"));
+    await nextTick();
+    confirmBtn.click();
+    await nextTick();
+    expect(document.body.querySelector('[data-testid="data-compare-config-import-error"]')?.textContent).toBe("配置 JSON 无效");
+    expect(emitted.import).toBeUndefined();
+
+    const validJson = JSON.stringify({ configs: [sampleConfig] });
+    textarea.value = validJson;
+    textarea.dispatchEvent(new Event("input"));
+    await nextTick();
+    confirmBtn.click();
+    await nextTick();
+    expect(emitted.import).toEqual([[validJson]]);
   });
 });

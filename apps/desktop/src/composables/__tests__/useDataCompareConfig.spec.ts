@@ -259,3 +259,92 @@ describe("per-table comparison search conditions", () => {
     expect(useDataCompareConfig().configs.value[0]?.whereConditionsByTable).toEqual({});
   });
 });
+
+describe("data compare config import and export", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.resetModules();
+  });
+
+  it("serializes and imports configs while preserving per-table options and matching connections by name", async () => {
+    const { serializeDataCompareConfigs, useDataCompareConfig } = await import("../useDataCompareConfig");
+    const state = useDataCompareConfig();
+    const created = state.createConfig(
+      "Informix To TiDB",
+      snapshot({
+        sourceConnectionId: "remote-src-id",
+        targetConnectionId: "remote-tgt-id",
+        selectedSourceTables: ["users", "orders"],
+        compareMode: "sample",
+        sampleSize: 2500,
+        amountToleranceEnabled: true,
+        nullEqualsEmpty: true,
+        keyColumnsByTable: { users: ["id"], orders: ["tenant_id", "order_id"] },
+        globalIgnoredColumns: ["updated_at"],
+        ignoredColumnsByTable: { orders: ["remark"] },
+        whereConditionsByTable: { users: "status = 'A'" },
+        trimStringsByTable: { users: true },
+      }),
+    );
+
+    const json = serializeDataCompareConfigs([created], {
+      getNameById: (id) => (id === "remote-src-id" ? "Informix Prod" : id === "remote-tgt-id" ? "TiDB Staging" : undefined),
+    });
+
+    // Clear the source machine's saved config before simulating import on another machine.
+    state.deleteConfig(created.id);
+    localStorage.clear();
+    vi.resetModules();
+    const { useDataCompareConfig: useTargetConfig } = await import("../useDataCompareConfig");
+    const targetState = useTargetConfig();
+    const importedResult = targetState.importConfigs(json, {
+      hasId: (id) => id === "local-src-id" || id === "local-tgt-id",
+      findIdByName: (name) => (name === "Informix Prod" ? "local-src-id" : name === "TiDB Staging" ? "local-tgt-id" : undefined),
+    });
+
+    expect(importedResult.error).toBeUndefined();
+    expect(importedResult.imported).toHaveLength(1);
+    const imported = importedResult.imported[0]!;
+    expect(imported.id).not.toBe(created.id);
+    expect(imported.name).toBe("Informix To TiDB");
+    expect(imported.sourceConnectionId).toBe("local-src-id");
+    expect(imported.targetConnectionId).toBe("local-tgt-id");
+    expect(imported.selectedSourceTables).toEqual(["users", "orders"]);
+    expect(imported.compareMode).toBe("sample");
+    expect(imported.sampleSize).toBe(2500);
+    expect(imported.amountToleranceEnabled).toBe(true);
+    expect(imported.nullEqualsEmpty).toBe(true);
+    expect(imported.keyColumnsByTable).toEqual({ users: ["id"], orders: ["tenant_id", "order_id"] });
+    expect(imported.globalIgnoredColumns).toEqual(["updated_at"]);
+    expect(imported.ignoredColumnsByTable).toEqual({ orders: ["remark"] });
+    expect(imported.whereConditionsByTable).toEqual({ users: "status = 'A'" });
+    expect(imported.trimStringsByTable).toEqual({ users: true });
+    expect(targetState.activeConfigId.value).toBe(imported.id);
+
+    // Re-importing the same JSON deduplicates the name instead of overwriting.
+    const second = targetState.importConfigs(json);
+    expect(second.imported[0]?.name).toBe("Informix To TiDB (1)");
+  });
+
+  it("supports bare config objects, plain arrays, and rejects invalid JSON", async () => {
+    const { useDataCompareConfig } = await import("../useDataCompareConfig");
+    const state = useDataCompareConfig();
+
+    expect(state.importConfigs("{bad json").error).toBe("invalidJson");
+    expect(state.importConfigs("{}").error).toBe("empty");
+
+    const single = state.importConfigs(JSON.stringify({ name: "Bare", ...snapshot() }));
+    expect(single.error).toBeUndefined();
+    expect(single.imported).toHaveLength(1);
+    expect(single.imported[0]?.name).toBe("Bare");
+
+    const list = state.importConfigs(
+      JSON.stringify([
+        { name: "A", ...snapshot() },
+        { name: "B", ...snapshot() },
+      ]),
+    );
+    expect(list.error).toBeUndefined();
+    expect(list.imported).toHaveLength(2);
+  });
+});

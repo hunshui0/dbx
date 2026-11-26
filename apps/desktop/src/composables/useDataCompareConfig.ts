@@ -63,6 +63,25 @@ export interface DataCompareConfigSnapshot {
   trimStringsByTable?: Record<string, boolean>;
 }
 
+export interface ExportedDataCompareConfigItem extends DataCompareConfig {
+  /** Optional connection names so configs imported on another machine can auto-match by name. */
+  sourceConnectionName?: string;
+  targetConnectionName?: string;
+}
+
+export interface DataCompareConfigExportBundle {
+  version: 1;
+  kind: "dbx-data-compare-config";
+  exportedAt: string;
+  configs: ExportedDataCompareConfigItem[];
+}
+
+export interface DataCompareConnectionResolver {
+  getNameById?: (id: string) => string | undefined;
+  findIdByName?: (name: string) => string | undefined;
+  hasId?: (id: string) => boolean;
+}
+
 const STORAGE_KEY = "dbx-data-compare-configs";
 const MAX_CONFIGS = 50;
 
@@ -139,6 +158,77 @@ function saveConfigsToStorage() {
     // Quota/private-mode failures must never break the compare dialog; the
     // in-memory configs keep working for the current session.
   }
+}
+
+export function serializeDataCompareConfigs(items: DataCompareConfig[], resolver?: DataCompareConnectionResolver): string {
+  const exported: ExportedDataCompareConfigItem[] = items.map((item) => {
+    const sourceConnectionName = item.sourceConnectionId ? resolver?.getNameById?.(item.sourceConnectionId) : undefined;
+    const targetConnectionName = item.targetConnectionId ? resolver?.getNameById?.(item.targetConnectionId) : undefined;
+    return {
+      ...item,
+      ...(sourceConnectionName ? { sourceConnectionName } : {}),
+      ...(targetConnectionName ? { targetConnectionName } : {}),
+    };
+  });
+  const bundle: DataCompareConfigExportBundle = {
+    version: 1,
+    kind: "dbx-data-compare-config",
+    exportedAt: new Date().toISOString(),
+    configs: exported,
+  };
+  return JSON.stringify(bundle, null, 2);
+}
+
+function isSnapshotLikeRecord(raw: unknown): raw is Record<string, unknown> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const item = raw as Record<string, unknown>;
+  return typeof item.name === "string" || Array.isArray(item.selectedSourceTables) || typeof item.sourceConnectionId === "string" || typeof item.sourceDatabase === "string" || typeof item.targetConnectionId === "string";
+}
+
+function resolveImportedConnectionId(connectionId: string, connectionName: unknown, resolver?: DataCompareConnectionResolver): string {
+  if (!resolver) return connectionId;
+  if (connectionId && resolver.hasId?.(connectionId)) return connectionId;
+  if (typeof connectionName === "string" && connectionName.trim()) {
+    const matched = resolver.findIdByName?.(connectionName.trim());
+    if (matched) return matched;
+  }
+  return connectionId;
+}
+
+export function parseDataCompareConfigsJson(jsonText: string, resolver?: DataCompareConnectionResolver): { configs: DataCompareConfig[]; error?: "invalidJson" | "empty" } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return { configs: [], error: "invalidJson" };
+  }
+
+  let rawItems: unknown[];
+  if (Array.isArray(parsed)) {
+    rawItems = parsed;
+  } else if (parsed && typeof parsed === "object" && Array.isArray((parsed as Record<string, unknown>).configs)) {
+    rawItems = (parsed as Record<string, unknown>).configs as unknown[];
+  } else if (isSnapshotLikeRecord(parsed)) {
+    rawItems = [parsed];
+  } else {
+    return { configs: [], error: "empty" };
+  }
+
+  const imported: DataCompareConfig[] = [];
+  for (const entry of rawItems) {
+    if (!isSnapshotLikeRecord(entry)) continue;
+    const withFallbackName = typeof entry.name === "string" && entry.name.trim() ? entry : { ...entry, name: "Imported Config" };
+    const sanitized = sanitizeConfig(withFallbackName);
+    if (!sanitized) continue;
+    imported.push({
+      ...sanitized,
+      sourceConnectionId: resolveImportedConnectionId(sanitized.sourceConnectionId, entry.sourceConnectionName, resolver),
+      targetConnectionId: resolveImportedConnectionId(sanitized.targetConnectionId, entry.targetConnectionName, resolver),
+    });
+  }
+
+  if (imported.length === 0) return { configs: [], error: "empty" };
+  return { configs: imported };
 }
 
 export function useDataCompareConfig() {
@@ -246,6 +336,29 @@ export function useDataCompareConfig() {
     activeConfigId.value = "";
   }
 
+  function importConfigs(jsonText: string, resolver?: DataCompareConnectionResolver): { imported: DataCompareConfig[]; error?: "invalidJson" | "empty" } {
+    const parsed = parseDataCompareConfigsJson(jsonText, resolver);
+    if (parsed.error || parsed.configs.length === 0) {
+      return { imported: [], error: parsed.error ?? "empty" };
+    }
+    const now = Date.now();
+    const added: DataCompareConfig[] = [];
+    for (const item of parsed.configs) {
+      const next: DataCompareConfig = {
+        ...item,
+        id: uuid(),
+        name: uniqueName(item.name),
+        createdAt: item.createdAt || now,
+        updatedAt: now,
+      };
+      configs.value = [next, ...configs.value].slice(0, MAX_CONFIGS);
+      added.push(next);
+    }
+    if (added[0]) activeConfigId.value = added[0].id;
+    saveConfigsToStorage();
+    return { imported: added };
+  }
+
   watch(configs, saveConfigsToStorage, { deep: true });
 
   return {
@@ -257,6 +370,7 @@ export function useDataCompareConfig() {
     renameConfig,
     deleteConfig,
     duplicateConfig,
+    importConfigs,
     clearActiveConfig,
   };
 }
